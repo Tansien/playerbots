@@ -1,102 +1,126 @@
 name: Ubuntu Build
 
-on: [push]
+# CI policy for this fork:
+# - All jobs run on self-hosted Ubuntu Linux runners only (labels: [self-hosted, linux]).
+#   No GitHub-hosted runners and no macOS/Windows jobs. If no self-hosted runner is
+#   online, jobs stay queued; do not switch back to GitHub-hosted runners.
+# - No Discord (or any other) notification steps.
+# - Fork pull requests must not execute code on the self-hosted runners; every job
+#   carries a head-repository guard and the workflow uses pull_request (never
+#   pull_request_target).
+# - Runners are provisioned by the repository owner and are expected to provide the
+#   normal CMaNGOS build dependencies: git, cmake (>= 3.16), g++ or clang++,
+#   libboost-all-dev, libssl-dev, and libmysqlclient-dev/default-libmysqlclient-dev.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
-  REPO_DIR : ${{github.workspace}}
-  BUILD_DIR: ${{github.workspace}}/bin/builddir
-  BOOST_VERSION: "1.83.0"
-  BOOST_PLATFORM_VERSION: "22.04"
-  COMPILER_CC: clang
-  COMPILER_PP: clang++
-  CORE_REPO_OWNER: ${{github.repository_owner}}
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
-
-    strategy:
-      matrix:
-        version: [classic, tbc, wotlk]
-        include:
-          - os: ubuntu-22.04
-            EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
+  living-tests:
+    name: Living Realm host tests
+    # Never run automatically for fork pull requests: they must not execute code on
+    # the self-hosted runners.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux]
 
     steps:
+      - name: Runner preflight (require Ubuntu)
+        run: |
+          if [ ! -r /etc/os-release ]; then
+            echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
+            exit 1
+          fi
+          . /etc/os-release
+          if [ "${ID}" != "ubuntu" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu Linux, got: ${PRETTY_NAME:-${ID}}"
+            exit 1
+          fi
+          echo "Runner OS: ${PRETTY_NAME}"
+
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          repository: ${{github.repository_owner}}/mangos-${{matrix.version}}
-          ref: master
-          path: ${{env.REPO_DIR}}
-
-      - name: Create Build Environment
-        run: |
-          echo "GITHUB_SHORT_REV=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "ARCHIVE_FILENAME=${{ github.event.repository.name }}-$(git rev-parse --short HEAD).zip" >> $GITHUB_ENV
-          echo "CC=${{env.COMPILER_CC}}" >> $GITHUB_ENV
-          echo "CXX=${{env.COMPILER_PP}}" >> $GITHUB_ENV
-          cmake -E make_directory ${{ env.BUILD_DIR }}
-
-      - name: Install Boost
-        uses: MarkusJx/install-boost@v2.4.5
-        id: install-boost
-        with:
-          # REQUIRED: Specify the required boost version
-          # A list of supported versions can be found here:
-          # https://github.com/MarkusJx/prebuilt-boost/blob/main/versions-manifest.json
-          boost_version: ${{env.BOOST_VERSION}}
-          # OPTIONAL: Specify a platform version
-          platform_version: ${{env.BOOST_PLATFORM_VERSION}}
-          # OPTIONAL: Specify a toolset
-          toolset: gcc
-          # OPTIONAL: Specify an architecture
-          arch: x86
-          # NOTE: If a boost version matching all requirements cannot be found,
-          # this build step will fail
 
       - name: Configure
-        env:
-          BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
-        run: cmake -DBoost_ARCHITECTURE=-x64 -DCMAKE_INSTALL_PREFIX=/home/runner/work ${{matrix.EXTRA_BUILD}} -B ${{env.BUILD_DIR}} -S ${{env.REPO_DIR}}
+        run: cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -B build-living -S .
 
       - name: Build
-        env:
-          MAKEFLAGS: "-j8"
-        run: |
-            cmake --build ${{env.BUILD_DIR}} --config ${{env.BUILD_TYPE}}
-            cmake --install ${{env.BUILD_DIR}}
+        run: cmake --build build-living -j "$(nproc)"
 
-  notify:
-    name: Send Notification to Discord on Failure
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: none
-    needs: # make sure the notification is sent AFTER the jobs you want included have completed
-      - build
-    if: failure()
+      - name: Test
+        run: ctest --test-dir build-living --output-on-failure
+
+  build:
+    name: Build ${{ matrix.version }}
+    # Never run automatically for fork pull requests: they must not execute code on
+    # the self-hosted runners.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned CMaNGOS core baselines from docs/design/0001-living-realm-implementation-contract.md (A.1).
+        include:
+          - version: classic
+            core_ref: de8f72993b9e1faa1bf92dd5505f3daec5cea3ce
+          - version: tbc
+            core_ref: e107b53c175e47d7e5b3496181353f5a6349be43
+          - version: wotlk
+            core_ref: 57a34d33fb8cb1822258c690c583cc9be8d04708
 
     steps:
-      - name: Setup Environmental Variables
+      - name: Runner preflight (require Ubuntu)
         run: |
-          echo "GIT_BRANCH=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-          echo "GIT_SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-8`" >> $GITHUB_ENV
+          if [ ! -r /etc/os-release ]; then
+            echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
+            exit 1
+          fi
+          . /etc/os-release
+          if [ "${ID}" != "ubuntu" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu Linux, got: ${PRETTY_NAME:-${ID}}"
+            exit 1
+          fi
+          echo "Runner OS: ${PRETTY_NAME}"
 
-      - name: Notify
-        uses: rjstone/discord-webhook-notify@v1.1.1
+      - name: Checkout CMaNGOS ${{ matrix.version }} core
+        uses: actions/checkout@v4
         with:
-          severity: error
-          description: |
-            **Linux Build Failed**
-          details: |
-            - **Branch:** ${{env.GIT_BRANCH}}
-            - **Pusher:** ${{github.event.pusher.name}}
-            - **Author:** ${{github.event.head_commit.author.name}}
-            - **Commit:** [${{github.repository}}/${{env.GIT_SHORT_SHA}}](${{github.server_url}}/${{ github.repository }}/commit/${{github.sha}})
-            - **Build Log:** [actions/runs/${{github.run_id}}](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}})
-          footer: CMaNGOS Developers Notified!
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+          repository: cmangos/mangos-${{ matrix.version }}
+          ref: ${{ matrix.core_ref }}
+          path: core
+
+      - name: Checkout playerbots
+        # Must live inside the core tree (the core adds it via add_subdirectory);
+        # checked out after the core so the core checkout cannot wipe it.
+        uses: actions/checkout@v4
+        with:
+          path: core/src/modules/PlayerBots
+
+      - name: Configure
+        # FETCHCONTENT_SOURCE_DIR_PLAYERBOTS pins the module to this checkout;
+        # without it FetchContent would update the directory to upstream master.
+        run: >
+          cmake
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DBUILD_PLAYERBOTS=ON
+          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
+          -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/run"
+          -B build
+          -S core
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
