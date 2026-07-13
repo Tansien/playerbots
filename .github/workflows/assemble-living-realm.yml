@@ -1,0 +1,45 @@
+name: Assemble Living Realm design
+
+on:
+  push:
+    branches:
+      - agent/living-realm-upload
+    paths:
+      - .living-realm/READY
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assemble and verify document
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .living-realm/chunk-*.b64 > /tmp/living-realm.b64
+          test "$(wc -c < /tmp/living-realm.b64)" -eq 69844
+          echo "6e1b03bf3fb88424ce7c077a02062d38b768ea9a0e492bfb8be40369300dfe59  /tmp/living-realm.b64" | sha256sum -c -
+          base64 --decode /tmp/living-realm.b64 > /tmp/0001-living-realm.md
+          test "$(wc -l < /tmp/0001-living-realm.md)" -eq 1484
+          echo "8794c43a3d142144750d7283efc7a306c3715ec169ad5b5ebd0b2f7ca7f5fb87  /tmp/0001-living-realm.md" | sha256sum -c -
+
+      - name: Commit document to design branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin agent/living-realm-design
+          git checkout -B agent/living-realm-design origin/agent/living-realm-design
+          mkdir -p docs/design
+          cp /tmp/0001-living-realm.md docs/design/0001-living-realm.md
+          git add docs/design/0001-living-realm.md
+          git diff --cached --check
+          git commit -m "docs: add Living Realm design"
+          git push origin HEAD:agent/living-realm-design
