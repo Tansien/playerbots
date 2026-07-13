@@ -2,7 +2,7 @@
 
 [Back to design 0003](0003-lifecycle-persistence-and-reconciliation.md)
 
-## 1. Schema examples
+## A.1 Schema examples
 
 ```sql
 CREATE TABLE ai_playerbot_living_schema (
@@ -11,6 +11,22 @@ CREATE TABLE ai_playerbot_living_schema (
   migration_state VARCHAR(16) NOT NULL,
   updated_at_ms BIGINT UNSIGNED NOT NULL,
   PRIMARY KEY (component)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+CREATE TABLE ai_playerbot_living_operation (
+  operation_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  operation_token BINARY(16) NOT NULL,
+  operation_type VARCHAR(32) NOT NULL,
+  phase VARCHAR(24) NOT NULL,
+  requested_at_ms BIGINT UNSIGNED NOT NULL,
+  terminal_at_ms BIGINT UNSIGNED NULL,
+  state_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  payload_version SMALLINT UNSIGNED NOT NULL,
+  payload MEDIUMTEXT NOT NULL,
+  failure_code VARCHAR(64) NULL,
+  PRIMARY KEY (operation_id),
+  UNIQUE KEY uq_living_operation_token (operation_token),
+  KEY ix_living_operation_phase (phase, requested_at_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 CREATE TABLE ai_playerbot_living_character (
@@ -25,10 +41,25 @@ CREATE TABLE ai_playerbot_living_character (
   state_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
   created_at_ms BIGINT UNSIGNED NOT NULL,
   updated_at_ms BIGINT UNSIGNED NOT NULL,
-  retired_at_ms BIGINT UNSIGNED NULL,
   PRIMARY KEY (character_guid),
-  UNIQUE KEY uq_living_identity (character_guid, identity_nonce),
-  KEY ix_living_status (status)
+  UNIQUE KEY uq_living_current_identity (character_guid, identity_nonce),
+  KEY ix_living_current_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+CREATE TABLE ai_playerbot_living_character_history (
+  character_guid INT UNSIGNED NOT NULL,
+  identity_nonce BINARY(16) NOT NULL,
+  provenance VARCHAR(32) NOT NULL,
+  account_id INT UNSIGNED NOT NULL,
+  race TINYINT UNSIGNED NOT NULL,
+  class TINYINT UNSIGNED NOT NULL,
+  retired_reason VARCHAR(64) NOT NULL,
+  created_at_ms BIGINT UNSIGNED NOT NULL,
+  retired_at_ms BIGINT UNSIGNED NOT NULL,
+  final_state_version BIGINT UNSIGNED NOT NULL,
+  payload MEDIUMTEXT NOT NULL,
+  PRIMARY KEY (character_guid, identity_nonce),
+  KEY ix_living_history_retired (retired_at_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 CREATE TABLE ai_playerbot_living_profile (
@@ -73,7 +104,9 @@ CREATE TABLE ai_playerbot_living_reservation (
   protected_real_player TINYINT UNSIGNED NOT NULL,
   created_at_ms BIGINT UNSIGNED NOT NULL,
   expires_at_ms BIGINT UNSIGNED NOT NULL,
+  terminal_at_ms BIGINT UNSIGNED NULL,
   state_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  payload_version SMALLINT UNSIGNED NOT NULL,
   payload MEDIUMTEXT NOT NULL,
   PRIMARY KEY (reservation_id),
   UNIQUE KEY uq_living_reservation_lease (lease_token),
@@ -81,62 +114,131 @@ CREATE TABLE ai_playerbot_living_reservation (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 CREATE TABLE ai_playerbot_living_reservation_member (
+  reservation_member_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   reservation_id BIGINT UNSIGNED NOT NULL,
   character_guid INT UNSIGNED NOT NULL,
   identity_nonce BINARY(16) NOT NULL,
   member_role VARCHAR(24) NOT NULL,
   active_slot TINYINT UNSIGNED NULL,
+  join_generation INT UNSIGNED NOT NULL DEFAULT 1,
   joined_at_ms BIGINT UNSIGNED NOT NULL,
   released_at_ms BIGINT UNSIGNED NULL,
   state_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  PRIMARY KEY (reservation_id, character_guid, identity_nonce),
-  UNIQUE KEY uq_living_active_member (character_guid, identity_nonce, active_slot)
+  PRIMARY KEY (reservation_member_id),
+  UNIQUE KEY uq_living_active_member
+    (character_guid, identity_nonce, active_slot),
+  KEY ix_living_reservation_members
+    (reservation_id, character_guid, identity_nonce)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 ```
 
-`active_slot=1` only for active memberships; terminal rows set it `NULL`, allowing history while enforcing one active reservation per identity. Application validation constrains enum strings, payload schema/version, and payload size. New tables intentionally avoid foreign keys to legacy tables; managed hooks and reconciliation enforce identity.
+`active_slot=1` only for active memberships; terminal episodes set it `NULL`.
+A rejoin creates a new membership row and increments `join_generation`, preserving
+episode history while enforcing one active reservation per identity.
 
-## 2. Migration protocol
+Application validation constrains enum strings, payload schema/version, and
+payload size. New tables intentionally avoid foreign keys to legacy tables;
+managed hooks and reconciliation enforce identity.
 
-Migrations are additive and ordered. Before applying, set component state to `APPLYING`; after schema/data validation, set `CLEAN`. Startup accepts exactly the supported clean version. `APPLYING`, `FAILED`, missing, or newer unsupported versions block managed startup. Roll-forward is the default recovery; destructive automatic rollback is not provided.
+## A.2 Transition enforcement
 
-When Living Realm is disabled, missing tables are acceptable and no queries are issued. Enabling requires clean schema.
+The current database layer cannot provide interactive row locks through the
+buffered transaction API. Therefore:
 
-## 3. Deterministic startup matrix
+- all writes flow through the world-thread `LivingRealmStateWriter`;
+- active-slot and version checks happen in the serialized writer;
+- critical writes use direct commit;
+- critical rows are re-read and verified by token/version;
+- SQL uniqueness constraints are corruption/concurrency backstops;
+- an unexpected mismatch indicates an external writer or invariant violation and
+  fails closed.
+
+No statement in this design relies on `SELECT ... FOR UPDATE` or affected-row
+CAS.
+
+## A.3 Migration protocol
+
+Migrations are additive and ordered. A migration first directly records
+`APPLYING`, performs schema/data work, validates the resulting schema, then
+directly records `CLEAN`.
+
+Startup accepts exactly the supported clean version. `APPLYING`, `FAILED`,
+missing, or newer unsupported versions block managed startup. Roll-forward is
+the default recovery; destructive automatic rollback is not provided.
+
+When Living Realm is disabled, missing tables are acceptable and no Living Realm
+queries are issued. Enabling requires clean schema.
+
+## A.4 Deterministic startup matrix
 
 | Persisted desire/state | Actual observation | Commitment/window | Result |
 |---|---|---|---|
 | desired offline | session online | no commitment | request wind-down; keep actual online until normal logout |
 | desired offline | session online | protected commitment | remain online; defer wind-down |
-| desired online | session absent | current window/commitment | login-eligible after all guards |
-| desired online | session absent | window expired, no commitment | recompute desired offline; no login |
+| desired online | session absent | current window/commitment/request | login-eligible after all guards |
+| desired online | session absent | window expired, no request | recompute desired offline; no login |
 | desired online | session online | any valid | reconcile online and continue |
 | stale login request | session absent | still eligible | issue new ephemeral attempt after backoff |
 | stale login request | session online | any | discard request; reconcile online |
 | stale logout request | session online | no commitment | resume/renew wind-down |
 | stale logout request | session absent | any | discard; reconcile offline |
 | missing schedule | any | identity valid | quarantine; do not synthesize in memory |
-| malformed profile/root | any | — | quarantine; if online, safe wind-down when legal |
-| deleted/retired character | session absent | — | terminal cleanup; never recreate implicitly |
-| partial migration | any | — | global startup block |
-| persisted in instance/BG | session absent | stale location | classify through core rules; preserve/clear only by explicit reconciliation |
+| malformed profile/current root | any | — | quarantine; if online, safe wind-down when legal |
+| history row exists, current root absent | character absent | — | valid retired identity; no implicit recreation |
+| history row exists, reused GUID has new root/nonce | character present | — | attach only to new nonce |
+| character exists, current root absent | any | bootstrap not active | quarantine/global block according to scope |
+| current root exists, character absent | session absent | — | retire orphan after managed-operation check |
+| partial migration/global operation | any | — | global startup block |
+| `AsyncBotLogin=false` | any managed identity | — | global managed-startup block |
+| managed identity appears in legacy timer path | any | — | critical failure; remove from path and block until reconciled |
+| persisted in instance/BG | session absent | stale location | classify through core rules; preserve/clear only explicitly |
 | online in instance/BG | session online | schedule expired | defer logout until leave/normal completion |
 | commitment row active | no live group/owner | grace expired | terminal release; schedule regains control |
-| live real-player group | row missing | accepted policy | create/repair protected lease transactionally |
+| live real-player group | row missing | accepted policy | create/repair protected reservation through state writer |
+| on-demand request active | session absent | TTL/capacity valid | login-eligible; not protected until group observed |
+| on-demand request expired | session absent | no schedule window | terminalize request; remain offline |
+| incomplete audit action | any | — | run action-specific reconciliation before eligibility |
 
-## 4. Per-character reconciliation order
+## A.5 Per-character reconciliation order
 
-1. validate root/nonce/provenance and character fingerprint;
+1. validate current root/nonce/provenance and character fingerprint;
 2. reconcile incomplete synthetic actions;
-3. inspect actual session/player, live group, instance/BG, death, taxi/transport, trade, and save state;
-4. validate/repair commitment against live group;
+3. inspect actual session/player, live group, instance/BG, death,
+   taxi/transport, trade, and persistence-submission state;
+4. validate/repair request and protected reservation against live group;
 5. validate schedule and compute desired state using UTC clock;
 6. validate active goal slot;
 7. derive wind-down/login eligibility;
-8. publish an immutable reconciled snapshot to login selection.
+8. publish an immutable reconciled snapshot.
 
-Periodic reconciliation repeats bounded subsets and never depends solely on events.
+Periodic reconciliation repeats bounded subsets and never depends solely on
+events.
 
-## 5. Concurrency
+## A.6 Cleanup and retention
 
-All lifecycle/reservation updates use InnoDB transactions, `SELECT ... FOR UPDATE` for active slots, lease tokens, and `state_version` compare-and-swap. The architecture assumes one authoritative world process per realm; active-active writers require another design. Worker outputs contain identity nonce, schedule/goal generation, state version, and expiry and are discarded when stale.
+- current roots move to history before deletion/reuse;
+- current-root history is retained at least as long as audit identity references;
+- global reset/migration operations are retained under an explicit operation
+  policy;
+- expired requests, reservations, and goals become terminal before deletion;
+- per-character audit retention follows 0002B;
+- raw-reset damage is repaired only by a managed operation;
+- no cleanup job acts on a `(guid, nonce)` pair without validating the current
+  root and operation state.
+
+## A.7 Concurrency and shutdown
+
+Worker outputs contain identity nonce, schedule/goal generation, state version,
+snapshot generation, and expiry and are discarded when stale. The state writer
+serializes accepted transitions. Active-active writers require another design.
+
+During shutdown:
+
+1. stop producing selection/goal/audit proposals;
+2. stop dispatching synthetic actions;
+3. drain or terminalize the state-writer queue;
+4. directly commit critical state;
+5. unregister Living Realm callbacks;
+6. allow normal core logout/save and database-delay-thread shutdown to continue.
+
+No Living Realm write may occur after step 5.
