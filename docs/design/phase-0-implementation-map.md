@@ -107,10 +107,12 @@ actions, blocks startup, touches the database, or changes runtime bot behavior.
   core, no database, and no live game objects. Every `living/` directory is an
   explicit CMake source group; the existing in-world test DSL under
   `playerbot/strategy/tests` is untouched.
-- CI builds Classic, TBC, and WotLK on self-hosted Ubuntu runners against the
-  pinned 0001A baselines and runs the host tests; macOS/Windows jobs and
-  Discord notifications are removed.
-- Tests: the whole suite (46 tests) plus the three-core build matrix;
+- CI builds Classic (the deployment target) on self-hosted Ubuntu 26.04 runners
+  against the pinned 0001A baseline and runs the host tests; macOS/Windows jobs
+  and Discord notifications are removed. TBC/WotLK are not built in CI for now,
+  but their expansion guards remain in the source and all three expansions were
+  compile-verified on Ubuntu when Phase 0 landed.
+- Tests: the whole suite (46 tests) plus the Classic core build;
   `config_templates_declare_matching_living_realm_defaults` keeps the three
   expansion templates aligned.
 

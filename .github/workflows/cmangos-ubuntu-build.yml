@@ -1,16 +1,21 @@
 name: Ubuntu Build
 
 # CI policy for this fork:
-# - All jobs run on self-hosted Ubuntu Linux runners only (labels: [self-hosted, linux]).
+# - All jobs run on self-hosted Ubuntu 26.04 runners only (labels: [self-hosted, linux]).
 #   No GitHub-hosted runners and no macOS/Windows jobs. If no self-hosted runner is
 #   online, jobs stay queued; do not switch back to GitHub-hosted runners.
+# - Only CMaNGOS Classic is built for now; the deployment target is Classic. The
+#   TBC/WotLK expansion guards remain in the source, and their pinned baselines stay
+#   recorded in docs/design/0001-living-realm-implementation-contract.md (A.1).
 # - No Discord (or any other) notification steps.
 # - Fork pull requests must not execute code on the self-hosted runners; every job
 #   carries a head-repository guard and the workflow uses pull_request (never
 #   pull_request_target).
 # - Runners are provisioned by the repository owner and are expected to provide the
 #   normal CMaNGOS build dependencies: git, cmake (>= 3.16), g++ or clang++,
-#   libboost-all-dev, libssl-dev, and libmysqlclient-dev/default-libmysqlclient-dev.
+#   libboost-all-dev, libssl-dev, libmysqlclient-dev/default-libmysqlclient-dev, and
+#   libicu-dev (on 26.04 the mysql client library links ICU, so the dev package is
+#   required at link time).
 
 on:
   push:
@@ -38,15 +43,15 @@ jobs:
     runs-on: [self-hosted, linux]
 
     steps:
-      - name: Runner preflight (require Ubuntu)
+      - name: Runner preflight (require Ubuntu 26.04)
         run: |
           if [ ! -r /etc/os-release ]; then
             echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
             exit 1
           fi
           . /etc/os-release
-          if [ "${ID}" != "ubuntu" ]; then
-            echo "::error::Self-hosted runner must be Ubuntu Linux, got: ${PRETTY_NAME:-${ID}}"
+          if [ "${ID}" != "ubuntu" ] || [ "${VERSION_ID}" != "26.04" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu 26.04, got: ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
             exit 1
           fi
           echo "Runner OS: ${PRETTY_NAME}"
@@ -73,25 +78,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pinned CMaNGOS core baselines from docs/design/0001-living-realm-implementation-contract.md (A.1).
+        # Pinned CMaNGOS core baseline from docs/design/0001-living-realm-implementation-contract.md (A.1).
+        # Classic only for now; the deployment target is Classic.
         include:
           - version: classic
             core_ref: de8f72993b9e1faa1bf92dd5505f3daec5cea3ce
-          - version: tbc
-            core_ref: e107b53c175e47d7e5b3496181353f5a6349be43
-          - version: wotlk
-            core_ref: 57a34d33fb8cb1822258c690c583cc9be8d04708
 
     steps:
-      - name: Runner preflight (require Ubuntu)
+      - name: Runner preflight (require Ubuntu 26.04)
         run: |
           if [ ! -r /etc/os-release ]; then
             echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
             exit 1
           fi
           . /etc/os-release
-          if [ "${ID}" != "ubuntu" ]; then
-            echo "::error::Self-hosted runner must be Ubuntu Linux, got: ${PRETTY_NAME:-${ID}}"
+          if [ "${ID}" != "ubuntu" ] || [ "${VERSION_ID}" != "26.04" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu 26.04, got: ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
             exit 1
           fi
           echo "Runner OS: ${PRETTY_NAME}"
