@@ -18,13 +18,14 @@ namespace living
         }
 
         void AddEntry(EffectiveConfigReport& report, std::string key, std::string configured,
-            std::string effective, ConfigClassification classification, ConfigSeverity severity,
-            ConfigReasonCode reason, bool blocking)
+            std::string effective, std::string enforcementPoint, ConfigClassification classification,
+            ConfigSeverity severity, ConfigReasonCode reason, bool blocking)
         {
             EffectiveConfigEntry entry;
             entry.key = std::move(key);
             entry.configuredValue = std::move(configured);
             entry.effectiveValue = std::move(effective);
+            entry.enforcementPoint = std::move(enforcementPoint);
             entry.classification = classification;
             entry.severity = severity;
             entry.reason = reason;
@@ -33,16 +34,20 @@ namespace living
         }
 
         // A conflicting legacy value can be overridden fail-closed at runtime, so
-        // strict mode decides whether it blocks (0002 section 3).
+        // strict mode decides whether it blocks (0002 section 3). Phase 0 applies
+        // no override in either mode; it only reports.
         void AddConflict(EffectiveConfigReport& report, bool strict, std::string key,
-            std::string configured, std::string effective, ConfigReasonCode reason)
+            std::string configured, std::string effective, std::string enforcementPoint,
+            ConfigReasonCode reason)
         {
             if (strict)
                 AddEntry(report, std::move(key), std::move(configured), std::move(effective),
-                    ConfigClassification::Conflict, ConfigSeverity::Blocking, reason, true);
+                    std::move(enforcementPoint), ConfigClassification::Conflict,
+                    ConfigSeverity::Blocking, reason, true);
             else
                 AddEntry(report, std::move(key), std::move(configured), std::move(effective),
-                    ConfigClassification::RuntimeOverride, ConfigSeverity::Warning, reason, false);
+                    std::move(enforcementPoint), ConfigClassification::OverrideRequired,
+                    ConfigSeverity::Warning, reason, false);
         }
     }
 
@@ -64,7 +69,7 @@ namespace living
         // blocking entry. This is the LR-001 parity guarantee.
         if (!config.enabled)
         {
-            AddEntry(report, LIVING_REALM_ENABLED_KEY, "0", "0",
+            AddEntry(report, LIVING_REALM_ENABLED_KEY, "0", "0", "none",
                 ConfigClassification::Informational, ConfigSeverity::Info,
                 ConfigReasonCode::LivingRealmDisabled, false);
             return report;
@@ -72,36 +77,59 @@ namespace living
 
         if (config.profile == LivingRealmProfile::Organic)
             AddEntry(report, LIVING_REALM_PROFILE_KEY, config.profileName, "organic",
-                ConfigClassification::Compatible, ConfigSeverity::Info,
+                "startup validation", ConfigClassification::Compatible, ConfigSeverity::Info,
                 ConfigReasonCode::OrganicProfileActive, false);
         else
             // An unknown profile cannot be reasoned about; it blocks regardless of
             // strict mode.
             AddEntry(report, LIVING_REALM_PROFILE_KEY, config.profileName, "organic",
-                ConfigClassification::Conflict, ConfigSeverity::Blocking,
+                "startup validation", ConfigClassification::Conflict, ConfigSeverity::Blocking,
                 ConfigReasonCode::UnknownProfile, true);
 
         // Legacy fabrication settings the Organic profile forces to their
-        // fail-closed values (0002 section 3 mandatory outcomes).
+        // fail-closed values (0002 section 3 mandatory outcomes). Enforcement
+        // points quote the 0002A matrix column.
         if (legacy.instantRandomize)
             AddConflict(report, config.strict, "AiPlayerbot.InstantRandomize", "1", "0",
-                ConfigReasonCode::RandomizationConflict);
+                "manager/factory entry", ConfigReasonCode::RandomizationConflict);
+
+        if (legacy.randomGearUpgradeEnabled)
+            AddConflict(report, config.strict, "AiPlayerbot.RandomGearUpgradeEnabled", "1", "0",
+                "manager/actions/commands", ConfigReasonCode::RandomizationConflict);
 
         if (legacy.rndBotCheatMask != 0)
             AddConflict(report, config.strict, "AiPlayerbot.RndBotCheats",
-                std::to_string(legacy.rndBotCheatMask), "0", ConfigReasonCode::CheatMaskConflict);
+                std::to_string(legacy.rndBotCheatMask), "0", "AI init/config resolution",
+                ConfigReasonCode::CheatMaskConflict);
 
         if (legacy.xpRate != 1.0f)
             AddConflict(report, config.strict, "AiPlayerbot.XPRate",
-                FormatFloatStable(legacy.xpRate), "1", ConfigReasonCode::XpRateConflict);
+                FormatFloatStable(legacy.xpRate), "1", "config + XP action",
+                ConfigReasonCode::XpRateConflict);
 
         if (legacy.syncQuestWithPlayer)
             AddConflict(report, config.strict, "AiPlayerbot.SyncQuestWithPlayer", "1", "0",
-                ConfigReasonCode::QuestSyncConflict);
+                "quest-giver action", ConfigReasonCode::QuestSyncConflict);
 
         if (legacy.syncQuestForPlayer)
             AddConflict(report, config.strict, "AiPlayerbot.SyncQuestForPlayer", "1", "0",
-                ConfigReasonCode::QuestSyncConflict);
+                "quest-giver action", ConfigReasonCode::QuestSyncConflict);
+
+        if (legacy.preQuests)
+            AddConflict(report, config.strict, "AiPlayerbot.PreQuests", "1", "0",
+                "bootstrap/factory", ConfigReasonCode::QuestFabricationConflict);
+
+        if (legacy.configuredQuestRewards)
+            AddConflict(report, config.strict, "AiPlayerbot.RandomBotQuestIds", "set", "empty",
+                "bootstrap/factory", ConfigReasonCode::QuestFabricationConflict);
+
+        if (legacy.syncLevelWithPlayers)
+            AddConflict(report, config.strict, "AiPlayerbot.SyncLevelWithPlayers", "1", "0",
+                "login/AI update", ConfigReasonCode::LevelSyncConflict);
+
+        if (legacy.syncAltLevelToMaster)
+            AddConflict(report, config.strict, "AiPlayerbot.SyncAltLevelToMaster", "1", "0",
+                "login/AI update", ConfigReasonCode::LevelSyncConflict);
 
         {
             std::string lowered = legacy.autoTrainSpells;
@@ -109,44 +137,76 @@ namespace living
                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (lowered == "free")
                 AddConflict(report, config.strict, "AiPlayerbot.AutoTrainSpells",
-                    legacy.autoTrainSpells, "no", ConfigReasonCode::FreeLearningConflict);
+                    legacy.autoTrainSpells, "no", "trainer action/config",
+                    ConfigReasonCode::FreeLearningConflict);
         }
 
         if (legacy.autoLearnTrainerSpells)
             AddConflict(report, config.strict, "AiPlayerbot.AutoLearnTrainerSpells", "1", "0",
-                ConfigReasonCode::FreeLearningConflict);
+                "auto-learn actions", ConfigReasonCode::FreeLearningConflict);
 
         if (legacy.autoLearnQuestSpells)
             AddConflict(report, config.strict, "AiPlayerbot.AutoLearnQuestSpells", "1", "0",
-                ConfigReasonCode::FreeLearningConflict);
+                "auto-learn actions", ConfigReasonCode::FreeLearningConflict);
 
         if (legacy.autoLearnDroppedSpells)
             AddConflict(report, config.strict, "AiPlayerbot.AutoLearnDroppedSpells", "1", "0",
-                ConfigReasonCode::FreeLearningConflict);
+                "auto-learn actions", ConfigReasonCode::FreeLearningConflict);
+
+        if (legacy.autoEnchantUpgradeLoot)
+            AddConflict(report, config.strict, "AiPlayerbot.AutoEnchantUpgradeLoot", "1", "0",
+                "equip/repair/buy/RPG hooks", ConfigReasonCode::EnchantConflict);
+
+        if (legacy.worldBuffCount != 0)
+            AddConflict(report, config.strict, "AiPlayerbot.WorldBuff*",
+                std::to_string(legacy.worldBuffCount), "0", "world-buff action",
+                ConfigReasonCode::WorldBuffConflict);
 
         if (legacy.enableRandomTeleports)
             AddConflict(report, config.strict, "AiPlayerbot.EnableRandomTeleports", "1", "0",
-                ConfigReasonCode::TeleportConflict);
+                "manager/teleport", ConfigReasonCode::TeleportConflict);
 
         if (legacy.randomBotTeleportNearPlayer)
             AddConflict(report, config.strict, "AiPlayerbot.RandomBotTeleportNearPlayer", "1", "0",
-                ConfigReasonCode::TeleportConflict);
+                "manager", ConfigReasonCode::TeleportConflict);
 
         if (legacy.transportTeleportType != 0)
             AddConflict(report, config.strict, "AiPlayerbot.TransportTeleportType",
-                std::to_string(legacy.transportTeleportType), "0", ConfigReasonCode::TransportConflict);
+                std::to_string(legacy.transportTeleportType), "0", "transport action",
+                ConfigReasonCode::TransportConflict);
+
+        if (legacy.randomBotTimedLogout)
+            AddConflict(report, config.strict, "AiPlayerbot.RandomBotTimedLogout", "1", "0",
+                "login/logout callbacks and criteria", ConfigReasonCode::TimedRotationConflict);
+
+        if (legacy.randomBotTimedOffline)
+            AddConflict(report, config.strict, "AiPlayerbot.RandomBotTimedOffline", "1", "0",
+                "login/logout callbacks and criteria", ConfigReasonCode::TimedRotationConflict);
+
+        if (legacy.nonGmFreeSummon)
+            AddConflict(report, config.strict, "AiPlayerbot.NonGmFreeSummon", "1", "0",
+                "summon action", ConfigReasonCode::FreeSummonConflict);
+
+        if (legacy.summonAtInnkeepersEnabled)
+            AddConflict(report, config.strict, "AiPlayerbot.SummonAtInnkeepersEnabled", "1", "0",
+                "summon action", ConfigReasonCode::FreeSummonConflict);
 
         // Hard 0.1 prerequisites: these cannot be overridden fail-closed, so they
         // block regardless of strict mode. Phase 0 models them without enforcing.
         if (!legacy.asyncBotLogin)
             AddEntry(report, "AiPlayerbot.AsyncBotLogin", "0", "1",
-                ConfigClassification::MissingPrerequisite, ConfigSeverity::Blocking,
-                ConfigReasonCode::AsyncBotLoginRequired, true);
+                "manager dispatch/startup validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::AsyncBotLoginRequired, true);
+
+        if (legacy.mixedPopulationDetected)
+            AddEntry(report, "LivingRealm.Population", "mixed", "managed-only",
+                "startup validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::MixedPopulationDetected, true);
 
         if (!legacy.livingSchemaPresent)
             AddEntry(report, "LivingRealm.Schema", "missing", "clean",
-                ConfigClassification::MissingPrerequisite, ConfigSeverity::Blocking,
-                ConfigReasonCode::LivingSchemaMissing, true);
+                "schema validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::LivingSchemaMissing, true);
 
         return report;
     }
@@ -157,7 +217,7 @@ namespace living
         {
             case ConfigClassification::Informational: return "Informational";
             case ConfigClassification::Compatible: return "Compatible";
-            case ConfigClassification::RuntimeOverride: return "RuntimeOverride";
+            case ConfigClassification::OverrideRequired: return "OverrideRequired";
             case ConfigClassification::Conflict: return "Conflict";
             case ConfigClassification::MissingPrerequisite: return "MissingPrerequisite";
         }
@@ -188,10 +248,17 @@ namespace living
             case ConfigReasonCode::CheatMaskConflict: return "CHEAT_MASK_CONFLICT";
             case ConfigReasonCode::XpRateConflict: return "XP_RATE_CONFLICT";
             case ConfigReasonCode::QuestSyncConflict: return "QUEST_SYNC_CONFLICT";
+            case ConfigReasonCode::QuestFabricationConflict: return "QUEST_FABRICATION_CONFLICT";
+            case ConfigReasonCode::LevelSyncConflict: return "LEVEL_SYNC_CONFLICT";
             case ConfigReasonCode::FreeLearningConflict: return "FREE_LEARNING_CONFLICT";
             case ConfigReasonCode::TeleportConflict: return "TELEPORT_CONFLICT";
             case ConfigReasonCode::TransportConflict: return "TRANSPORT_CONFLICT";
+            case ConfigReasonCode::TimedRotationConflict: return "TIMED_ROTATION_CONFLICT";
+            case ConfigReasonCode::FreeSummonConflict: return "FREE_SUMMON_CONFLICT";
+            case ConfigReasonCode::EnchantConflict: return "ENCHANT_CONFLICT";
+            case ConfigReasonCode::WorldBuffConflict: return "WORLD_BUFF_CONFLICT";
             case ConfigReasonCode::AsyncBotLoginRequired: return "ASYNC_BOT_LOGIN_REQUIRED";
+            case ConfigReasonCode::MixedPopulationDetected: return "MIXED_POPULATION_DETECTED";
             case ConfigReasonCode::LivingSchemaMissing: return "LIVING_SCHEMA_MISSING";
         }
 
@@ -211,6 +278,8 @@ namespace living
         text += ToString(entry.severity);
         text += " reason=";
         text += ToString(entry.reason);
+        text += " enforcement=";
+        text += entry.enforcementPoint;
         text += entry.blocking ? " blocking=1" : " blocking=0";
         return text;
     }

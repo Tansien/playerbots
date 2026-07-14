@@ -21,18 +21,30 @@ namespace
     {
         LegacyCompatibilityInputs inputs;
         inputs.instantRandomize = true;
+        inputs.randomGearUpgradeEnabled = true;
         inputs.rndBotCheatMask = 0x25; // taxi|item|breath, the shipped default
         inputs.xpRate = 2.0f;
         inputs.syncQuestWithPlayer = true;
         inputs.syncQuestForPlayer = true;
+        inputs.preQuests = true;
+        inputs.configuredQuestRewards = true;
+        inputs.syncLevelWithPlayers = true;
+        inputs.syncAltLevelToMaster = true;
         inputs.autoTrainSpells = "free";
         inputs.autoLearnTrainerSpells = true;
         inputs.autoLearnQuestSpells = true;
         inputs.autoLearnDroppedSpells = true;
+        inputs.autoEnchantUpgradeLoot = true;
+        inputs.worldBuffCount = 3;
         inputs.enableRandomTeleports = true;
         inputs.randomBotTeleportNearPlayer = true;
         inputs.transportTeleportType = 2;
+        inputs.randomBotTimedLogout = true;
+        inputs.randomBotTimedOffline = true;
+        inputs.nonGmFreeSummon = true;
+        inputs.summonAtInnkeepersEnabled = true;
         inputs.asyncBotLogin = false;
+        inputs.mixedPopulationDetected = true;
         inputs.livingSchemaPresent = false;
         return inputs;
     }
@@ -125,15 +137,26 @@ LIVING_TEST(config_report_represents_every_required_conflict)
     EffectiveConfigReport const report = BuildEffectiveConfigReport(
         LivingRealmConfig::FromValues(true, "organic", true), ConflictingLegacyInputs());
 
-    LIVING_CHECK(CountReason(report, ConfigReasonCode::RandomizationConflict) == 1);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::RandomizationConflict) == 2);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::CheatMaskConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::XpRateConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::QuestSyncConflict) == 2);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::QuestFabricationConflict) == 2);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::LevelSyncConflict) == 2);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::FreeLearningConflict) == 4);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::EnchantConflict) == 1);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::WorldBuffConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TeleportConflict) == 2);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TransportConflict) == 1);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::TimedRotationConflict) == 2);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::FreeSummonConflict) == 2);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::AsyncBotLoginRequired) == 1);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::MixedPopulationDetected) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::LivingSchemaMissing) == 1);
+
+    // Every entry names its 0.1 enforcement point (design 0002 section 3).
+    for (EffectiveConfigEntry const& entry : report.entries)
+        LIVING_CHECK(!entry.enforcementPoint.empty());
 }
 
 LIVING_TEST(config_strict_mode_conflicts_are_deterministic)
@@ -149,18 +172,19 @@ LIVING_TEST(config_strict_mode_conflicts_are_deterministic)
             LIVING_CHECK(entry.severity == ConfigSeverity::Blocking);
             LIVING_CHECK(entry.blocking);
         }
-        LIVING_CHECK(entry.classification != ConfigClassification::RuntimeOverride);
+        LIVING_CHECK(entry.classification != ConfigClassification::OverrideRequired);
     }
     LIVING_CHECK(strict.HasBlockingEntry());
 
-    // Non-strict mode downgrades overridable conflicts to fail-closed runtime
-    // overrides, but hard prerequisites still block.
+    // Non-strict mode marks overridable conflicts as overrides 0.1 must apply
+    // fail-closed at runtime (Phase 0 applies nothing), but hard prerequisites
+    // still block.
     EffectiveConfigReport const lenient = BuildEffectiveConfigReport(
         LivingRealmConfig::FromValues(true, "organic", false), conflicting);
     for (EffectiveConfigEntry const& entry : lenient.entries)
     {
         LIVING_CHECK(entry.classification != ConfigClassification::Conflict);
-        if (entry.classification == ConfigClassification::RuntimeOverride)
+        if (entry.classification == ConfigClassification::OverrideRequired)
         {
             LIVING_CHECK(entry.severity == ConfigSeverity::Warning);
             LIVING_CHECK(!entry.blocking);
@@ -181,7 +205,8 @@ LIVING_TEST(config_report_output_is_stable)
         LivingRealmConfig::FromValues(false, "organic", true), CleanLegacyInputs());
     LIVING_CHECK(FormatEffectiveConfigEntry(report.entries[0]) ==
         "AiPlayerbot.LivingRealm.Enabled configured=0 effective=0 "
-        "classification=Informational severity=Info reason=LIVING_REALM_DISABLED blocking=0");
+        "classification=Informational severity=Info reason=LIVING_REALM_DISABLED "
+        "enforcement=none blocking=0");
 
     LegacyCompatibilityInputs inputs = CleanLegacyInputs();
     inputs.xpRate = 2.5f;
@@ -189,11 +214,15 @@ LIVING_TEST(config_report_output_is_stable)
         LivingRealmConfig::FromValues(true, "organic", true), inputs);
     LIVING_CHECK(FormatReport(conflict) ==
         "AiPlayerbot.LivingRealm.Profile configured=organic effective=organic "
-        "classification=Compatible severity=Info reason=ORGANIC_PROFILE_ACTIVE blocking=0\n"
+        "classification=Compatible severity=Info reason=ORGANIC_PROFILE_ACTIVE "
+        "enforcement=startup validation blocking=0\n"
         "AiPlayerbot.XPRate configured=2.5 effective=1 "
-        "classification=Conflict severity=Blocking reason=XP_RATE_CONFLICT blocking=1\n");
+        "classification=Conflict severity=Blocking reason=XP_RATE_CONFLICT "
+        "enforcement=config + XP action blocking=1\n");
 
     LIVING_CHECK(std::strcmp(ToString(ConfigSeverity::Blocking), "Blocking") == 0);
     LIVING_CHECK(std::strcmp(ToString(ConfigClassification::MissingPrerequisite), "MissingPrerequisite") == 0);
+    LIVING_CHECK(std::strcmp(ToString(ConfigClassification::OverrideRequired), "OverrideRequired") == 0);
     LIVING_CHECK(std::strcmp(ToString(ConfigReasonCode::AsyncBotLoginRequired), "ASYNC_BOT_LOGIN_REQUIRED") == 0);
+    LIVING_CHECK(std::strcmp(ToString(ConfigReasonCode::MixedPopulationDetected), "MIXED_POPULATION_DETECTED") == 0);
 }

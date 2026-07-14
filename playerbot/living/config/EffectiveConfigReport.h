@@ -12,7 +12,8 @@ namespace living
     {
         Informational,       // no Organic consequence
         Compatible,          // configured value is valid for the Organic profile
-        RuntimeOverride,     // non-strict mode: value would be overridden to the fail-closed effective value
+        OverrideRequired,    // non-strict mode: 0.1 must override this to the fail-closed effective
+                             // value at runtime; Phase 0 applies no override and only reports
         Conflict,            // strict mode: value conflicts and blocks Organic startup
         MissingPrerequisite  // hard 0.1 requirement absent; cannot be overridden fail-closed
     };
@@ -33,10 +34,17 @@ namespace living
         CheatMaskConflict,
         XpRateConflict,
         QuestSyncConflict,
+        QuestFabricationConflict,
+        LevelSyncConflict,
         FreeLearningConflict,
         TeleportConflict,
         TransportConflict,
+        TimedRotationConflict,
+        FreeSummonConflict,
+        EnchantConflict,
+        WorldBuffConflict,
         AsyncBotLoginRequired,
+        MixedPopulationDetected,
         LivingSchemaMissing
     };
 
@@ -45,6 +53,7 @@ namespace living
         std::string key;             // source configuration key (or prerequisite identifier)
         std::string configuredValue;
         std::string effectiveValue;  // value the Organic profile requires/would enforce
+        std::string enforcementPoint;// where 0.1 enforces the effective value (0002A column)
         ConfigClassification classification = ConfigClassification::Informational;
         ConfigSeverity severity = ConfigSeverity::Info;
         ConfigReasonCode reason = ConfigReasonCode::LivingRealmDisabled;
@@ -57,18 +66,31 @@ namespace living
     struct LegacyCompatibilityInputs
     {
         bool instantRandomize = false;           // AiPlayerbot.InstantRandomize
+        bool randomGearUpgradeEnabled = false;   // AiPlayerbot.RandomGearUpgradeEnabled
         uint32_t rndBotCheatMask = 0;            // parsed AiPlayerbot.RndBotCheats
         float xpRate = 1.0f;                     // AiPlayerbot.XPRate
         bool syncQuestWithPlayer = false;        // AiPlayerbot.SyncQuestWithPlayer
         bool syncQuestForPlayer = false;         // AiPlayerbot.SyncQuestForPlayer
+        bool preQuests = false;                  // AiPlayerbot.PreQuests
+        bool configuredQuestRewards = false;     // AiPlayerbot.RandomBotQuestIds non-empty
+        bool syncLevelWithPlayers = false;       // AiPlayerbot.SyncLevelWithPlayers
+        bool syncAltLevelToMaster = false;       // AiPlayerbot.SyncAltLevelToMaster
         std::string autoTrainSpells = "no";      // AiPlayerbot.AutoTrainSpells ("free" conflicts)
         bool autoLearnTrainerSpells = false;     // AiPlayerbot.AutoLearnTrainerSpells
         bool autoLearnQuestSpells = false;       // AiPlayerbot.AutoLearnQuestSpells
         bool autoLearnDroppedSpells = false;     // AiPlayerbot.AutoLearnDroppedSpells
+        bool autoEnchantUpgradeLoot = false;     // AiPlayerbot.AutoEnchantUpgradeLoot
+        uint32_t worldBuffCount = 0;             // number of parsed AiPlayerbot.WorldBuff* entries
         bool enableRandomTeleports = false;      // AiPlayerbot.EnableRandomTeleports
         bool randomBotTeleportNearPlayer = false;// AiPlayerbot.RandomBotTeleportNearPlayer
         uint32_t transportTeleportType = 0;      // AiPlayerbot.TransportTeleportType (modes 1/2 conflict)
+        bool randomBotTimedLogout = false;       // AiPlayerbot.RandomBotTimedLogout
+        bool randomBotTimedOffline = false;      // AiPlayerbot.RandomBotTimedOffline
+        bool nonGmFreeSummon = false;            // AiPlayerbot.NonGmFreeSummon
+        bool summonAtInnkeepersEnabled = false;  // AiPlayerbot.SummonAtInnkeepersEnabled
         bool asyncBotLogin = false;              // AiPlayerbot.AsyncBotLogin (0.1 prerequisite)
+        bool mixedPopulationDetected = false;    // legacy bots under the managed prefix; needs DB
+                                                 // inspection, so Phase 0 always passes false
         bool livingSchemaPresent = false;        // future global prerequisite; always false in Phase 0
     };
 
