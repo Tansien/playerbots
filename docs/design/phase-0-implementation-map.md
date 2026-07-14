@@ -19,7 +19,7 @@ partial, with the remainder enumerated here.
 |---|---|
 | Host test target | `CMakeLists.txt` (`BUILD_PLAYERBOTS_LIVING_TESTS`, standalone configure, `playerbots_living_tests` CTest target) |
 | Test harness | `playerbot/living/tests/LivingTest.h`, `playerbot/living/tests/LivingTestMain.cpp` |
-| Action inventory | `playerbot/living/policy/OrganicActionKind.h`, `playerbot/living/policy/OrganicActionMetadata.h/.cpp` (85 kinds, one metadata row each, constexpr completeness check) |
+| Action inventory | `playerbot/living/policy/OrganicActionKind.h`, `playerbot/living/policy/OrganicActionMetadata.h/.cpp` (one metadata row per kind in enum order, constexpr-checked; count grows with source audits per 0002A A.2) |
 | Organic policy | `playerbot/living/policy/OrganicPolicy.h/.cpp` (`EvaluateOrganicPolicy`, pure and deterministic) |
 | Provenance boundary | `playerbot/living/policy/BotProvenance.h/.cpp` |
 | Config model and report | `playerbot/living/config/LivingRealmConfig.h/.cpp`, `playerbot/living/config/EffectiveConfigReport.h/.cpp` |
@@ -153,10 +153,12 @@ partial, with the remainder enumerated here.
 - Tests: `events_names_are_stable`, `events_test_sink_preserves_order`,
   `events_noop_sink_has_no_observable_effect`.
 
-## Explicitly not in Phase 0
+## Explicitly outside Phase 0 (any tranche)
 
-No production SQL or schema, no `LivingRealmStateWriter`, no synthetic-action
-execution, no legacy-behavior suppression, no schedules/goals/commitments, no
-login-manager changes, no overlays, no Population Director, and no fixture
-account/character creation. See the pull request body for the full non-goal
-list.
+No production SQL or schema, no `LivingRealmStateWriter` implementation, no
+synthetic-action execution, no legacy-behavior suppression, no
+schedules/goals/commitments, no login-manager changes, no overlays, no
+Population Director, and no fixture account/character creation. (Deferred
+*Phase 0* items are listed at the top of this document; this section lists
+work that belongs to Living Realm 0.1 and later.) See the pull request body
+for the full non-goal list.
