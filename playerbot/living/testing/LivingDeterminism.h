@@ -89,7 +89,8 @@ namespace living
         explicit SeededLivingRandom(uint64_t seed) : engine(seed) {}
 
         uint32_t NextUInt32();
-        // Uniform in [0, boundExclusive); boundExclusive == 0 returns 0.
+        // Exactly uniform in [0, boundExclusive) via rejection sampling;
+        // boundExclusive == 0 returns 0.
         uint32_t NextUInt32(uint32_t boundExclusive);
         uint64_t NextUInt64();
 

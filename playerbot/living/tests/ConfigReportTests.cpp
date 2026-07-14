@@ -2,6 +2,7 @@
 
 #include "../config/EffectiveConfigReport.h"
 
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -13,6 +14,7 @@ namespace
     {
         LegacyCompatibilityInputs inputs;
         inputs.asyncBotLogin = true;
+        inputs.populationInspection = PopulationInspection::Clean;
         inputs.livingSchemaPresent = true;
         return inputs;
     }
@@ -38,13 +40,14 @@ namespace
         inputs.worldBuffCount = 3;
         inputs.enableRandomTeleports = true;
         inputs.randomBotTeleportNearPlayer = true;
+        inputs.enableMinimalMove = true;
         inputs.transportTeleportType = 2;
         inputs.randomBotTimedLogout = true;
         inputs.randomBotTimedOffline = true;
         inputs.nonGmFreeSummon = true;
         inputs.summonAtInnkeepersEnabled = true;
         inputs.asyncBotLogin = false;
-        inputs.mixedPopulationDetected = true;
+        inputs.populationInspection = PopulationInspection::MixedDetected;
         inputs.livingSchemaPresent = false;
         return inputs;
     }
@@ -146,12 +149,13 @@ LIVING_TEST(config_report_represents_every_required_conflict)
     LIVING_CHECK(CountReason(report, ConfigReasonCode::FreeLearningConflict) == 4);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::EnchantConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::WorldBuffConflict) == 1);
-    LIVING_CHECK(CountReason(report, ConfigReasonCode::TeleportConflict) == 2);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::TeleportConflict) == 3);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TransportConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TimedRotationConflict) == 2);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::FreeSummonConflict) == 2);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::AsyncBotLoginRequired) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::MixedPopulationDetected) == 1);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::PopulationNotInspected) == 0);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::LivingSchemaMissing) == 1);
 
     // Every entry names its 0.1 enforcement point (design 0002 section 3).
@@ -197,6 +201,51 @@ LIVING_TEST(config_strict_mode_conflicts_are_deterministic)
     // Same inputs, same report, every time.
     LIVING_CHECK(FormatReport(strict) == FormatReport(BuildEffectiveConfigReport(
         LivingRealmConfig::FromValues(true, "organic", true), conflicting)));
+}
+
+LIVING_TEST(config_population_inspection_never_reads_clean_by_default)
+{
+    // "Not inspected" is an explicit blocking state, distinct from a verified
+    // managed-only population; the default input never claims clean.
+    LegacyCompatibilityInputs inputs = CleanLegacyInputs();
+    inputs.populationInspection = PopulationInspection::NotInspected;
+    EffectiveConfigReport const notInspected = BuildEffectiveConfigReport(
+        LivingRealmConfig::FromValues(true, "organic", true), inputs);
+    LIVING_CHECK(CountReason(notInspected, ConfigReasonCode::PopulationNotInspected) == 1);
+    LIVING_CHECK(notInspected.HasBlockingEntry());
+
+    inputs.populationInspection = PopulationInspection::MixedDetected;
+    EffectiveConfigReport const mixed = BuildEffectiveConfigReport(
+        LivingRealmConfig::FromValues(true, "organic", true), inputs);
+    LIVING_CHECK(CountReason(mixed, ConfigReasonCode::MixedPopulationDetected) == 1);
+    LIVING_CHECK(CountReason(mixed, ConfigReasonCode::PopulationNotInspected) == 0);
+    LIVING_CHECK(mixed.HasBlockingEntry());
+
+    inputs.populationInspection = PopulationInspection::Clean;
+    EffectiveConfigReport const clean = BuildEffectiveConfigReport(
+        LivingRealmConfig::FromValues(true, "organic", true), inputs);
+    LIVING_CHECK(CountReason(clean, ConfigReasonCode::PopulationNotInspected) == 0);
+    LIVING_CHECK(CountReason(clean, ConfigReasonCode::MixedPopulationDetected) == 0);
+    LIVING_CHECK(!clean.HasBlockingEntry());
+
+    LIVING_CHECK(LegacyCompatibilityInputs().populationInspection == PopulationInspection::NotInspected);
+}
+
+LIVING_TEST(config_float_reporting_is_locale_free_and_faithful)
+{
+    // One ulp above 1.0 must not be reported as "1" while flagging a conflict.
+    LegacyCompatibilityInputs inputs = CleanLegacyInputs();
+    inputs.xpRate = std::nextafter(1.0f, 2.0f);
+    EffectiveConfigReport const report = BuildEffectiveConfigReport(
+        LivingRealmConfig::FromValues(true, "organic", true), inputs);
+
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::XpRateConflict) == 1);
+    for (EffectiveConfigEntry const& entry : report.entries)
+        if (entry.reason == ConfigReasonCode::XpRateConflict)
+        {
+            LIVING_CHECK(entry.configuredValue != "1");
+            LIVING_CHECK(entry.configuredValue.find(',') == std::string::npos);
+        }
 }
 
 LIVING_TEST(config_report_output_is_stable)
