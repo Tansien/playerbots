@@ -22,6 +22,7 @@ namespace living
     {
         // managed bootstrap
         CORE_CHARACTER_CREATE = 0,
+        COMMAND_CHARACTER_PROVISION,
 
         // randomization families
         RANDOMIZE_INSTANT,
@@ -74,6 +75,7 @@ namespace living
         QUEST_COMPLETE_GENERIC,
         QUEST_SYNC_TO_BOT,
         QUEST_SYNC_TO_PLAYER,
+        REMOTE_QUEST_ACCEPT,
 
         // character-state initialization
         WORLD_BUFF_APPLY,
@@ -85,6 +87,7 @@ namespace living
         // social bootstrap
         GUILD_BOOTSTRAP,
         ARENA_TEAM_BOOTSTRAP,
+        GUILD_BANK_TAB_MUTATION,
 
         // the 13 configured cheat-mask categories (BotCheatMask)
         CHEAT_TAXI,
@@ -108,6 +111,7 @@ namespace living
         RPG_CAMP_TELEPORT,
         BG_REGROUP_TELEPORT,
         MINIMAL_MOVE_TELEPORT,
+        UNOBSERVED_MOVE_TELEPORT,
         FREE_SUMMON,
         DIRECT_SUMMON_TELEPORT,
         RANDOM_MANAGER_REVIVE,
@@ -121,6 +125,7 @@ namespace living
         STUCK_EMERGENCY_TELEPORT,
         GAMEPLAY_DEATH_RECOVERY,
         INSTANT_REPOP_RELOCATE,
+        DEATH_RECOVERY_TELEPORT,
 
         // ordinary gameplay through core handlers
         GAMEPLAY_LOOT,
@@ -135,6 +140,7 @@ namespace living
         TRAINER_PURCHASE,
         VENDOR_REPAIR_TRANSACTION,
         AUCTION_TRANSACTION,
+        DIRECT_AUCTION_MUTATION,
         MAIL_TRANSACTION,
         LEGACY_DIRECT_MAIL_MUTATION,
         TRADE_TRANSACTION,
@@ -149,6 +155,7 @@ namespace living
 
         // broad maintenance and administration
         BROAD_MAINTENANCE_COMMAND,
+        DEBUG_MUTATION_COMMAND,
         ADMIN_BYPASS_MUTATION,
 
         // test fixtures

@@ -106,7 +106,9 @@ LIVING_TEST(inventory_fixture_only_rows_are_never_production_eligible)
             LIVING_CHECK(!row.productionEligible);
     }
 
-    LIVING_CHECK(fixtureRows == 3); // CHEAT_RUNTIME_OVERRIDE, BROAD_MAINTENANCE_COMMAND, FIXTURE_PROVISION
+    // CHEAT_RUNTIME_OVERRIDE, BROAD_MAINTENANCE_COMMAND, DEBUG_MUTATION_COMMAND,
+    // COMMAND_CHARACTER_PROVISION, FIXTURE_PROVISION
+    LIVING_CHECK(fixtureRows == 5);
 }
 
 LIVING_TEST(inventory_covers_required_shortcut_families)

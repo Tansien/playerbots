@@ -15,8 +15,7 @@ namespace
         request.kind = kind;
         request.characterGuid = 2000;
         request.provenance = provenance;
-        request.livingRealmEnabled = true;
-        request.organicProfile = true;
+        request.mode = LivingRealmMode::Organic;
         return request;
     }
 }
@@ -161,7 +160,7 @@ LIVING_TEST(provenance_invalid_values_fail_closed)
     LIVING_CHECK(EvaluateOrganicPolicy(trainer).decision == OrganicDecision::Deny);
 
     // Disabled Living Realm remains a legacy passthrough regardless (LR-001).
-    request.livingRealmEnabled = false;
+    request.mode = LivingRealmMode::Disabled;
     OrganicPolicyResult const disabled = EvaluateOrganicPolicy(request);
     LIVING_CHECK(disabled.decision != OrganicDecision::Deny);
     LIVING_CHECK(disabled.reason == OrganicReasonCode::LegacyPassthrough);

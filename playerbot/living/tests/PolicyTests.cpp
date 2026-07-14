@@ -18,15 +18,14 @@ namespace
         request.characterGuid = 1000;
         request.identityNonce = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
         request.provenance = BotProvenance::ORGANIC_CREATED;
-        request.livingRealmEnabled = true;
-        request.organicProfile = true;
+        request.mode = LivingRealmMode::Organic;
         return request;
     }
 
     OrganicRequest DisabledRequestFor(OrganicActionKind kind)
     {
         OrganicRequest request = OrganicRequestFor(kind);
-        request.livingRealmEnabled = false;
+        request.mode = LivingRealmMode::Disabled;
         request.provenance = BotProvenance::LEGACY_UNMANAGED;
         return request;
     }
@@ -68,10 +67,35 @@ LIVING_TEST(policy_unknown_actions_fail_closed_when_enabled)
 LIVING_TEST(policy_unsupported_profile_fails_closed)
 {
     OrganicRequest request = OrganicRequestFor(OrganicActionKind::GAMEPLAY_LOOT);
-    request.organicProfile = false;
+    request.mode = LivingRealmMode::UnknownProfile;
     OrganicPolicyResult const result = EvaluateOrganicPolicy(request);
     LIVING_CHECK(result.decision == OrganicDecision::Deny);
     LIVING_CHECK(result.reason == OrganicReasonCode::UnsupportedProfile);
+
+    // An out-of-range mode value is corrupted input and also fails closed.
+    request.mode = static_cast<LivingRealmMode>(0xFF);
+    LIVING_CHECK(EvaluateOrganicPolicy(request).decision == OrganicDecision::Deny);
+}
+
+LIVING_TEST(policy_unspecified_mode_fails_closed)
+{
+    // A default-constructed request denies: legacy passthrough is a privilege of
+    // an explicitly Disabled realm, so a caller that forgets to resolve the mode
+    // cannot fail open.
+    OrganicRequest defaulted;
+    OrganicPolicyResult const result = EvaluateOrganicPolicy(defaulted);
+    LIVING_CHECK(result.decision == OrganicDecision::Deny);
+
+    OrganicRequest request = OrganicRequestFor(OrganicActionKind::GAMEPLAY_LOOT);
+    request.mode = LivingRealmMode::Unspecified;
+    request.managedBootstrapActive = true;
+    request.protectedRealPlayerCommitment = true;
+    request.recoveryLadderExhausted = true;
+    request.ownerAuthorizedRecovery = true;
+    request.canonicalRouteAllowlisted = true;
+    OrganicPolicyResult const unspecified = EvaluateOrganicPolicy(request);
+    LIVING_CHECK(unspecified.decision == OrganicDecision::Deny);
+    LIVING_CHECK(unspecified.reason == OrganicReasonCode::ModeUnspecified);
 }
 
 LIVING_TEST(policy_legal_automation_is_distinguishable_from_gameplay)
@@ -311,5 +335,7 @@ LIVING_TEST(policy_string_conversions_are_stable)
     LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::RouteNotAllowlisted), "ROUTE_NOT_ALLOWLISTED") == 0);
 
     LIVING_CHECK(std::strcmp(ToString(OrganicSourceKind::TestFixture), "TestFixture") == 0);
+    LIVING_CHECK(std::strcmp(ToString(LivingRealmMode::Unspecified), "Unspecified") == 0);
+    LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::ModeUnspecified), "MODE_UNSPECIFIED") == 0);
     LIVING_CHECK(std::strcmp(ToString(OrganicClassification::RequireAudit), "RequireAudit") == 0);
 }
