@@ -46,7 +46,6 @@ LIVING_TEST(events_test_sink_preserves_order)
     second.type = LivingEventType::QUEST_ACCEPTED;
     second.characterGuid = 1;
     second.identityNonce = { 9, 9, 9 }; // same guid, distinct identity
-    second.actionToken = { 4, 2 };
     second.occurredAtMs = 200;
     second.detail = "quest=123";
     sink.Emit(second);
@@ -62,10 +61,21 @@ LIVING_TEST(events_test_sink_preserves_order)
     LIVING_CHECK(sink.events[1].type == LivingEventType::QUEST_ACCEPTED);
     LIVING_CHECK(sink.events[1].detail == "quest=123");
     LIVING_CHECK(sink.events[1].identityNonce[0] == 9);  // identity survives the sink
-    LIVING_CHECK(sink.events[1].actionToken[0] == 4);
+    LIVING_CHECK((sink.events[1].actionToken == std::array<uint8_t, 16>{})); // token only on synthetic events
     LIVING_CHECK((sink.events[0].identityNonce == std::array<uint8_t, 16>{})); // zero when n/a
     LIVING_CHECK(sink.events[2].type == LivingEventType::LOGOUT_OBSERVED);
     LIVING_CHECK(sink.events[2].characterGuid == 2);
+
+    // Action tokens belong to the SYNTHETIC_ACTION_* events (0002B).
+    LivingEvent synthetic;
+    synthetic.type = LivingEventType::SYNTHETIC_ACTION_REQUESTED;
+    synthetic.characterGuid = 3;
+    synthetic.identityNonce = { 7 };
+    synthetic.actionToken = { 4, 2 };
+    synthetic.occurredAtMs = 300;
+    sink.Emit(synthetic);
+    LIVING_CHECK(sink.events.size() == 4);
+    LIVING_CHECK(sink.events[3].actionToken[0] == 4);
 }
 
 LIVING_TEST(events_noop_sink_has_no_observable_effect)

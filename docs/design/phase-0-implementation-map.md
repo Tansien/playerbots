@@ -182,6 +182,15 @@ blockers per 0002A A.2:
   cancellation of positive, cancelable auras.
 - `DIRECT_ITEM_DESTRUCTION` / `FREE_PET_HAPPINESS`: use the core destroy-item
   handler and the normal feed-pet item/spell path.
+- `ENCOUNTER_AURA_MUTATION` / `LOGIN_ITEM_FABRICATION` / `FREE_TALENT_RESPEC` /
+  `DIRECT_GLYPH_MUTATION`: guard the Netherspite aura shortcut, login
+  starter-item creation, talent respec, and glyph application call sites.
+- `DIRECT_QUEST_ABANDON` guard belongs at the shared `PlayerbotAI::DropQuest`
+  boundary so the pruning, failed-timer, and guild-order callers are all
+  covered.
+- In-world regression scenarios for the quest-cleanup accounting and
+  taxi-money restoration fixes (host tests cannot construct core quest/taxi
+  objects; use the `playerbot/strategy/tests` DSL on a test realm).
 - Population inspection: implement the database check that moves
   `PopulationInspection` off `NotInspected`.
 

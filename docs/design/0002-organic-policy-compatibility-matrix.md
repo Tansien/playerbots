@@ -84,6 +84,14 @@ design.
 | Command character provisioning | `PlayerbotHolder::CreateBot` addclass-style creation with post-create grants | Creates leveled/geared characters on demand | Denied | bot command | Fixture profile only |
 | Guild-bank tab mutation | `BuyGuildBankTabAction` buys tabs/sets rights without interaction | Guild-bank state change | Denied | guild-bank action | None |
 | Remote quest accept | `TravelAction` hardcoded Dark Portal `AddQuest` (10119/9407) | Accepts quests without quest-giver interaction | Denied | travel action | Normal quest-giver handlers only |
+| Direct quest abandon | `PlayerbotAI::DropQuest` callers: quest-log pruning, failed-timer, guild-order actions | Abandons quests outside the core abandon handler | Denied | shared DropQuest boundary | Core abandon semantics only |
+| Free pet happiness | `FeedPetAction`: `SetPower(POWER_HAPPINESS)` | Fills pet happiness without food or the Feed Pet spell | Denied | feed-pet action | Normal feed item/spell path |
+| Direct aura removal | `RemoveAuraAction` (`ra` command) | Removes arbitrary named auras, including hostile debuffs | Denied | remove-aura action | Core-validated cancellation only |
+| Direct item destruction | `SmartDestroyItemAction`/`DestroyItemAction` | Destroys items directly from maintenance/bag-pressure paths | Denied | destroy-item action | Core destroy-item handler |
+| Encounter aura mutation | `KarazhanDungeonActions` (Netherspite): boss beam removal + Perseverance aura | Mutates shared encounter state, can affect real raid members | Denied | encounter action | Core encounter mechanics only |
+| Login item fabrication | `PlayerbotHolder::OnBotLogin` hearthstone/death-gate creation | Recreates items on every login when missing | Denied | login hook | Starter items at managed bootstrap only |
+| Free talent respec | `ChangeTalentsAction` / `TalentSpec::ApplyTalents` | Removes/learns talent spells without respec cost | Denied | talent actions | Core respec rules; earned-point spending stays automation |
+| Direct glyph mutation | `GlyphAction` direct slot application (WotLK) | Applies/removes glyphs outside the core handler | Denied | glyph action | Core glyph handler only |
 
 The rows from "Account-transfer hire" down were added by the Phase 0 source audit
 under the A.2 completion rule; they were not in the original reviewed seed.

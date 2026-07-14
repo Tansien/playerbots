@@ -55,6 +55,7 @@ namespace living
         DIRECT_ITEM_SPLIT_TRANSFER,
         DIRECT_ITEM_OWNERSHIP_TRANSFER,
         DIRECT_ITEM_DESTRUCTION,
+        LOGIN_ITEM_FABRICATION,
 
         // skills, spells, and free learning
         SKILLS_INIT,
@@ -69,6 +70,7 @@ namespace living
         // talents
         TALENT_SPEND_EARNED,
         TALENT_INIT_SYNTHETIC,
+        FREE_TALENT_RESPEC,
 
         // quests
         PREQUEST_INIT,
@@ -82,6 +84,8 @@ namespace living
         // character-state initialization
         WORLD_BUFF_APPLY,
         DIRECT_AURA_REMOVAL,
+        ENCOUNTER_AURA_MUTATION,
+        DIRECT_GLYPH_MUTATION,
         REPUTATION_INIT,
         TAXI_NODES_INIT,
         MOUNT_INIT,
