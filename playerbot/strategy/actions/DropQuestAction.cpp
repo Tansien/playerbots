@@ -116,13 +116,21 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
         if (!quest)
             continue;
 
+        // Counting pass: count EVERY occupied slot and mutate nothing. Failed and
+        // class-specific quests occupy log space too; skipping them made a full
+        // log read as having room, and dropping during "counting" could desync the
+        // counter (a uint8 underflow here previously made later pruning stages
+        // discard progressed/completed quests).
+        if (wantNum == 100)
+        {
+            numQuest++;
+            continue;
+        }
+
         if (bot->GetQuestStatus(questId) != QUEST_STATUS_FAILED)
         {
             if (quest->GetRequiredClasses()) //Do not drop class specific quests
                 continue;
-
-            if (wantNum == 100)
-                numQuest++;
 
             int32 lowLevelDiff = sWorld.getConfig(CONFIG_INT32_QUEST_LOW_LEVEL_HIDE_DIFF);
             if (lowLevelDiff < 0 || bot->GetLevel() <= bot->GetQuestLevelForPlayer(quest) + uint32(lowLevelDiff)) //Quest is not gray
@@ -147,17 +155,11 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
                 continue;
         }
 
-        //Drop quest.
-        // Failed quests reach this point during the counting pass too; they were
-        // never added to numQuest (only non-failed quests are counted), so they
-        // must not decrement it either. An unconditional decrement could wrap the
-        // uint8 to 255 and make the later pruning stages drop progressed or
-        // completed quests until the counter wrapped back down.
-        bool const countedQuest = bot->GetQuestStatus(questId) != QUEST_STATUS_FAILED;
-
+        //Drop quest. Every occupied slot was counted, so every drop decrements,
+        //floored at zero as an underflow backstop.
         bot->GetPlayerbotAI()->DropQuest(questId);
 
-        if (countedQuest && numQuest > 0)
+        if (numQuest > 0)
             numQuest--;
 
         ai->TellPlayer(requester, BOT_TEXT("quest_remove") + " " + chat->formatQuest(quest), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
