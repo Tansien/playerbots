@@ -108,3 +108,34 @@ LIVING_TEST(provenance_legacy_unmanaged_cannot_use_managed_organic_semantics)
     LIVING_CHECK(result.decision == OrganicDecision::Deny);
     LIVING_CHECK(result.reason == OrganicReasonCode::OrganicProvenanceRequired);
 }
+
+LIVING_TEST(provenance_invalid_values_fail_closed)
+{
+    // Corrupted or out-of-range provenance (bad cast, corrupted persisted input) is
+    // never an allow: only ORGANIC_CREATED - or FIXTURE inside the test profile -
+    // reaches the classification switch.
+    OrganicRequest request = EnabledOrganicRequest(OrganicActionKind::GAMEPLAY_LOOT, BotProvenance::Count);
+    OrganicPolicyResult const atCount = EvaluateOrganicPolicy(request);
+    LIVING_CHECK(atCount.decision == OrganicDecision::Deny);
+    LIVING_CHECK(atCount.reason == OrganicReasonCode::InvalidProvenance);
+
+    request.provenance = static_cast<BotProvenance>(0xFF);
+    OrganicPolicyResult const garbage = EvaluateOrganicPolicy(request);
+    LIVING_CHECK(garbage.decision == OrganicDecision::Deny);
+    LIVING_CHECK(garbage.reason == OrganicReasonCode::InvalidProvenance);
+
+    // The fixture test profile does not rescue an invalid value.
+    request.fixtureTestProfile = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(request).decision == OrganicDecision::Deny);
+
+    // Automation and audited kinds fail closed the same way.
+    OrganicRequest trainer = EnabledOrganicRequest(OrganicActionKind::TRAINER_PURCHASE,
+        static_cast<BotProvenance>(0xFF));
+    LIVING_CHECK(EvaluateOrganicPolicy(trainer).decision == OrganicDecision::Deny);
+
+    // Disabled Living Realm remains a legacy passthrough regardless (LR-001).
+    request.livingRealmEnabled = false;
+    OrganicPolicyResult const disabled = EvaluateOrganicPolicy(request);
+    LIVING_CHECK(disabled.decision != OrganicDecision::Deny);
+    LIVING_CHECK(disabled.reason == OrganicReasonCode::LegacyPassthrough);
+}
