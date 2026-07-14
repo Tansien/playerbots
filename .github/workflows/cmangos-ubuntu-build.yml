@@ -5,10 +5,18 @@ name: Ubuntu Build
 #   repository's runner pool (labels: [self-hosted, linux, playerbots]).
 #   No GitHub-hosted runners and no macOS/Windows jobs. If no self-hosted runner is
 #   online, jobs stay queued; do not switch back to GitHub-hosted runners.
+# - Trust boundary: the persistent self-hosted runners execute trusted refs only.
+#   Triggers are push (branches of this repository; writers only) and manual
+#   workflow_dispatch — there is deliberately NO pull_request trigger, because a
+#   pull_request run executes the PR's own copy of this workflow, which a fork can
+#   edit. Same-repo PRs still get checks via the push run on their head commit.
+#   Fork PRs get no automatic CI: review the diff (including workflow changes!)
+#   first, then run it from a trusted branch or workflow_dispatch. Keep the Actions
+#   fork-approval policy at "all external contributors" and prefer ephemeral/JIT
+#   runner registration as additional layers.
 # - No Discord (or any other) notification steps.
-# - Fork pull requests must not execute code on the self-hosted runners; every job
-#   carries a head-repository guard and the workflow uses pull_request (never
-#   pull_request_target).
+# - Build state: each job configures and builds under RUNNER_TEMP, which the runner
+#   recreates per job, so no CMake cache or artifact survives between runs.
 # - Runners are provisioned by the repository owner and are expected to provide the
 #   normal CMaNGOS build dependencies: git, cmake (>= 3.16), g++ or clang++,
 #   libboost-all-dev, libssl-dev, libmysqlclient-dev/default-libmysqlclient-dev, and
@@ -18,8 +26,7 @@ name: Ubuntu Build
 on:
   push:
     branches:
-      - master
-  pull_request:
+      - '**'
   workflow_dispatch:
 
 permissions:
@@ -35,9 +42,6 @@ env:
 jobs:
   living-tests:
     name: Living Realm host tests
-    # Never run automatically for fork pull requests: they must not execute code on
-    # the self-hosted runners.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, playerbots]
 
     steps:
@@ -58,19 +62,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -B build-living -S .
+        run: cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -B "$RUNNER_TEMP/build-living" -S .
 
       - name: Build
-        run: cmake --build build-living -j "$(nproc)"
+        run: cmake --build "$RUNNER_TEMP/build-living" -j "$(nproc)"
 
       - name: Test
-        run: ctest --test-dir build-living --output-on-failure
+        run: ctest --test-dir "$RUNNER_TEMP/build-living" --output-on-failure
 
   build:
     name: Build ${{ matrix.version }}
-    # Never run automatically for fork pull requests: they must not execute code on
-    # the self-hosted runners.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, playerbots]
 
     strategy:
@@ -116,14 +117,15 @@ jobs:
       - name: Configure
         # FETCHCONTENT_SOURCE_DIR_PLAYERBOTS pins the module to this checkout;
         # without it FetchContent would update the directory to upstream master.
+        # Build/install dirs live under RUNNER_TEMP so nothing is reused across runs.
         run: >
           cmake
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           -DBUILD_PLAYERBOTS=ON
           -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
-          -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/run"
-          -B build
+          -DCMAKE_INSTALL_PREFIX="${RUNNER_TEMP}/run-${{ matrix.version }}"
+          -B "${RUNNER_TEMP}/build-${{ matrix.version }}"
           -S core
 
       - name: Build
-        run: cmake --build build -j "$(nproc)"
+        run: cmake --build "${RUNNER_TEMP}/build-${{ matrix.version }}" -j "$(nproc)"
