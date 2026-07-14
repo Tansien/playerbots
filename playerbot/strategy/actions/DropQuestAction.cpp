@@ -57,7 +57,7 @@ bool CleanQuestLogAction::Execute(Event& event)
     uint8 totalQuests = 0;
 
     DropQuestType(requester, totalQuests); //Count the total quests
-     
+
     if (MAX_QUEST_LOG_SIZE - totalQuests > 6)
     {
         DropQuestType(requester, totalQuests, MAX_QUEST_LOG_SIZE, true, true); //Drop failed quests
@@ -148,9 +148,17 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
         }
 
         //Drop quest.
+        // Failed quests reach this point during the counting pass too; they were
+        // never added to numQuest (only non-failed quests are counted), so they
+        // must not decrement it either. An unconditional decrement could wrap the
+        // uint8 to 255 and make the later pruning stages drop progressed or
+        // completed quests until the counter wrapped back down.
+        bool const countedQuest = bot->GetQuestStatus(questId) != QUEST_STATUS_FAILED;
+
         bot->GetPlayerbotAI()->DropQuest(questId);
 
-        numQuest--;
+        if (countedQuest && numQuest > 0)
+            numQuest--;
 
         ai->TellPlayer(requester, BOT_TEXT("quest_remove") + " " + chat->formatQuest(quest), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
     }
