@@ -1,12 +1,10 @@
 name: Ubuntu Build
 
 # CI policy for this fork:
-# - All jobs run on self-hosted Ubuntu 26.04 runners only (labels: [self-hosted, linux]).
+# - All jobs run on self-hosted Ubuntu 26.04 runners only, pinned to this
+#   repository's runner pool (labels: [self-hosted, linux, playerbots]).
 #   No GitHub-hosted runners and no macOS/Windows jobs. If no self-hosted runner is
 #   online, jobs stay queued; do not switch back to GitHub-hosted runners.
-# - Only CMaNGOS Classic is built for now; the deployment target is Classic. The
-#   TBC/WotLK expansion guards remain in the source, and their pinned baselines stay
-#   recorded in docs/design/0001-living-realm-implementation-contract.md (A.1).
 # - No Discord (or any other) notification steps.
 # - Fork pull requests must not execute code on the self-hosted runners; every job
 #   carries a head-repository guard and the workflow uses pull_request (never
@@ -40,7 +38,7 @@ jobs:
     # Never run automatically for fork pull requests: they must not execute code on
     # the self-hosted runners.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted, linux, playerbots]
 
     steps:
       - name: Runner preflight (require Ubuntu 26.04)
@@ -73,16 +71,19 @@ jobs:
     # Never run automatically for fork pull requests: they must not execute code on
     # the self-hosted runners.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted, linux, playerbots]
 
     strategy:
       fail-fast: false
       matrix:
-        # Pinned CMaNGOS core baseline from docs/design/0001-living-realm-implementation-contract.md (A.1).
-        # Classic only for now; the deployment target is Classic.
+        # Pinned CMaNGOS core baselines from docs/design/0001-living-realm-implementation-contract.md (A.1).
         include:
           - version: classic
             core_ref: de8f72993b9e1faa1bf92dd5505f3daec5cea3ce
+          - version: tbc
+            core_ref: e107b53c175e47d7e5b3496181353f5a6349be43
+          - version: wotlk
+            core_ref: 57a34d33fb8cb1822258c690c583cc9be8d04708
 
     steps:
       - name: Runner preflight (require Ubuntu 26.04)
