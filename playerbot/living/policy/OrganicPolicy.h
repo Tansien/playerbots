@@ -48,6 +48,7 @@ namespace living
         BootstrapNotActive,
         FixtureOutsideTestProfile,
         FixtureProvenanceRequired,
+        FixtureIsolated,
         OrganicProvenanceRequired,
         InvalidProvenance,
         LegacyLifecycleExcluded,

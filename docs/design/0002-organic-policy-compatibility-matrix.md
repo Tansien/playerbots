@@ -72,9 +72,14 @@ design.
 | Instant repop relocation | `RepopAction` (`ReleaseSpiritAction.h`): `ResurrectPlayer(1.0)` + teleport to spawn/homebind | Full resurrection and relocation outside core death rules | Denied | repop action | Normal death recovery allowed |
 | BG/arena regroup teleport | `BattleGroundJoinAction` member teleport to leader | Relocates group bots cross-world on queue/join | Denied | BG join action | Core BG entry rules remain gameplay |
 | Direct split-stack item transfer | `GuildShareItemAction`: `Item::CreateItem` split-stack construction | Creates item stack outside trade/mail handlers | Denied | guild share action | Normal trade/mail allowed |
+| Direct item ownership transfer | `GiveItemAction`/`GuildShareItemAction` full stack: `MoveItemFromInventory` + `SetOwnerGuid` | Moves items between characters outside trade handlers | Denied | give/share actions | Normal trade/mail allowed |
+| Legacy direct mail mutation | `CheckMailAction` unconditional `DELETE FROM mail/mail_items` after partial `ProcessMail`; `SendMailAction` direct state changes | Can discard money/attachments; bypasses core mail handlers | Denied | mail actions | Core mail session handlers only |
+| Minimal/off-screen move teleport | `AiPlayerbot.EnableMinimalMove` direct `TeleportTo` along path | Relocates without normal movement when unobserved | Denied | movement action | None |
+| Direct summon helper | `SummonAction`/`UseMeetingStoneAction` helper: `ResurrectPlayer(1.0)` + `TeleportTo` | Resurrects and relocates without core summon rules | Denied | summon/meeting-stone actions | Core-rule summons remain gameplay |
+| RTSC spell grant | `RtscAction` `learnSpell`/`removeSpell` on requesting player | Mutates a real player's spell book | Denied | rtsc action | None |
 
-The last four rows were added by the Phase 0 source audit under the A.2 completion
-rule; they were not in the original reviewed seed.
+The rows from "Account-transfer hire" down were added by the Phase 0 source audit
+under the A.2 completion rule; they were not in the original reviewed seed.
 
 ## A.2 Completion rule
 

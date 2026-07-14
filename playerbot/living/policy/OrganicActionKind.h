@@ -52,6 +52,7 @@ namespace living
         CONSUMABLES_INIT,
         AMMO_REPLENISH,
         DIRECT_ITEM_SPLIT_TRANSFER,
+        DIRECT_ITEM_OWNERSHIP_TRANSFER,
 
         // skills, spells, and free learning
         SKILLS_INIT,
@@ -61,6 +62,7 @@ namespace living
         AUTO_LEARN_QUEST_SPELLS,
         AUTO_LEARN_DROPPED_SPELLS,
         AUTO_LEARN_ITEM_FABRICATION,
+        RTSC_SPELL_GRANT,
 
         // talents
         TALENT_SPEND_EARNED,
@@ -105,7 +107,9 @@ namespace living
         TELEPORT_NEAR_PLAYER,
         RPG_CAMP_TELEPORT,
         BG_REGROUP_TELEPORT,
+        MINIMAL_MOVE_TELEPORT,
         FREE_SUMMON,
+        DIRECT_SUMMON_TELEPORT,
         RANDOM_MANAGER_REVIVE,
 
         // transport
@@ -132,6 +136,7 @@ namespace living
         VENDOR_REPAIR_TRANSACTION,
         AUCTION_TRANSACTION,
         MAIL_TRANSACTION,
+        LEGACY_DIRECT_MAIL_MUTATION,
         TRADE_TRANSACTION,
 
         // lifecycle and population operations
