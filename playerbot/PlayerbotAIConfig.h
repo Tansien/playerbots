@@ -347,6 +347,12 @@ public:
 
     bool randomBotLoginWithPlayer;
     bool asyncBotLogin, preloadHolders;
+
+    // Living Realm (Phase 0): parsed and reported only, never enforced yet.
+    // See docs/design/0001-living-realm.md and playerbot/living/.
+    bool livingRealmEnabled;
+    std::string livingRealmProfile;
+    bool livingRealmStrict;
     uint32 freeRoomForNonSpareBots;
     uint32 loginBotsNearPlayerRange;
     std::vector<std::string> defaultLoginCriteria;
