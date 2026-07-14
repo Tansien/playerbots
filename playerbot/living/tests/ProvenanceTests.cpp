@@ -89,16 +89,43 @@ LIVING_TEST(provenance_fixture_actions_denied_outside_test_profile)
 
 LIVING_TEST(provenance_fixture_identity_cannot_enter_production_semantics)
 {
-    // A FIXTURE identity performing even ordinary gameplay in production Organic
-    // semantics is denied: fixtures stay inside the test profile.
+    // A FIXTURE identity is isolated to the fixture-only actions: gameplay,
+    // automation, bootstrap, and audited classifications all deny, with or
+    // without the test-profile flag (0006 section 7 isolation contract).
     OrganicPolicyResult const loot = EvaluateOrganicPolicy(
         EnabledOrganicRequest(OrganicActionKind::GAMEPLAY_LOOT, BotProvenance::FIXTURE));
     LIVING_CHECK(loot.decision == OrganicDecision::Deny);
-    LIVING_CHECK(loot.reason == OrganicReasonCode::FixtureOutsideTestProfile);
+    LIVING_CHECK(loot.reason == OrganicReasonCode::FixtureIsolated);
 
     OrganicPolicyResult const trainer = EvaluateOrganicPolicy(
         EnabledOrganicRequest(OrganicActionKind::TRAINER_PURCHASE, BotProvenance::FIXTURE));
     LIVING_CHECK(trainer.decision == OrganicDecision::Deny);
+
+    // The test-profile flag does not open production paths for fixtures.
+    OrganicActionKind const productionKinds[] = {
+        OrganicActionKind::GAMEPLAY_LOOT,
+        OrganicActionKind::MAIL_TRANSACTION,
+        OrganicActionKind::TRAINER_PURCHASE,
+        OrganicActionKind::CORE_CHARACTER_CREATE,
+        OrganicActionKind::TRANSPORT_GROUP_SYNC,
+        OrganicActionKind::STUCK_EMERGENCY_TELEPORT,
+        OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER
+    };
+    for (OrganicActionKind kind : productionKinds)
+    {
+        OrganicRequest request = EnabledOrganicRequest(kind, BotProvenance::FIXTURE);
+        request.fixtureTestProfile = true;
+        // Grant every situational context; fixtures must still be denied.
+        request.managedBootstrapActive = true;
+        request.protectedRealPlayerCommitment = true;
+        request.recoveryLadderExhausted = true;
+        request.ownerAuthorizedRecovery = true;
+        request.canonicalRouteAllowlisted = true;
+
+        OrganicPolicyResult const result = EvaluateOrganicPolicy(request);
+        LIVING_CHECK(result.decision == OrganicDecision::Deny);
+        LIVING_CHECK(result.reason == OrganicReasonCode::FixtureIsolated);
+    }
 }
 
 LIVING_TEST(provenance_legacy_unmanaged_cannot_use_managed_organic_semantics)

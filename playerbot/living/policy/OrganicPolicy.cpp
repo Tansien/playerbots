@@ -100,15 +100,19 @@ namespace living
             return Result(OrganicDecision::AllowAutomation, OrganicReasonCode::FixtureAuthorized, true);
         }
 
-        // Fixture identities never act in production semantics (0001 invariant 13).
-        if (request.provenance == BotProvenance::FIXTURE && !request.fixtureTestProfile)
-            return Result(OrganicDecision::Deny, OrganicReasonCode::FixtureOutsideTestProfile, true);
+        // Fixture identities are fully isolated (0001 invariant 13, 0006 section 7):
+        // beyond the fixture-only actions handled above they receive no gameplay,
+        // automation, bootstrap, or audited authorization, in any profile. This is
+        // what keeps fixtures out of production economy, schedules, fairness, and
+        // audit accounting even if a test profile flag is misconfigured on.
+        if (request.provenance == BotProvenance::FIXTURE)
+            return Result(OrganicDecision::Deny, OrganicReasonCode::FixtureIsolated, true);
 
-        // Managed Organic semantics require ORGANIC_CREATED provenance (a FIXTURE
-        // identity inside the test profile was vetted above). Everything else fails
-        // closed: LEGACY_UNMANAGED is a mixed population (0002 section 3, 0003
-        // section 2), and an out-of-range value is corrupted input, never an allow.
-        if (!SatisfiesOrganicProvenance(request.provenance) && request.provenance != BotProvenance::FIXTURE)
+        // Managed Organic semantics require ORGANIC_CREATED provenance. Everything
+        // else fails closed: LEGACY_UNMANAGED is a mixed population (0002 section 3,
+        // 0003 section 2), and an out-of-range value is corrupted input, never an
+        // allow.
+        if (!SatisfiesOrganicProvenance(request.provenance))
             return Result(OrganicDecision::Deny,
                 request.provenance == BotProvenance::LEGACY_UNMANAGED
                     ? OrganicReasonCode::OrganicProvenanceRequired
@@ -189,6 +193,7 @@ namespace living
             case OrganicReasonCode::BootstrapNotActive: return "BOOTSTRAP_NOT_ACTIVE";
             case OrganicReasonCode::FixtureOutsideTestProfile: return "FIXTURE_OUTSIDE_TEST_PROFILE";
             case OrganicReasonCode::FixtureProvenanceRequired: return "FIXTURE_PROVENANCE_REQUIRED";
+            case OrganicReasonCode::FixtureIsolated: return "FIXTURE_ISOLATED";
             case OrganicReasonCode::OrganicProvenanceRequired: return "ORGANIC_PROVENANCE_REQUIRED";
             case OrganicReasonCode::InvalidProvenance: return "INVALID_PROVENANCE";
             case OrganicReasonCode::LegacyLifecycleExcluded: return "LEGACY_LIFECYCLE_EXCLUDED";
