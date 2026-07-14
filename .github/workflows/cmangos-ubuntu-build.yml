@@ -15,7 +15,9 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    # Self-hosted Proxmox runners (gha-pb-*): clang, cmake, mysql/icu/zlib dev
+    # packages are preinstalled on the hosts — the runner user has no sudo.
+    runs-on: [self-hosted, linux, x64, playerbots]
     permissions:
       contents: read
 
@@ -23,8 +25,7 @@ jobs:
       matrix:
         version: [classic, tbc, wotlk]
         include:
-          - os: ubuntu-22.04
-            EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
+          - EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
 
     steps:
       - name: Checkout
