@@ -136,15 +136,12 @@ namespace living
             AddConflict(report, config.strict, "AiPlayerbot.SyncAltLevelToMaster", "1", "0",
                 "login/AI update", ConfigReasonCode::LevelSyncConflict);
 
-        {
-            std::string lowered = legacy.autoTrainSpells;
-            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (lowered == "free")
-                AddConflict(report, config.strict, "AiPlayerbot.AutoTrainSpells",
-                    legacy.autoTrainSpells, "no", "trainer action/config",
-                    ConfigReasonCode::FreeLearningConflict);
-        }
+        // Exact match: TrainerAction recognizes only the literal lowercase "free",
+        // so the report must not flag values the runtime would not treat as free.
+        if (legacy.autoTrainSpells == "free")
+            AddConflict(report, config.strict, "AiPlayerbot.AutoTrainSpells",
+                legacy.autoTrainSpells, "no", "trainer action/config",
+                ConfigReasonCode::FreeLearningConflict);
 
         if (legacy.autoLearnTrainerSpells)
             AddConflict(report, config.strict, "AiPlayerbot.AutoLearnTrainerSpells", "1", "0",
@@ -208,15 +205,24 @@ namespace living
                 ConfigSeverity::Blocking, ConfigReasonCode::AsyncBotLoginRequired, true);
 
         // Population provenance is a hard prerequisite with an explicit unknown
-        // state: "not inspected" must never read as clean.
-        if (legacy.populationInspection == PopulationInspection::NotInspected)
-            AddEntry(report, "LivingRealm.Population", "not-inspected", "managed-only",
-                "startup validation", ConfigClassification::MissingPrerequisite,
-                ConfigSeverity::Blocking, ConfigReasonCode::PopulationNotInspected, true);
-        else if (legacy.populationInspection == PopulationInspection::MixedDetected)
-            AddEntry(report, "LivingRealm.Population", "mixed", "managed-only",
-                "startup validation", ConfigClassification::MissingPrerequisite,
-                ConfigSeverity::Blocking, ConfigReasonCode::MixedPopulationDetected, true);
+        // state. Only a verified Clean value passes silently; "not inspected" and
+        // any out-of-range value block, so corruption can never read as clean.
+        switch (legacy.populationInspection)
+        {
+            case PopulationInspection::Clean:
+                break;
+            case PopulationInspection::MixedDetected:
+                AddEntry(report, "LivingRealm.Population", "mixed", "managed-only",
+                    "startup validation", ConfigClassification::MissingPrerequisite,
+                    ConfigSeverity::Blocking, ConfigReasonCode::MixedPopulationDetected, true);
+                break;
+            case PopulationInspection::NotInspected:
+            default:
+                AddEntry(report, "LivingRealm.Population", "not-inspected", "managed-only",
+                    "startup validation", ConfigClassification::MissingPrerequisite,
+                    ConfigSeverity::Blocking, ConfigReasonCode::PopulationNotInspected, true);
+                break;
+        }
 
         if (!legacy.livingSchemaPresent)
             AddEntry(report, "LivingRealm.Schema", "missing", "clean",
