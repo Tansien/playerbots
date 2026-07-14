@@ -47,8 +47,11 @@ bool GlyphAction::Execute(Event& event)
             std::string removeSlots = param.substr(7);
 
             for (auto& token : getMultiQualifiers(removeSlots, " "))
-            {               
-                if (isValidNumberString(token))
+            {
+                // Reject non-numeric tokens BEFORE stoi: the check was inverted, so
+                // valid numbers were refused while anything else reached stoi and
+                // threw out of the command handler.
+                if (!isValidNumberString(token))
                 {
                     std::ostringstream out;
                     out << token << " is not a valid slot number";
@@ -58,7 +61,8 @@ bool GlyphAction::Execute(Event& event)
 
                 uint8 slotId = stoi(token);
 
-                if (slotId > glyphs.size())
+                // Bounds-check against the vector actually being indexed.
+                if (slotId >= equipedGlyphs.size())
                     glyphs.push_back(0);
                 else
                     glyphs.push_back(equipedGlyphs[slotId]);
