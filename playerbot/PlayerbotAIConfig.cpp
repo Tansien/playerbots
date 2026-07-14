@@ -1,5 +1,6 @@
 
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/living/config/EffectiveConfigReport.h"
 #include "playerbot/playerbot.h"
 #include "RandomPlayerbotFactory.h"
 #include "Accounts/AccountMgr.h"
@@ -821,6 +822,42 @@ bool PlayerbotAIConfig::Initialize()
 
     if (sPlayerbotAIConfig.randomBotJoinBG)
         sRandomPlayerbotMgr.LoadBattleMastersCache();
+
+    livingRealmEnabled = config.GetBoolDefault("AiPlayerbot.LivingRealm.Enabled", false);
+    livingRealmProfile = config.GetStringDefault("AiPlayerbot.LivingRealm.Profile", "organic");
+    livingRealmStrict = config.GetBoolDefault("AiPlayerbot.LivingRealm.Strict", true);
+
+    if (livingRealmEnabled)
+    {
+        // Phase 0 only reports the effective Organic configuration; blocking
+        // startup and suppressing legacy behavior is later Living Realm 0.1 work.
+        living::LegacyCompatibilityInputs legacyInputs;
+        legacyInputs.instantRandomize = instantRandomize;
+        legacyInputs.rndBotCheatMask = rndBotCheatMask;
+        legacyInputs.xpRate = playerbotsXPrate;
+        legacyInputs.syncQuestWithPlayer = syncQuestWithPlayer;
+        legacyInputs.syncQuestForPlayer = syncQuestForPlayer;
+        legacyInputs.autoTrainSpells = autoTrainSpells;
+        legacyInputs.autoLearnTrainerSpells = autoLearnTrainerSpells;
+        legacyInputs.autoLearnQuestSpells = autoLearnQuestSpells;
+        legacyInputs.autoLearnDroppedSpells = autoLearnDroppedSpells;
+        legacyInputs.enableRandomTeleports = enableRandomTeleports;
+        legacyInputs.randomBotTeleportNearPlayer = randomBotTeleportNearPlayer;
+        legacyInputs.transportTeleportType = transportTeleportType;
+        legacyInputs.asyncBotLogin = asyncBotLogin;
+        legacyInputs.livingSchemaPresent = false; // Phase 0 defines no Living Realm schema
+
+        living::EffectiveConfigReport const report = living::BuildEffectiveConfigReport(
+            living::LivingRealmConfig::FromValues(livingRealmEnabled, livingRealmProfile, livingRealmStrict),
+            legacyInputs);
+
+        sLog.outString("Living Realm effective configuration (Phase 0, report only):");
+        for (auto const& entry : report.entries)
+            sLog.outString("    %s", living::FormatEffectiveConfigEntry(entry).c_str());
+
+        if (report.HasBlockingEntry())
+            sLog.outError("Living Realm: blocking configuration conflicts found. Living Realm 0.1 will refuse managed startup until these are resolved; Phase 0 continues with legacy behavior.");
+    }
 
     sLog.outString("---------------------------------------");
     sLog.outString("        AI Playerbot initialized       ");

@@ -1175,3 +1175,19 @@ AiPlayerbot.LLMDefaultPromptsFile = llm_character_card.txt
 
 # Mystery config value. Currently enables async bot pathfinding. Rarely crashes the server.
 # AiPlayerbot.TweakValue = 0
+
+# Living Realm (Phase 0). Master switch for the optional persistent-population
+# layer described in docs/design/0001-living-realm.md. Disabled by default:
+# legacy Playerbots behavior is fully preserved and no Living Realm database
+# schema is required.
+AiPlayerbot.LivingRealm.Enabled = 0
+
+# Living Realm population profile. Only "organic" is defined; any other value is
+# a blocking validation failure when Living Realm is enabled.
+AiPlayerbot.LivingRealm.Profile = organic
+
+# Strict effective-configuration validation. When enabled (default), settings
+# that conflict with the Organic profile are reported as blocking conflicts;
+# when disabled they are reported as fail-closed runtime overrides. Phase 0 only
+# reports; nothing blocks startup yet.
+AiPlayerbot.LivingRealm.Strict = 1
