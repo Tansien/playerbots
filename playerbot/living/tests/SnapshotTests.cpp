@@ -122,4 +122,11 @@ LIVING_TEST(snapshot_staleness_is_detected_per_dimension)
     changed = BaseSnapshot();
     changed.location.zoneId = 999;
     LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+
+    // A freshly captured snapshot carries its own new proposal expiry; that is
+    // bookkeeping, not character state, and must not make a live proposal stale.
+    changed = BaseSnapshot();
+    changed.proposalExpiresAtMs = 99999;
+    LIVING_CHECK(!IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsSnapshotStale(basis, changed, 10000)); // basis' own expiry still applies
 }
