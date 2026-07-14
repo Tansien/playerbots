@@ -183,8 +183,6 @@ bool RpgTaxiAction::Execute(Event& event)
     }
 
     uint32 path = nodes[urand(0, nodes.size() - 1)];
-    uint32 money = bot->GetMoney();
-    bot->SetMoney(money + 100000);
 
     TaxiPathEntry const* entry = sTaxiPathStore.LookupEntry(path);
     if (!entry)
@@ -199,11 +197,17 @@ bool RpgTaxiAction::Execute(Event& event)
         sLog.outError("Bot %s cannot talk to flightmaster (%zu location available)", bot->GetName(), nodes.size());
         return false;
     }
-#ifdef MANGOSBOT_TWO                
+#ifdef MANGOSBOT_TWO
     bot->OnTaxiFlightEject(true);
 #endif
+    // The temporary fare money is granted as late as possible and restored on
+    // every path out, so a failed activation can never leave it on the bot.
+    uint32 money = bot->GetMoney();
+    bot->SetMoney(money + 100000);
+
     if (!bot->ActivateTaxiPathTo({ entry->from, entry->to }, flightMaster, 0))
     {
+        bot->SetMoney(money);
         sLog.outError("Bot %s cannot fly %u (%zu location available)", bot->GetName(), path, nodes.size());
         return false;
     }
