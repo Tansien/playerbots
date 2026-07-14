@@ -72,25 +72,15 @@ namespace living
         return a == b;
     }
 
-    // A proposal computed from `basis` may act on `current` only when identity,
-    // versions, and generations still match and the proposal has not expired.
-    // Anything else is stale and must be discarded without side effects.
+    // Mandatory full validator: a proposal computed from `basis` may act on
+    // `current` only when EVERY field still matches - identity (guid AND nonce),
+    // versions, generations, desired/observed online state, group and commitment
+    // summary, and location - and the proposal has not expired (0005A A.1 requires
+    // actual online/group/map state to be revalidated, not just versions). Anything
+    // else is stale and must be discarded without side effects.
     inline bool IsSnapshotStale(LivingCharacterSnapshot const& basis,
         LivingCharacterSnapshot const& current, uint64_t nowUtcMs)
     {
-        if (!SameIdentity(basis.identity, current.identity))
-            return true;
-        if (basis.stateVersion != current.stateVersion)
-            return true;
-        if (basis.scheduleGeneration != current.scheduleGeneration)
-            return true;
-        if (basis.goalGeneration != current.goalGeneration)
-            return true;
-        if (basis.snapshotGeneration != current.snapshotGeneration)
-            return true;
-        if (nowUtcMs >= basis.proposalExpiresAtMs)
-            return true;
-
-        return false;
+        return !(basis == current) || nowUtcMs >= basis.proposalExpiresAtMs;
     }
 }

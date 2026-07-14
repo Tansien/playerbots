@@ -109,9 +109,17 @@ LIVING_TEST(snapshot_staleness_is_detected_per_dimension)
     LIVING_CHECK(IsSnapshotStale(basis, BaseSnapshot(), 10000));
     LIVING_CHECK(IsSnapshotStale(basis, BaseSnapshot(), 20000));
 
-    // Observed online/group changes alone do not invalidate a proposal; versions
-    // and generations own staleness.
+    // Observed state is part of the mandatory revalidation (0005A A.1): actual
+    // online, group, and location changes invalidate a proposal too.
     changed = BaseSnapshot();
     changed.actualObservedOnline = true;
-    LIVING_CHECK(!IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+
+    changed = BaseSnapshot();
+    changed.group.memberCount += 1;
+    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+
+    changed = BaseSnapshot();
+    changed.location.zoneId = 999;
+    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
 }

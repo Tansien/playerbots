@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -37,6 +38,11 @@ namespace living
     {
         LivingEventType type = LivingEventType::Count;
         uint32_t characterGuid = 0;
+        // Identity nonce: a reused low guid with a different nonce is a different
+        // identity (0003 section 2), so events carry both. Zero when not applicable.
+        std::array<uint8_t, 16> identityNonce{};
+        // 0002B action token for the SYNTHETIC_ACTION_* events; zero otherwise.
+        std::array<uint8_t, 16> actionToken{};
         uint64_t occurredAtMs = 0; // UTC epoch ms from an injected clock
         std::string detail;        // bounded free-form context; never parsed for decisions
     };

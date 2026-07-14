@@ -229,6 +229,13 @@ LIVING_TEST(config_population_inspection_never_reads_clean_by_default)
     LIVING_CHECK(!clean.HasBlockingEntry());
 
     LIVING_CHECK(LegacyCompatibilityInputs().populationInspection == PopulationInspection::NotInspected);
+
+    // An out-of-range value must block like NotInspected, never pass like Clean.
+    inputs.populationInspection = static_cast<PopulationInspection>(0xFF);
+    EffectiveConfigReport const garbage = BuildEffectiveConfigReport(
+        LivingRealmConfig::FromValues(true, "organic", true), inputs);
+    LIVING_CHECK(CountReason(garbage, ConfigReasonCode::PopulationNotInspected) == 1);
+    LIVING_CHECK(garbage.HasBlockingEntry());
 }
 
 LIVING_TEST(config_float_reporting_is_locale_free_and_faithful)
