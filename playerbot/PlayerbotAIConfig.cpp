@@ -794,9 +794,11 @@ bool PlayerbotAIConfig::Initialize()
 
     targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f),
 
-    livingRealmEnabled = config.GetBoolDefault("AiPlayerbot.LivingRealm.Enabled", false);
-    livingRealmProfile = config.GetStringDefault("AiPlayerbot.LivingRealm.Profile", "organic");
-    livingRealmStrict = config.GetBoolDefault("AiPlayerbot.LivingRealm.Strict", true);
+    // Keys/defaults come from the shared constants so the template-parity host test
+    // also guards this parser against drift.
+    livingRealmEnabled = config.GetBoolDefault(living::LIVING_REALM_ENABLED_KEY, living::LIVING_REALM_ENABLED_DEFAULT);
+    livingRealmProfile = config.GetStringDefault(living::LIVING_REALM_PROFILE_KEY, living::LIVING_REALM_PROFILE_DEFAULT);
+    livingRealmStrict = config.GetBoolDefault(living::LIVING_REALM_STRICT_KEY, living::LIVING_REALM_STRICT_DEFAULT);
 
     if (livingRealmEnabled)
     {
@@ -823,13 +825,16 @@ bool PlayerbotAIConfig::Initialize()
         legacyInputs.worldBuffCount = static_cast<uint32>(worldBuffs.size());
         legacyInputs.enableRandomTeleports = enableRandomTeleports;
         legacyInputs.randomBotTeleportNearPlayer = randomBotTeleportNearPlayer;
+        legacyInputs.enableMinimalMove = enableMinimalMove;
         legacyInputs.transportTeleportType = transportTeleportType;
         legacyInputs.randomBotTimedLogout = randomBotTimedLogout;
         legacyInputs.randomBotTimedOffline = randomBotTimedOffline;
         legacyInputs.nonGmFreeSummon = nonGmFreeSummon;
         legacyInputs.summonAtInnkeepersEnabled = summonAtInnkeepersEnabled;
         legacyInputs.asyncBotLogin = asyncBotLogin;
-        legacyInputs.mixedPopulationDetected = false; // needs DB inspection; 0.1 startup work
+        // Population provenance needs DB inspection (0.1 startup work); report the
+        // honest unknown state instead of claiming a clean population.
+        legacyInputs.populationInspection = living::PopulationInspection::NotInspected;
         legacyInputs.livingSchemaPresent = false;     // Phase 0 defines no Living Realm schema
 
         living::EffectiveConfigReport const report = living::BuildEffectiveConfigReport(

@@ -44,8 +44,19 @@ namespace living
         EnchantConflict,
         WorldBuffConflict,
         AsyncBotLoginRequired,
+        PopulationNotInspected,
         MixedPopulationDetected,
         LivingSchemaMissing
+    };
+
+    // Provenance state of the existing random-bot population under the managed
+    // account prefix. Detection requires database inspection (0.1 startup work), so
+    // "not inspected" is an explicit state: it must never be reported as clean.
+    enum class PopulationInspection : uint8_t
+    {
+        NotInspected,
+        Clean,
+        MixedDetected
     };
 
     struct EffectiveConfigEntry
@@ -83,14 +94,15 @@ namespace living
         uint32_t worldBuffCount = 0;             // number of parsed AiPlayerbot.WorldBuff* entries
         bool enableRandomTeleports = false;      // AiPlayerbot.EnableRandomTeleports
         bool randomBotTeleportNearPlayer = false;// AiPlayerbot.RandomBotTeleportNearPlayer
+        bool enableMinimalMove = false;          // AiPlayerbot.EnableMinimalMove (direct teleport moves)
         uint32_t transportTeleportType = 0;      // AiPlayerbot.TransportTeleportType (modes 1/2 conflict)
         bool randomBotTimedLogout = false;       // AiPlayerbot.RandomBotTimedLogout
         bool randomBotTimedOffline = false;      // AiPlayerbot.RandomBotTimedOffline
         bool nonGmFreeSummon = false;            // AiPlayerbot.NonGmFreeSummon
         bool summonAtInnkeepersEnabled = false;  // AiPlayerbot.SummonAtInnkeepersEnabled
         bool asyncBotLogin = false;              // AiPlayerbot.AsyncBotLogin (0.1 prerequisite)
-        bool mixedPopulationDetected = false;    // legacy bots under the managed prefix; needs DB
-                                                 // inspection, so Phase 0 always passes false
+        PopulationInspection populationInspection =
+            PopulationInspection::NotInspected;  // Phase 0 cannot inspect; never claim clean
         bool livingSchemaPresent = false;        // future global prerequisite; always false in Phase 0
     };
 

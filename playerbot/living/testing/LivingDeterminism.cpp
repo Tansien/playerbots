@@ -56,9 +56,16 @@ namespace living
         if (boundExclusive == 0)
             return 0;
 
-        // std::uniform_int_distribution is not portable across standard libraries;
-        // Lemire-style reduction keeps sequences identical on every platform.
-        return static_cast<uint32_t>((static_cast<uint64_t>(NextUInt32()) * boundExclusive) >> 32);
+        // std::uniform_int_distribution is not portable across standard libraries.
+        // Rejection sampling keeps the result exactly uniform (no modulo/multiply
+        // bias) while staying reproducible: the loop consumes engine outputs
+        // deterministically.
+        uint32_t const rejectBelow = static_cast<uint32_t>(0u - boundExclusive) % boundExclusive;
+        uint32_t value = NextUInt32();
+        while (value < rejectBelow)
+            value = NextUInt32();
+
+        return value % boundExclusive;
     }
 
     uint64_t SeededLivingRandom::NextUInt64()

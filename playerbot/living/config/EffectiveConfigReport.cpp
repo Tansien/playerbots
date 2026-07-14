@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
+#include <locale>
 #include <sstream>
 
 namespace living
@@ -10,9 +12,12 @@ namespace living
     {
         std::string FormatFloatStable(float value)
         {
-            // Deterministic short form ("1", "1.5") so report text is stable across
-            // platforms; std::to_string's fixed six decimals are noisy in reports.
+            // Locale-independent, round-trip-faithful text: the classic locale keeps
+            // the decimal point a '.', and max_digits10 makes values that merely
+            // differ from 1.0 by one ulp visibly different from "1" in the report.
             std::ostringstream out;
+            out.imbue(std::locale::classic());
+            out.precision(std::numeric_limits<float>::max_digits10);
             out << value;
             return out.str();
         }
@@ -170,6 +175,10 @@ namespace living
             AddConflict(report, config.strict, "AiPlayerbot.RandomBotTeleportNearPlayer", "1", "0",
                 "manager", ConfigReasonCode::TeleportConflict);
 
+        if (legacy.enableMinimalMove)
+            AddConflict(report, config.strict, "AiPlayerbot.EnableMinimalMove", "1", "0",
+                "movement action", ConfigReasonCode::TeleportConflict);
+
         if (legacy.transportTeleportType != 0)
             AddConflict(report, config.strict, "AiPlayerbot.TransportTeleportType",
                 std::to_string(legacy.transportTeleportType), "0", "transport action",
@@ -198,7 +207,13 @@ namespace living
                 "manager dispatch/startup validation", ConfigClassification::MissingPrerequisite,
                 ConfigSeverity::Blocking, ConfigReasonCode::AsyncBotLoginRequired, true);
 
-        if (legacy.mixedPopulationDetected)
+        // Population provenance is a hard prerequisite with an explicit unknown
+        // state: "not inspected" must never read as clean.
+        if (legacy.populationInspection == PopulationInspection::NotInspected)
+            AddEntry(report, "LivingRealm.Population", "not-inspected", "managed-only",
+                "startup validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::PopulationNotInspected, true);
+        else if (legacy.populationInspection == PopulationInspection::MixedDetected)
             AddEntry(report, "LivingRealm.Population", "mixed", "managed-only",
                 "startup validation", ConfigClassification::MissingPrerequisite,
                 ConfigSeverity::Blocking, ConfigReasonCode::MixedPopulationDetected, true);
@@ -258,6 +273,7 @@ namespace living
             case ConfigReasonCode::EnchantConflict: return "ENCHANT_CONFLICT";
             case ConfigReasonCode::WorldBuffConflict: return "WORLD_BUFF_CONFLICT";
             case ConfigReasonCode::AsyncBotLoginRequired: return "ASYNC_BOT_LOGIN_REQUIRED";
+            case ConfigReasonCode::PopulationNotInspected: return "POPULATION_NOT_INSPECTED";
             case ConfigReasonCode::MixedPopulationDetected: return "MIXED_POPULATION_DETECTED";
             case ConfigReasonCode::LivingSchemaMissing: return "LIVING_SCHEMA_MISSING";
         }
