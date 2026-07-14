@@ -59,7 +59,7 @@ jobs:
           echo "Runner OS: ${PRETTY_NAME}"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Configure
         run: cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -B "$RUNNER_TEMP/build-living" -S .
@@ -101,7 +101,7 @@ jobs:
           echo "Runner OS: ${PRETTY_NAME}"
 
       - name: Checkout CMaNGOS ${{ matrix.version }} core
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: cmangos/mangos-${{ matrix.version }}
           ref: ${{ matrix.core_ref }}
@@ -110,7 +110,7 @@ jobs:
       - name: Checkout playerbots
         # Must live inside the core tree (the core adds it via add_subdirectory);
         # checked out after the core so the core checkout cannot wipe it.
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           path: core/src/modules/PlayerBots
 
