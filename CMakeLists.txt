@@ -16,6 +16,60 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
 
+# ---- Living Realm host-side tests (docs/design/0001-living-realm-implementation-contract.md A.4) ----
+# This file is normally added from a CMaNGOS core build (BUILD_PLAYERBOTS=ON). It
+# can also be configured standalone to build only the host-side test target:
+#   cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -B build -S <this directory>
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+  cmake_minimum_required(VERSION 3.16)
+  project(PlayerbotsLiving CXX)
+  set(PLAYERBOTS_STANDALONE ON)
+else()
+  set(PLAYERBOTS_STANDALONE OFF)
+endif()
+
+option(BUILD_PLAYERBOTS_LIVING_TESTS "Build the host-side playerbots_living_tests CTest executable" OFF)
+
+if(PLAYERBOTS_STANDALONE AND NOT BUILD_PLAYERBOTS_LIVING_TESTS)
+  message(FATAL_ERROR "Standalone configuration only builds the Living Realm host tests; "
+    "set -DBUILD_PLAYERBOTS_LIVING_TESTS=ON, or configure through a CMaNGOS core with -DBUILD_PLAYERBOTS=ON")
+endif()
+
+# Living Realm sources are standard C++ with no core/world dependency; they are
+# compiled into the module library and into the host-side test executable. Each
+# directory is added explicitly (the build does not recurse into new directories).
+file(GLOB Playerbot_Living_Config ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/config/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/config/*.h)
+file(GLOB Playerbot_Living_Policy ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/policy/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/policy/*.h)
+file(GLOB Playerbot_Living_Events ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/events/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/events/*.h)
+file(GLOB Playerbot_Living_Snapshots ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/snapshots/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/snapshots/*.h)
+file(GLOB Playerbot_Living_Testing ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/testing/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/testing/*.h)
+
+set(PLAYERBOTS_LIVING_SRCS
+    ${Playerbot_Living_Config}
+    ${Playerbot_Living_Policy}
+    ${Playerbot_Living_Events}
+    ${Playerbot_Living_Snapshots}
+    ${Playerbot_Living_Testing}
+)
+
+if(BUILD_PLAYERBOTS_LIVING_TESTS)
+  enable_testing()
+
+  file(GLOB Playerbot_Living_Tests ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/tests/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/tests/*.h)
+
+  add_executable(playerbots_living_tests ${PLAYERBOTS_LIVING_SRCS} ${Playerbot_Living_Tests})
+  set_target_properties(playerbots_living_tests PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  target_compile_definitions(playerbots_living_tests PRIVATE
+    PLAYERBOTS_LIVING_CONF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/playerbot")
+
+  add_test(NAME playerbots_living_tests COMMAND playerbots_living_tests)
+endif()
+
+if(PLAYERBOTS_STANDALONE)
+  return()
+endif()
+# ---- end Living Realm host-side tests ----
+
 set(LIBRARY_NAME playerbots)
 
 #Add PCH Files
@@ -117,6 +171,10 @@ file(GLOB Playerbot_DeathKnight ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/strategy/d
 file(GLOB Playerbot_Tests ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/strategy/tests/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/strategy/tests/*.h)
     source_group("Player Bot\\Strategies\\Tests" FILES ${Playerbot_Tests})
     LIST(APPEND LIBRARY_SRCS ${Playerbot_Tests})
+
+#Living Realm (pure sources shared with the host-side test target above)
+    source_group("Player Bot\\Living" FILES ${PLAYERBOTS_LIVING_SRCS})
+    LIST(APPEND LIBRARY_SRCS ${PLAYERBOTS_LIVING_SRCS})
 
 # Define ENABLE_PLAYERBOTS if need
 if (BUILD_PLAYERBOTS)
