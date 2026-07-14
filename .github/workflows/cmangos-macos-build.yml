@@ -29,10 +29,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          repository: ${{github.repository_owner}}/mangos-${{matrix.version}}
+          repository: cmangos/mangos-${{matrix.version}}
           ref: master
           path: ${{env.REPO_DIR}}
           submodules: true
+
+      # The core FetchContents the module from cmangos/playerbots@master.
+      # Check out THIS commit instead and point FetchContent at it below.
+      - name: Checkout playerbots module
+        uses: actions/checkout@v4
+        with:
+          path: src/modules/PlayerBots
 
       - name: Install Dependencies
         run: |
@@ -56,6 +63,7 @@ jobs:
         run: |
           cmake -DBoost_ARCHITECTURE=-x64 \
             ${{matrix.EXTRA_BUILD}} \
+            -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS=${{env.REPO_DIR}}/src/modules/PlayerBots \
             -DCMAKE_INSTALL_PREFIX=/home/runner/work \
             -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
             -DICU_ROOT="$(brew --prefix icu4c)" \
