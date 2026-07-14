@@ -1,9 +1,17 @@
 # Living Realm Phase 0: implementation map
 
-Maps the Phase 0 implementation and its tests to the requirements in
-[0001A section A.7](0001-living-realm-implementation-contract.md). Phase 0 is
-foundations only: pure models, seams, and tests. Nothing here executes synthetic
-actions, blocks startup, touches the database, or changes runtime bot behavior.
+Maps the **first Phase 0 tranche** and its tests to the requirements in
+[0001A section A.7](0001-living-realm-implementation-contract.md). This tranche
+is pure models, seams, and tests: nothing here executes synthetic actions,
+blocks startup, touches the database, or changes runtime bot behavior.
+
+Phase 0 items from [0001 section 7](0001-living-realm.md) that are **not** in
+this tranche and land with the next implementation PR: the single-writer
+persistence seam and migration/version detection model, production telemetry
+call sites for the existing observations (login/logout, group, travel, quest),
+baseline CPU/database/login/travel/activity metrics, and the 0006 comparison
+fixtures. Until then, "Phase 0 implemented" claims should be read as this map:
+partial, with the remainder enumerated here.
 
 ## Components
 
@@ -56,6 +64,12 @@ actions, blocks startup, touches the database, or changes runtime bot behavior.
   reconciler requirement, production eligibility, fixture-only status, design
   reference). A constexpr check fails compilation on a kind without a
   consistent row; a generic misc/unknown kind does not exist.
+- The Phase 0 source audit added four rows beyond the reviewed 0002A seed
+  (recorded in 0002A per its A.2 rule): `ACCOUNT_TRANSFER_HIRE` (HireAction),
+  `INSTANT_REPOP_RELOCATE` (RepopAction), `BG_REGROUP_TELEPORT`
+  (BattleGroundJoinAction), and `DIRECT_ITEM_SPLIT_TRANSFER`
+  (GuildShareItemAction). Per A.2 the inventory is a growing seed; proving
+  completeness is a 0.1 acceptance gate, not a Phase 0 claim.
 - Only `STUCK_EMERGENCY_TELEPORT`, `TRANSPORT_GROUP_SYNC`, and
   `PUBLIC_TRANSPORT_TRANSFER` may return `RequireAudit`, each gated on explicit
   pure-data context (classification only; execution is later work).
@@ -107,12 +121,12 @@ actions, blocks startup, touches the database, or changes runtime bot behavior.
   core, no database, and no live game objects. Every `living/` directory is an
   explicit CMake source group; the existing in-world test DSL under
   `playerbot/strategy/tests` is untouched.
-- CI builds Classic (the deployment target) on self-hosted Ubuntu 26.04 runners
-  against the pinned 0001A baseline and runs the host tests; macOS/Windows jobs
-  and Discord notifications are removed. TBC/WotLK are not built in CI for now,
-  but their expansion guards remain in the source and all three expansions were
-  compile-verified on Ubuntu when Phase 0 landed.
-- Tests: the whole suite (46 tests) plus the Classic core build;
+- CI builds Classic, TBC, and WotLK on self-hosted Ubuntu 26.04 runners
+  (labels `[self-hosted, linux, playerbots]`) against the pinned 0001A
+  baselines and runs the host tests; macOS/Windows jobs and Discord
+  notifications are removed, satisfying the three-expansion rule in the design
+  README.
+- Tests: the whole suite plus the three-core build matrix;
   `config_templates_declare_matching_living_realm_defaults` keeps the three
   expansion templates aligned.
 
