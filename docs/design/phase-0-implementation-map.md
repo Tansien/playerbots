@@ -153,6 +153,29 @@ partial, with the remainder enumerated here.
 - Tests: `events_names_are_stable`, `events_test_sink_preserves_order`,
   `events_noop_sink_has_no_observable_effect`.
 
+## Tracked 0.1 acceptance blockers (runtime work owed on classified paths)
+
+Classification is Phase 0's deliverable; these classified paths additionally
+need runtime changes before 0.1 acceptance, and are tracked here as mandatory
+blockers per 0002A A.2:
+
+- `LEGACY_DIRECT_MAIL_MUTATION`: make `CheckMailAction` deletion conditional on
+  every money/attachment operation succeeding (atomic with processing), or
+  route mail through the core handlers.
+- `DEBUG_MUTATION_COMMAND`: gate `cdebug` mutation subcommands behind
+  moderator/fixture authorization; keep read-only diagnostics separate.
+- `BROAD_MAINTENANCE_COMMAND` wildcard targeting: preflight that every `%`
+  target is a FIXTURE identity before any mutation (per-identity policy
+  evaluation already denies non-fixture targets).
+- `UNOBSERVED_MOVE_TELEPORT` / `MINIMAL_MOVE_TELEPORT` /
+  `DEATH_RECOVERY_TELEPORT` / `DIRECT_SUMMON_TELEPORT` /
+  `BG_REGROUP_TELEPORT`: guard the direct `TeleportTo` call sites for managed
+  identities.
+- `DIRECT_AUCTION_MUTATION` / `DIRECT_ITEM_*_TRANSFER`: route through the core
+  session handlers or deny at the call site.
+- Population inspection: implement the database check that moves
+  `PopulationInspection` off `NotInspected`.
+
 ## Explicitly outside Phase 0 (any tranche)
 
 No production SQL or schema, no `LivingRealmStateWriter` implementation, no

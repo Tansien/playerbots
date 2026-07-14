@@ -17,6 +17,19 @@ namespace living
         Deny             // no side effect
     };
 
+    // Effective Living Realm mode for a request. Unspecified is the default and
+    // DENIES: legacy passthrough is a privilege of an explicitly Disabled realm, so
+    // a call site that forgets to resolve the mode fails closed instead of open.
+    enum class LivingRealmMode : uint8_t
+    {
+        Unspecified = 0, // not resolved by the caller: every action denies
+        Disabled,        // Living Realm off: strict legacy passthrough (LR-001)
+        Organic,         // enabled with the Organic profile
+        UnknownProfile   // enabled with an unrecognized profile: every action denies
+    };
+
+    char const* ToString(LivingRealmMode value);
+
     // Where the guarded request originated. Informational for reports and telemetry;
     // decisions depend on the explicit boolean context, not on trusting the caller.
     enum class OrganicSourceKind : uint8_t
@@ -44,6 +57,7 @@ namespace living
         FixtureAuthorized,
         DeniedByClassification,
         UnknownAction,
+        ModeUnspecified,
         UnsupportedProfile,
         BootstrapNotActive,
         FixtureOutsideTestProfile,
@@ -67,7 +81,7 @@ namespace living
     // structure with the audit protocol implementation, not in Phase 0.
     struct OrganicRequest
     {
-        // Defaults fail closed: unknown action, unmanaged provenance, disabled realm.
+        // Defaults fail closed: unknown action, unresolved mode, unmanaged provenance.
         OrganicActionKind kind = OrganicActionKind::Count;
         OrganicSourceKind source = OrganicSourceKind::AiUpdate;
 
@@ -75,9 +89,9 @@ namespace living
         std::array<uint8_t, 16> identityNonce{};
         BotProvenance provenance = BotProvenance::LEGACY_UNMANAGED;
 
-        // effective configuration context
-        bool livingRealmEnabled = false;
-        bool organicProfile = false;
+        // effective configuration context; legacy passthrough requires an explicit
+        // Disabled mode, never a default
+        LivingRealmMode mode = LivingRealmMode::Unspecified;
         bool fixtureTestProfile = false;
 
         // situational context

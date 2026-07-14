@@ -77,6 +77,13 @@ design.
 | Minimal/off-screen move teleport | `AiPlayerbot.EnableMinimalMove` direct `TeleportTo` along path | Relocates without normal movement when unobserved | Denied | movement action | None |
 | Direct summon helper | `SummonAction`/`UseMeetingStoneAction` helper: `ResurrectPlayer(1.0)` + `TeleportTo` | Resurrects and relocates without core summon rules | Denied | summon/meeting-stone actions | Core-rule summons remain gameplay |
 | RTSC spell grant | `RtscAction` `learnSpell`/`removeSpell` on requesting player | Mutates a real player's spell book | Denied | rtsc action | None |
+| Direct auction mutation | `GuildShareAhBuyAction`: `AuctionEntry::UpdateBid` bypassing `HandleAuctionPlaceBid` | Direct auction state change | Denied | guild AH action | Core auction handlers only |
+| Debug mutation subcommands | `DebugAction` (`cdebug`) do/quest/position/npc paths reachable by group members | Arbitrary actions, quest/item/money fabrication, teleports | Denied | debug action | Fixture profile only; read-only diagnostics excluded |
+| Unobserved movement teleport | `MovementActions` activity-throttled `TeleportTo` (area-trigger, long-distance, flight shortcuts) | Relocates without normal movement | Denied | movement action | None |
+| Death-recovery teleport | `ReviveFromCorpseAction` direct `TeleportTo` corpse/graveyard | Relocates during death recovery when unobserved | Denied | revive action | Normal corpse run remains gameplay |
+| Command character provisioning | `PlayerbotHolder::CreateBot` addclass-style creation with post-create grants | Creates leveled/geared characters on demand | Denied | bot command | Fixture profile only |
+| Guild-bank tab mutation | `BuyGuildBankTabAction` buys tabs/sets rights without interaction | Guild-bank state change | Denied | guild-bank action | None |
+| Remote quest accept | `TravelAction` hardcoded Dark Portal `AddQuest` (10119/9407) | Accepts quests without quest-giver interaction | Denied | travel action | Normal quest-giver handlers only |
 
 The rows from "Account-transfer hire" down were added by the Phase 0 source audit
 under the A.2 completion rule; they were not in the original reviewed seed.

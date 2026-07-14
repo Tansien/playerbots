@@ -71,22 +71,28 @@ namespace living
         OrganicActionMetadata const* metadata = TryGetOrganicActionMetadata(request.kind);
         bool const knownAction = metadata != nullptr;
 
-        // Disabled Living Realm is a passthrough: the guard must not alter legacy
-        // behavior in any way (LR-001), including for actions it does not know.
-        if (!request.livingRealmEnabled)
+        // Explicitly disabled Living Realm is a passthrough: the guard must not
+        // alter legacy behavior in any way (LR-001), including for actions it does
+        // not know. Only the explicit Disabled mode earns this; every other mode
+        // value falls through to fail-closed handling below.
+        if (request.mode == LivingRealmMode::Disabled)
         {
             bool const gameplay = knownAction && metadata->classification == OrganicClassification::AllowGameplay;
             return Result(gameplay ? OrganicDecision::AllowGameplay : OrganicDecision::AllowAutomation,
                 OrganicReasonCode::LegacyPassthrough, knownAction);
         }
 
-        // Enabled Organic mode fails closed: unknown actions have no side effects.
+        // Fail closed: unknown actions have no side effects.
         if (!knownAction)
             return Result(OrganicDecision::Deny, OrganicReasonCode::UnknownAction, false);
 
-        // An enabled realm with an unsupported profile is a configuration error; no
-        // action may proceed on guesswork.
-        if (!request.organicProfile)
+        // A caller that did not resolve the mode gets a deny, never a passthrough.
+        if (request.mode == LivingRealmMode::Unspecified)
+            return Result(OrganicDecision::Deny, OrganicReasonCode::ModeUnspecified, true);
+
+        // An enabled realm with an unsupported profile is a configuration error, and
+        // an out-of-range mode value is corrupted input; neither may proceed.
+        if (request.mode != LivingRealmMode::Organic)
             return Result(OrganicDecision::Deny, OrganicReasonCode::UnsupportedProfile, true);
 
         // Fixture-only actions exist solely for FIXTURE identities inside an explicit
@@ -145,6 +151,19 @@ namespace living
         return Result(OrganicDecision::Deny, OrganicReasonCode::DeniedByClassification, true);
     }
 
+    char const* ToString(LivingRealmMode value)
+    {
+        switch (value)
+        {
+            case LivingRealmMode::Unspecified: return "Unspecified";
+            case LivingRealmMode::Disabled: return "Disabled";
+            case LivingRealmMode::Organic: return "Organic";
+            case LivingRealmMode::UnknownProfile: return "UnknownProfile";
+        }
+
+        return "INVALID_MODE";
+    }
+
     char const* ToString(OrganicDecision value)
     {
         switch (value)
@@ -189,6 +208,7 @@ namespace living
             case OrganicReasonCode::FixtureAuthorized: return "FIXTURE_AUTHORIZED";
             case OrganicReasonCode::DeniedByClassification: return "DENIED_BY_CLASSIFICATION";
             case OrganicReasonCode::UnknownAction: return "UNKNOWN_ACTION";
+            case OrganicReasonCode::ModeUnspecified: return "MODE_UNSPECIFIED";
             case OrganicReasonCode::UnsupportedProfile: return "UNSUPPORTED_PROFILE";
             case OrganicReasonCode::BootstrapNotActive: return "BOOTSTRAP_NOT_ACTIVE";
             case OrganicReasonCode::FixtureOutsideTestProfile: return "FIXTURE_OUTSIDE_TEST_PROFILE";
