@@ -73,6 +73,17 @@ LIVING_TEST(determinism_seeded_random_is_reproducible_and_bounded)
     LIVING_CHECK(bounded.NextUInt32(0) == 0);
     LIVING_CHECK(bounded.NextUInt32(1) == 0);
 
+    // A bound just above 2^31 rejects roughly half of all raw draws, so the
+    // rejection branch is exercised deterministically and stays reproducible.
+    SeededLivingRandom rej1(99);
+    SeededLivingRandom rej2(99);
+    for (int i = 0; i < 200; ++i)
+    {
+        uint32_t const value = rej1.NextUInt32(0x80000001u);
+        LIVING_CHECK(value < 0x80000001u);
+        LIVING_CHECK(value == rej2.NextUInt32(0x80000001u));
+    }
+
     SeededLivingRandom c(7);
     SeededLivingRandom d(8);
     bool anyDifference = false;

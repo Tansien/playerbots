@@ -167,7 +167,9 @@ LIVING_TEST(policy_fabrication_families_are_denied)
         OrganicActionKind::GUILD_BANK_TAB_MUTATION, OrganicActionKind::REMOTE_QUEST_ACCEPT,
         OrganicActionKind::DIRECT_QUEST_ABANDON, OrganicActionKind::DEATH_RECOVERY_TELEPORT,
         OrganicActionKind::UNOBSERVED_MOVE_TELEPORT, OrganicActionKind::FREE_PET_HAPPINESS,
-        OrganicActionKind::DIRECT_AURA_REMOVAL,
+        OrganicActionKind::DIRECT_AURA_REMOVAL, OrganicActionKind::ENCOUNTER_AURA_MUTATION,
+        OrganicActionKind::LOGIN_ITEM_FABRICATION, OrganicActionKind::FREE_TALENT_RESPEC,
+        OrganicActionKind::DIRECT_GLYPH_MUTATION,
         OrganicActionKind::OFFLINE_PROGRESSION
     };
 
