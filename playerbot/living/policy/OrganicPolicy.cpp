@@ -90,6 +90,11 @@ namespace living
         if (request.mode == LivingRealmMode::Unspecified)
             return Result(OrganicDecision::Deny, OrganicReasonCode::ModeUnspecified, true);
 
+        // The source is informational for decisions, but an out-of-range value is
+        // corrupted input and fails closed like every other malformed field.
+        if (request.source >= OrganicSourceKind::Count)
+            return Result(OrganicDecision::Deny, OrganicReasonCode::InvalidSource, true);
+
         // An enabled realm with an unsupported profile is a configuration error, and
         // an out-of-range mode value is corrupted input; neither may proceed.
         if (request.mode != LivingRealmMode::Organic)
@@ -191,6 +196,7 @@ namespace living
             case OrganicSourceKind::TransportService: return "TransportService";
             case OrganicSourceKind::AdminSurface: return "AdminSurface";
             case OrganicSourceKind::TestFixture: return "TestFixture";
+            case OrganicSourceKind::Count: break;
         }
 
         return "INVALID_SOURCE";
@@ -210,6 +216,7 @@ namespace living
             case OrganicReasonCode::UnknownAction: return "UNKNOWN_ACTION";
             case OrganicReasonCode::ModeUnspecified: return "MODE_UNSPECIFIED";
             case OrganicReasonCode::UnsupportedProfile: return "UNSUPPORTED_PROFILE";
+            case OrganicReasonCode::InvalidSource: return "INVALID_SOURCE";
             case OrganicReasonCode::BootstrapNotActive: return "BOOTSTRAP_NOT_ACTIVE";
             case OrganicReasonCode::FixtureOutsideTestProfile: return "FIXTURE_OUTSIDE_TEST_PROFILE";
             case OrganicReasonCode::FixtureProvenanceRequired: return "FIXTURE_PROVENANCE_REQUIRED";

@@ -173,6 +173,15 @@ blockers per 0002A A.2:
   identities.
 - `DIRECT_AUCTION_MUTATION` / `DIRECT_ITEM_*_TRANSFER`: route through the core
   session handlers or deny at the call site.
+- `COMMAND_CHARACTER_PROVISION` / `GUILD_BANK_TAB_MUTATION` /
+  `REMOTE_QUEST_ACCEPT` / `WORLD_BUFF_APPLY`: guard the command, guild-bank,
+  hardcoded-quest, and world-buff call sites for managed identities.
+- `DIRECT_QUEST_ABANDON`: route quest abandonment through the core abandon
+  handler (item cleanup included) instead of direct `DropQuest` pruning.
+- `DIRECT_AURA_REMOVAL`: restrict the `ra` command to core-validated
+  cancellation of positive, cancelable auras.
+- `DIRECT_ITEM_DESTRUCTION` / `FREE_PET_HAPPINESS`: use the core destroy-item
+  handler and the normal feed-pet item/spell path.
 - Population inspection: implement the database check that moves
   `PopulationInspection` off `NotInspected`.
 

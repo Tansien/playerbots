@@ -43,7 +43,9 @@ namespace living
         RecoveryService,  // 0002C stuck-recovery ladder
         TransportService, // 0002C transport compatibility service
         AdminSurface,     // future authenticated administration surface
-        TestFixture       // host-side or in-world test tooling
+        TestFixture,      // host-side or in-world test tooling
+
+        Count
     };
 
     // Stable reason codes for logs, reports, and audit rows.
@@ -59,6 +61,7 @@ namespace living
         UnknownAction,
         ModeUnspecified,
         UnsupportedProfile,
+        InvalidSource,
         BootstrapNotActive,
         FixtureOutsideTestProfile,
         FixtureProvenanceRequired,

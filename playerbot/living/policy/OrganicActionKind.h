@@ -54,6 +54,7 @@ namespace living
         AMMO_REPLENISH,
         DIRECT_ITEM_SPLIT_TRANSFER,
         DIRECT_ITEM_OWNERSHIP_TRANSFER,
+        DIRECT_ITEM_DESTRUCTION,
 
         // skills, spells, and free learning
         SKILLS_INIT,
@@ -76,13 +77,16 @@ namespace living
         QUEST_SYNC_TO_BOT,
         QUEST_SYNC_TO_PLAYER,
         REMOTE_QUEST_ACCEPT,
+        DIRECT_QUEST_ABANDON,
 
         // character-state initialization
         WORLD_BUFF_APPLY,
+        DIRECT_AURA_REMOVAL,
         REPUTATION_INIT,
         TAXI_NODES_INIT,
         MOUNT_INIT,
         PET_INIT,
+        FREE_PET_HAPPINESS,
 
         // social bootstrap
         GUILD_BOOTSTRAP,

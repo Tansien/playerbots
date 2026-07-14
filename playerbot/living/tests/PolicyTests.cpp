@@ -161,7 +161,13 @@ LIVING_TEST(policy_fabrication_families_are_denied)
         OrganicActionKind::RANDOM_MANAGER_REVIVE,
         OrganicActionKind::INSTANT_REPOP_RELOCATE, OrganicActionKind::ACCOUNT_TRANSFER_HIRE,
         OrganicActionKind::DIRECT_ITEM_SPLIT_TRANSFER, OrganicActionKind::DIRECT_ITEM_OWNERSHIP_TRANSFER,
-        OrganicActionKind::LEGACY_DIRECT_MAIL_MUTATION, OrganicActionKind::RTSC_SPELL_GRANT,
+        OrganicActionKind::DIRECT_ITEM_DESTRUCTION,
+        OrganicActionKind::LEGACY_DIRECT_MAIL_MUTATION, OrganicActionKind::DIRECT_AUCTION_MUTATION,
+        OrganicActionKind::RTSC_SPELL_GRANT,
+        OrganicActionKind::GUILD_BANK_TAB_MUTATION, OrganicActionKind::REMOTE_QUEST_ACCEPT,
+        OrganicActionKind::DIRECT_QUEST_ABANDON, OrganicActionKind::DEATH_RECOVERY_TELEPORT,
+        OrganicActionKind::UNOBSERVED_MOVE_TELEPORT, OrganicActionKind::FREE_PET_HAPPINESS,
+        OrganicActionKind::DIRECT_AURA_REMOVAL,
         OrganicActionKind::OFFLINE_PROGRESSION
     };
 
@@ -308,6 +314,68 @@ LIVING_TEST(policy_only_three_actions_can_ever_require_audit)
         OrganicPolicyResult const result = EvaluateOrganicPolicy(request);
         LIVING_CHECK((result.decision == OrganicDecision::RequireAudit) == isApproved);
     }
+}
+
+LIVING_TEST(policy_every_classification_maps_to_its_decision)
+{
+    // Table-driven conformance over the whole inventory: every kind, present and
+    // future, must map to exactly the decision its classification promises, so a
+    // newly added kind cannot ship without its intended production behavior.
+    for (OrganicActionMetadata const& row : AllOrganicActionMetadata())
+    {
+        OrganicRequest production = OrganicRequestFor(row.kind);
+        OrganicPolicyResult const result = EvaluateOrganicPolicy(production);
+
+        switch (row.classification)
+        {
+            case OrganicClassification::AllowGameplay:
+                LIVING_CHECK(result.decision == OrganicDecision::AllowGameplay);
+                break;
+            case OrganicClassification::AllowAutomation:
+                LIVING_CHECK(result.decision == OrganicDecision::AllowAutomation);
+                break;
+            case OrganicClassification::Deny:
+                LIVING_CHECK(result.decision == OrganicDecision::Deny);
+                break;
+            case OrganicClassification::BootstrapOnly:
+            {
+                LIVING_CHECK(result.decision == OrganicDecision::Deny);
+                OrganicRequest bootstrap = production;
+                bootstrap.managedBootstrapActive = true;
+                LIVING_CHECK(EvaluateOrganicPolicy(bootstrap).decision == OrganicDecision::AllowGameplay);
+                break;
+            }
+            case OrganicClassification::RequireAudit:
+                // Without action-specific context the audited kinds deny...
+                LIVING_CHECK(result.decision == OrganicDecision::Deny);
+                break;
+            case OrganicClassification::FixtureOnly:
+            {
+                LIVING_CHECK(result.decision == OrganicDecision::Deny);
+                OrganicRequest fixture = production;
+                fixture.provenance = BotProvenance::FIXTURE;
+                fixture.fixtureTestProfile = true;
+                LIVING_CHECK(EvaluateOrganicPolicy(fixture).decision == OrganicDecision::AllowAutomation);
+                break;
+            }
+        }
+    }
+}
+
+LIVING_TEST(policy_invalid_source_fails_closed)
+{
+    OrganicRequest request = OrganicRequestFor(OrganicActionKind::GAMEPLAY_LOOT);
+    request.source = static_cast<OrganicSourceKind>(0xFF);
+    OrganicPolicyResult const garbage = EvaluateOrganicPolicy(request);
+    LIVING_CHECK(garbage.decision == OrganicDecision::Deny);
+    LIVING_CHECK(garbage.reason == OrganicReasonCode::InvalidSource);
+
+    request.source = OrganicSourceKind::Count;
+    LIVING_CHECK(EvaluateOrganicPolicy(request).decision == OrganicDecision::Deny);
+
+    // Disabled mode stays a passthrough even with a corrupted source (LR-001).
+    request.mode = LivingRealmMode::Disabled;
+    LIVING_CHECK(EvaluateOrganicPolicy(request).decision != OrganicDecision::Deny);
 }
 
 LIVING_TEST(policy_evaluation_is_deterministic)
