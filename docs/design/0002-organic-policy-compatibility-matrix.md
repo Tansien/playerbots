@@ -68,6 +68,13 @@ design.
 | Delete/reset population | existing account/reset paths | Deletes/recreates bots | Only through managed global operation | managed reset coordinator | New nonces; operation audit |
 | Raw delete/reset SQL | `delete_randombots.sql`, `reset_randombots.sql` | Bypasses managed hooks | Unsupported once Organic is enabled | startup/reset validation | Block and repair/reset |
 | Offline material progression | future planners | Simulated gains | Denied | planner/store | None |
+| Account-transfer hire | `HireAction`: `SetMoney` + direct `characters.account` update | Moves bot to player account, mutates money | Denied | hire action | Future managed operation only |
+| Instant repop relocation | `RepopAction` (`ReleaseSpiritAction.h`): `ResurrectPlayer(1.0)` + teleport to spawn/homebind | Full resurrection and relocation outside core death rules | Denied | repop action | Normal death recovery allowed |
+| BG/arena regroup teleport | `BattleGroundJoinAction` member teleport to leader | Relocates group bots cross-world on queue/join | Denied | BG join action | Core BG entry rules remain gameplay |
+| Direct split-stack item transfer | `GuildShareItemAction`: `Item::CreateItem` split-stack construction | Creates item stack outside trade/mail handlers | Denied | guild share action | Normal trade/mail allowed |
+
+The last four rows were added by the Phase 0 source audit under the A.2 completion
+rule; they were not in the original reviewed seed.
 
 ## A.2 Completion rule
 

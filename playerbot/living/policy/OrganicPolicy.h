@@ -49,6 +49,7 @@ namespace living
         FixtureOutsideTestProfile,
         FixtureProvenanceRequired,
         OrganicProvenanceRequired,
+        InvalidProvenance,
         LegacyLifecycleExcluded,
         ManagedOperationRequired,
         RawResetUnsupported,

@@ -104,11 +104,16 @@ namespace living
         if (request.provenance == BotProvenance::FIXTURE && !request.fixtureTestProfile)
             return Result(OrganicDecision::Deny, OrganicReasonCode::FixtureOutsideTestProfile, true);
 
-        // Managed Organic semantics require ORGANIC_CREATED provenance; a legacy
-        // unmanaged identity in an enabled Organic realm is a mixed population and
-        // fails closed (0002 section 3, 0003 section 2).
-        if (request.provenance == BotProvenance::LEGACY_UNMANAGED)
-            return Result(OrganicDecision::Deny, OrganicReasonCode::OrganicProvenanceRequired, true);
+        // Managed Organic semantics require ORGANIC_CREATED provenance (a FIXTURE
+        // identity inside the test profile was vetted above). Everything else fails
+        // closed: LEGACY_UNMANAGED is a mixed population (0002 section 3, 0003
+        // section 2), and an out-of-range value is corrupted input, never an allow.
+        if (!SatisfiesOrganicProvenance(request.provenance) && request.provenance != BotProvenance::FIXTURE)
+            return Result(OrganicDecision::Deny,
+                request.provenance == BotProvenance::LEGACY_UNMANAGED
+                    ? OrganicReasonCode::OrganicProvenanceRequired
+                    : OrganicReasonCode::InvalidProvenance,
+                true);
 
         switch (metadata->classification)
         {
@@ -185,6 +190,7 @@ namespace living
             case OrganicReasonCode::FixtureOutsideTestProfile: return "FIXTURE_OUTSIDE_TEST_PROFILE";
             case OrganicReasonCode::FixtureProvenanceRequired: return "FIXTURE_PROVENANCE_REQUIRED";
             case OrganicReasonCode::OrganicProvenanceRequired: return "ORGANIC_PROVENANCE_REQUIRED";
+            case OrganicReasonCode::InvalidProvenance: return "INVALID_PROVENANCE";
             case OrganicReasonCode::LegacyLifecycleExcluded: return "LEGACY_LIFECYCLE_EXCLUDED";
             case OrganicReasonCode::ManagedOperationRequired: return "MANAGED_OPERATION_REQUIRED";
             case OrganicReasonCode::RawResetUnsupported: return "RAW_RESET_UNSUPPORTED";

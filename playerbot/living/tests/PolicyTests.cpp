@@ -131,9 +131,11 @@ LIVING_TEST(policy_fabrication_families_are_denied)
         OrganicActionKind::TAXI_NODES_INIT, OrganicActionKind::MOUNT_INIT, OrganicActionKind::PET_INIT,
         OrganicActionKind::GUILD_BOOTSTRAP, OrganicActionKind::ARENA_TEAM_BOOTSTRAP,
         OrganicActionKind::RANDOM_TELEPORT, OrganicActionKind::TELEPORT_NEAR_PLAYER,
-        OrganicActionKind::RPG_CAMP_TELEPORT, OrganicActionKind::LEGACY_TRANSPORT_SHORTCUT,
+        OrganicActionKind::RPG_CAMP_TELEPORT, OrganicActionKind::BG_REGROUP_TELEPORT,
+        OrganicActionKind::LEGACY_TRANSPORT_SHORTCUT,
         OrganicActionKind::FREE_SUMMON, OrganicActionKind::RANDOM_MANAGER_REVIVE,
-        OrganicActionKind::OFFLINE_PROGRESSION
+        OrganicActionKind::INSTANT_REPOP_RELOCATE, OrganicActionKind::ACCOUNT_TRANSFER_HIRE,
+        OrganicActionKind::DIRECT_ITEM_SPLIT_TRANSFER, OrganicActionKind::OFFLINE_PROGRESSION
     };
 
     for (OrganicActionKind kind : denied)
