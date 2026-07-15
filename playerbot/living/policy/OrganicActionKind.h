@@ -78,6 +78,7 @@ namespace living
         QUEST_COMPLETE_GENERIC,
         QUEST_SYNC_TO_BOT,
         QUEST_SYNC_TO_PLAYER,
+        GAMEPLAY_QUEST_ACCEPT,
         REMOTE_QUEST_ACCEPT,
         DIRECT_QUEST_ABANDON,
 
@@ -134,6 +135,7 @@ namespace living
         GAMEPLAY_DEATH_RECOVERY,
         INSTANT_REPOP_RELOCATE,
         DEATH_RECOVERY_TELEPORT,
+        DIRECT_SPIRIT_HEALER_RESURRECTION,
 
         // ordinary gameplay through core handlers
         GAMEPLAY_LOOT,

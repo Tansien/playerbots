@@ -20,7 +20,7 @@ design.
 | Random gear initialization | `InitEquipment`, gear templates | Creates/replaces gear | Denied | factory | None |
 | Periodic gear upgrade/autogear | `RandomGear*`, update gear, autogear-style commands | Creates/replaces gear | Denied | manager/actions/commands | None |
 | Starting/periodic money | factory full/incremental money, manager refresh | Creates currency | Denied | factory/manager | None |
-| Temporary-money flight/purchase tricks | RPG flight and purchase helper paths | Grants money, performs action, restores balance | Denied | action-level guard | None |
+| Temporary-money flight/purchase tricks | RPG flight, world-buff flight, `taxi`/`gold` cheat fare in `MovementActions`, buy/repair helpers | Grants money, performs action, restores balance; `SetMoney` runs `MoneyChanged` synchronously, so a crossed threshold can permanently auto-reward a money-required quest (and advance WotLK highest-gold achievements) — restoring the balance cannot undo it | Denied | shared temporary-`SetMoney` boundary | None |
 | Bags and generated inventory | `InitBags`, `InitInventory` | Creates items | Only core starter inventory at creation | factory/bootstrap | None |
 | Runtime ammo replenishment | `PlayerbotAI` ammo stack refill/`InitAmmo` | Creates or refills ammo | Denied | AI update/ammo action | Buy/craft/loot normally |
 | Food/ammo/reagents/potions/consumables | init/refresh/maintenance paths | Creates items | Denied | factory/manager/actions | None |
@@ -92,6 +92,8 @@ design.
 | Login item fabrication | `PlayerbotHolder::OnBotLogin` hearthstone/death-gate creation | Recreates items on every login when missing | Denied | login hook | Starter items at managed bootstrap only |
 | Free talent respec | `ChangeTalentsAction` / `TalentSpec::ApplyTalents` | Removes/learns talent spells without respec cost | Denied | talent actions | Core respec rules; earned-point spending stays automation |
 | Direct glyph mutation | `GlyphAction` direct slot application (WotLK) | Applies/removes glyphs outside the core handler | Denied | glyph action | Core glyph handler only |
+| Normal quest acceptance | core-eligible `AddQuest` via quest-giver/shared/item handlers | Legitimate quest intake | Allowed gameplay | existing actions/core | No |
+| Direct spirit-healer resurrection | `SpiritHealerAction`: resurrects even when no healer was found | Resurrects/damages durability without the core healer handler | Denied | revive action | Core spirit-healer handler only |
 
 The rows from "Account-transfer hire" down were added by the Phase 0 source audit
 under the A.2 completion rule; they were not in the original reviewed seed.
