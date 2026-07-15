@@ -38,20 +38,36 @@ bool GlyphAction::Execute(Event& event)
             if (AvailableGlyphsValue::GetGlyphSlotTypeFromSlot(glyphSlot, bot->GetLevel()) != GlyphSlotType::LOCKED_SLOT)
                 glyphsSlots.push_back(glyphSlot);
     }
-    else if (param.find("remove") == 0)
+    // Exact grammar: "remove" (all glyphs) or "remove <slot> [<slot>...]".
+    // Matching a bare prefix accepted "removed" and friends as "remove all".
+    else if (param == "remove" || param.find("remove ") == 0)
     {
         std::vector<uint32> equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
 
-        if (param.size() > 7)
-        {
-            std::string removeSlots = param.substr(7);
+        std::string const removeSlots = param == "remove" ? "" : param.substr(7);
 
+        if (!removeSlots.empty())
+        {
             for (auto& token : getMultiQualifiers(removeSlots, " "))
             {
-                // Reject non-numeric tokens BEFORE stoi: the check was inverted, so
-                // valid numbers were refused while anything else reached stoi and
-                // threw out of the command handler.
-                if (!isValidNumberString(token))
+                // Parse without throwing and validate the value BEFORE narrowing:
+                // isValidNumberString accepts a lone sign and any digit count, so
+                // stoi could throw out of the chat-command handler, and narrowing
+                // first turned e.g. slot 256 into slot 0 and mutated it.
+                uint64 parsedSlot = 0;
+                bool validSlot = !token.empty() && token.size() <= 3;
+                for (char c : token)
+                {
+                    if (c < '0' || c > '9')
+                    {
+                        validSlot = false;
+                        break;
+                    }
+
+                    parsedSlot = parsedSlot * 10 + uint64(c - '0');
+                }
+
+                if (!validSlot || parsedSlot >= equipedGlyphs.size())
                 {
                     std::ostringstream out;
                     out << token << " is not a valid slot number";
@@ -59,14 +75,8 @@ bool GlyphAction::Execute(Event& event)
                     return false;
                 }
 
-                uint8 slotId = stoi(token);
-
-                // Bounds-check against the vector actually being indexed.
-                if (slotId >= equipedGlyphs.size())
-                    glyphs.push_back(0);
-                else
-                    glyphs.push_back(equipedGlyphs[slotId]);
-
+                uint8 const slotId = uint8(parsedSlot);
+                glyphs.push_back(equipedGlyphs[slotId]);
                 glyphsSlots.push_back(slotId);
             }
         }
