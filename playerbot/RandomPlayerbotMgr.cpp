@@ -2389,8 +2389,69 @@ void RandomPlayerbotMgr::Revive(Player* player)
 
 // Returns true only when the bot was actually relocated, so callers do not
 // Refresh() (free revive/repair/resource refill/money) after a failed relocation.
+namespace
+{
+    // A random teleport may only move free synthetic random bots. A connected real
+    // player can carry a NON-NULL PlayerbotAI in this codebase and is identified by
+    // IsRealPlayer() (the manager relies on exactly that elsewhere), so a null-AI
+    // check alone still relocated real players; a bot owned by a real player must
+    // stay with its owner rather than be moved away from that commitment.
+    bool IsFreeSyntheticRandomBot(Player* player)
+    {
+        if (!player || !player->GetSession())
+            return false;
+
+        PlayerbotAI* playerAi = player->GetPlayerbotAI();
+        if (!playerAi)                       // real player with no AI at all
+            return false;
+        if (playerAi->IsRealPlayer())        // connected real player, AI or not
+            return false;
+        if (playerAi->HasRealPlayerMaster()) // player-owned/protected bot
+            return false;
+        if (sPlayerbotAIConfig.IsFreeAltBot(player)) // player alt bot
+            return false;
+
+        return sPlayerbotAIConfig.IsInRandomAccountList(player->GetSession()->GetAccountId());
+    }
+
+    // Two-phase: nothing may be mutated - not even the initiating bot - until every
+    // member of its group has passed, so a mixed group is never partially
+    // teleported.
+    bool GroupIsTeleportable(Player* bot)
+    {
+        if (!IsFreeSyntheticRandomBot(bot))
+            return false;
+
+        Group* group = bot->GetGroup();
+        if (!group)
+            return true;
+
+        for (GroupReference* gref = group->GetFirstMember(); gref; gref = gref->next())
+        {
+            Player* member = gref->getSource();
+            if (!member || member == bot)
+                continue;
+
+            if (!IsFreeSyntheticRandomBot(member))
+                return false;
+        }
+
+        return true;
+    }
+}
+
 bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, bool hearth, bool activeOnly)
 {
+    // Complete preflight BEFORE any mutation (taxi, homebind, motion, position,
+    // heartbeat, AI reset). The initiating bot used to be fully teleported before
+    // any member was inspected, so a mixed group was left split.
+    if (!GroupIsTeleportable(bot))
+    {
+        sLog.outDetail("Random teleport skipped for bot %s: group contains a real player or a player-owned bot",
+            bot ? bot->GetName() : "<null>");
+        return false;
+    }
+
     if (bot->IsBeingTeleported())
         return false;
 
@@ -2663,16 +2724,9 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                     if (!member || member == bot)
                         continue;
 
-                    // Preflight the member BEFORE any mutation: this used to read
-                    // bot->GetPlayerbotAI() (the teleporting bot's own AI), which is
-                    // non-null for every member, so a real player in the group had
-                    // their homebind rewritten and was teleported, and then
-                    // member->GetPlayerbotAI()->Reset() dereferenced null and crashed
-                    // after the damage was already done.
+                    // GroupIsTeleportable() already proved every member is a free
+                    // synthetic random bot, so this loop only mutates.
                     PlayerbotAI* memberAi = member->GetPlayerbotAI();
-                    if (!memberAi)
-                        continue;
-
                     if (member->IsTaxiFlying())
                         member->GetMotionMaster()->MovementExpired();
                     if (hearth)
