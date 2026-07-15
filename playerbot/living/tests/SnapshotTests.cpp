@@ -75,70 +75,70 @@ LIVING_TEST(snapshot_same_guid_different_nonce_is_a_different_identity)
     LIVING_CHECK(!SameIdentity(a, c));
 }
 
-LIVING_TEST(snapshot_staleness_is_detected_per_dimension)
+LIVING_TEST(snapshot_character_state_staleness_is_detected_per_dimension)
 {
     LivingCharacterSnapshot const basis = BaseSnapshot();
     uint64_t const now = 500; // well before expiry at 10000
 
-    LIVING_CHECK(!IsSnapshotStale(basis, BaseSnapshot(), now));
+    LIVING_CHECK(!IsCharacterStateStale(basis, BaseSnapshot(), now));
 
     LivingCharacterSnapshot changed = BaseSnapshot();
     changed.identity.identityNonce[0] = 0xAA;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now)); // identity nonce
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now)); // identity nonce
 
     changed = BaseSnapshot();
     changed.identity.characterGuid = 4321;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now)); // guid
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now)); // guid
 
     changed = BaseSnapshot();
     changed.stateVersion += 1;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now)); // state version
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now)); // state version
 
     changed = BaseSnapshot();
     changed.scheduleGeneration += 1;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now)); // schedule generation
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now)); // schedule generation
 
     changed = BaseSnapshot();
     changed.goalGeneration += 1;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now)); // goal generation
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now)); // goal generation
 
     changed = BaseSnapshot();
     changed.snapshotGeneration += 1;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now)); // snapshot generation
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now)); // snapshot generation
 
     // Expiry boundary: valid strictly before, stale at and after.
-    LIVING_CHECK(!IsSnapshotStale(basis, BaseSnapshot(), 9999));
-    LIVING_CHECK(IsSnapshotStale(basis, BaseSnapshot(), 10000));
-    LIVING_CHECK(IsSnapshotStale(basis, BaseSnapshot(), 20000));
+    LIVING_CHECK(!IsCharacterStateStale(basis, BaseSnapshot(), 9999));
+    LIVING_CHECK(IsCharacterStateStale(basis, BaseSnapshot(), 10000));
+    LIVING_CHECK(IsCharacterStateStale(basis, BaseSnapshot(), 20000));
 
     // Observed state is part of the mandatory revalidation (0005A A.1): actual
     // online, group, and location changes invalidate a proposal too.
     changed = BaseSnapshot();
     changed.actualObservedOnline = true;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now));
 
     changed = BaseSnapshot();
     changed.group.memberCount += 1;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now));
 
     changed = BaseSnapshot();
     changed.location.zoneId = 999;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now));
 
     // Login-queue attempt state and commitment generation are revalidated too
     // (0005A A.1): a proposal must not act on a stale queue or commitment view.
     changed = BaseSnapshot();
     changed.queueState = LivingQueueState::OnLoginQueue;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now));
 
     changed = BaseSnapshot();
     changed.group.commitmentGeneration += 1;
-    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, now));
 
     // A freshly captured snapshot carries its own new proposal expiry; that is
     // bookkeeping, not character state, and must not make a live proposal stale.
     changed = BaseSnapshot();
     changed.proposalExpiresAtMs = 99999;
-    LIVING_CHECK(!IsSnapshotStale(basis, changed, now));
-    LIVING_CHECK(IsSnapshotStale(basis, changed, 10000)); // basis' own expiry still applies
+    LIVING_CHECK(!IsCharacterStateStale(basis, changed, now));
+    LIVING_CHECK(IsCharacterStateStale(basis, changed, 10000)); // basis' own expiry still applies
 }

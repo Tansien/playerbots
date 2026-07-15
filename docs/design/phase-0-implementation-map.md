@@ -27,6 +27,7 @@ partial, with the remainder enumerated here.
 | Snapshots | `playerbot/living/snapshots/LivingSnapshots.h/.cpp` |
 | Events | `playerbot/living/events/LivingEvents.h/.cpp` (15 stable names, no-op and ordered test sinks) |
 | Determinism/fault seams | `playerbot/living/testing/LivingDeterminism.h/.cpp` (clocks, nonce/token providers, seeded random, named 0002B fault points) |
+| Shared pure helpers | `playerbot/living/util/LivingNumericParse.h/.cpp` (non-throwing full-consumption `uint32`/slot parsing used by `ChatHelper::parseItemsUnordered` and both `GlyphAction` slot branches), `playerbot/living/util/LivingQuestSlots.h` (single quest-log occupancy/orphan rule used by `CleanQuestLogAction` and `FreeQuestLogSlotValue`). These live under `living/` because they have no core dependency, which is what lets the host tests compile and regression-test the exact functions the runtime calls. |
 | CI | `.github/workflows/cmangos-ubuntu-build.yml` (self-hosted Ubuntu only, fork-PR guard, pinned core baselines, host-test job) |
 
 ## Requirement traceability
@@ -64,12 +65,19 @@ partial, with the remainder enumerated here.
   reconciler requirement, production eligibility, fixture-only status, design
   reference). A constexpr check fails compilation on a kind without a
   consistent row; a generic misc/unknown kind does not exist.
-- The Phase 0 source audit added four rows beyond the reviewed 0002A seed
-  (recorded in 0002A per its A.2 rule): `ACCOUNT_TRANSFER_HIRE` (HireAction),
-  `INSTANT_REPOP_RELOCATE` (RepopAction), `BG_REGROUP_TELEPORT`
-  (BattleGroundJoinAction), and `DIRECT_ITEM_SPLIT_TRANSFER`
-  (GuildShareItemAction). Per A.2 the inventory is a growing seed; proving
-  completeness is a 0.1 acceptance gate, not a Phase 0 claim.
+- Successive Phase 0 source audits have added rows beyond the reviewed 0002A
+  seed, each recorded in 0002A per its A.2 rule (account-transfer hire, instant
+  repop, BG regroup teleport, direct item split/ownership/destruction, legacy
+  direct mail, direct auction mutation, debug mutation commands, minimal and
+  unobserved move teleports, direct summon, death-recovery teleport, direct
+  spirit-healer resurrection, RTSC spell grant, command character provisioning,
+  guild-bank tab mutation, remote quest accept, direct quest abandon, free pet
+  happiness, direct aura removal, encounter aura mutation, login item
+  fabrication, free talent respec, direct glyph mutation, plus the positive
+  `GAMEPLAY_QUEST_ACCEPT` counterpart). Per A.2 the inventory is a growing seed;
+  proving completeness is a 0.1 acceptance gate, not a Phase 0 claim. The count
+  is deliberately not restated here so it cannot drift again - the enum and its
+  constexpr-checked metadata table are the source of truth.
 - Only `STUCK_EMERGENCY_TELEPORT`, `TRANSPORT_GROUP_SYNC`, and
   `PUBLIC_TRANSPORT_TRANSFER` may return `RequireAudit`, each gated on explicit
   pure-data context (classification only; execution is later work).
@@ -81,11 +89,13 @@ partial, with the remainder enumerated here.
   `inventory_fixture_only_rows_are_never_production_eligible`,
   `policy_fabrication_families_are_denied`, `policy_all_13_cheat_bits_are_denied`,
   `policy_broad_maintenance_and_lifecycle_shortcuts_are_denied`,
-  `policy_bootstrap_creation_requires_active_managed_bootstrap`,
-  `policy_stuck_teleport_requires_exhausted_ladder_and_owner_consent`,
-  `policy_transport_group_sync_requires_protected_commitment`,
-  `policy_public_transport_requires_allowlisted_route`,
+  `policy_bootstrap_creation_is_pre_identity_and_factory_bound`,
+  `policy_stuck_teleport_requires_every_recovery_gate`,
+  `policy_transport_group_sync_requires_every_gate`,
+  `policy_public_transport_requires_every_gate`,
   `policy_only_three_actions_can_ever_require_audit`,
+  `policy_every_classification_maps_to_its_decision`,
+  `policy_identity_root_must_be_bindable`,
   `policy_legal_automation_is_distinguishable_from_gameplay`.
 
 ### LR-006 groundwork: single-writer/direct-durability seams
@@ -94,15 +104,20 @@ partial, with the remainder enumerated here.
   needs: injectable UTC/monotonic clocks, unique 16-byte nonce/token
   sequences, and the named 0002B B.10 fault-injection points
   (`LivingFaultPoints`). No writer or database code exists yet by design.
-- Immutable snapshot types with per-dimension staleness (identity nonce, state
-  version, schedule/goal/snapshot generation, expiry) implement the proposal
-  revalidation contract of 0003A A.7 without touching `PlayerbotLoginMgr`.
+- Immutable snapshot types with per-dimension **character-state** staleness
+  (identity nonce, state version, schedule/goal/snapshot generation, queue
+  attempt state, group/commitment summary, location, expiry) support the
+  proposal revalidation of 0003A A.7 without touching `PlayerbotLoginMgr`. The
+  helper is named `IsCharacterStateStale` because it is deliberately narrower
+  than 0005A A.1: role, recent-service, estimated-cost, capacity, and policy
+  inputs are not modelled here (the 0.2 Director owns them) and callers must
+  revalidate capacity/policy separately.
 - Tests: `determinism_test_clock_is_deterministic`,
   `determinism_token_sequences_are_reproducible_and_unique`,
   `determinism_seeded_random_is_reproducible_and_bounded`,
   `determinism_fault_injector_fires_exactly_where_armed`,
   `snapshot_equality_covers_every_field`,
-  `snapshot_staleness_is_detected_per_dimension`,
+  `snapshot_character_state_staleness_is_detected_per_dimension`,
   `snapshot_same_guid_different_nonce_is_a_different_identity`.
 
 ### LR-010 groundwork: managed bots cannot use legacy login rotation
@@ -177,7 +192,20 @@ blockers per 0002A A.2:
   `REMOTE_QUEST_ACCEPT` / `WORLD_BUFF_APPLY`: guard the command, guild-bank,
   hardcoded-quest, and world-buff call sites for managed identities.
 - `DIRECT_QUEST_ABANDON`: route quest abandonment through the core abandon
-  handler (item cleanup included) instead of direct `DropQuest` pruning.
+  handler (item cleanup included) instead of direct `DropQuest` pruning. The
+  guard belongs at the shared `PlayerbotAI::DropQuest` boundary, which
+  `CleanQuestLogAction`, `DropQuestAction`, `QuestUpdateFailedTimerAction`, and
+  `GuildAcceptQuestOrderAction` all reach.
+- `GAMEPLAY_QUEST_ACCEPT` vs `QUEST_SYNC_TO_BOT`: both live inside
+  `QuestAction::AcceptQuest` (the core handler call, then the
+  `syncQuestWithPlayer` `AddQuest` fallback). The guard must bind to those two
+  branches individually; an action-entry allow would expose the denied sync.
+- Orphaned quest-log slots are repaired by clearing the slot
+  (`SetQuestSlot(slot, 0)`), the same boundary `DropQuestAction` already uses.
+  A cross-expansion-safe repair that also reconciles `m_questStatus`/source
+  items for a template-less quest does not exist in the current core API, so the
+  0.1 guard must either accept slot clearing as the repair or quarantine the
+  character; it must not discard valid quests to work around the orphan.
 - `DIRECT_AURA_REMOVAL`: restrict the `ra` command to core-validated
   cancellation of positive, cancelable auras.
 - `DIRECT_ITEM_DESTRUCTION` / `FREE_PET_HAPPINESS`: use the core destroy-item

@@ -1,6 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "DropQuestAction.h"
+#include "playerbot/living/util/LivingQuestSlots.h"
 
 using namespace ai;
 
@@ -109,7 +110,7 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
     {
         uint32 questId = bot->GetQuestSlotQuestId(slot);
 
-        if (!questId)
+        if (!living::IsQuestSlotOccupied(questId))
             continue;
 
         // Counting pass: count EVERY occupied slot and mutate nothing. Failed,
@@ -125,6 +126,23 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
         }
 
         Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
+        if (living::IsOrphanedQuestSlot(questId, quest != nullptr))
+        {
+            // Repair the orphan through the same slot boundary DropQuestAction uses.
+            // An orphan cannot be evaluated for pruning (no level/progress/class), so
+            // skipping it meant cleanup discarded valid quests while keeping the bad
+            // entry, and a log full of orphans could never be freed at all. Clearing
+            // the slot frees real capacity and destroys no valid quest.
+            sLog.outError("Bot %s: clearing orphaned quest-log slot %u (quest %u has no template)",
+                bot->GetName(), uint32(slot), questId);
+            bot->SetQuestSlot(slot, 0);
+
+            if (numQuest > 0)
+                numQuest--;
+
+            continue;
+        }
+
         if (!quest)
             continue;
 

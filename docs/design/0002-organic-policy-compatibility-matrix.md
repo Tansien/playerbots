@@ -86,13 +86,13 @@ design.
 | Remote quest accept | `TravelAction` hardcoded Dark Portal `AddQuest` (10119/9407) | Accepts quests without quest-giver interaction | Denied | travel action | Normal quest-giver handlers only |
 | Direct quest abandon | `PlayerbotAI::DropQuest` callers: quest-log pruning, failed-timer, guild-order actions | Abandons quests outside the core abandon handler | Denied | shared DropQuest boundary | Core abandon semantics only |
 | Free pet happiness | `FeedPetAction`: `SetPower(POWER_HAPPINESS)` | Fills pet happiness without food or the Feed Pet spell | Denied | feed-pet action | Normal feed item/spell path |
-| Direct aura removal | `RemoveAuraAction` (`ra` command) | Removes arbitrary named auras, including hostile debuffs | Denied | remove-aura action | Core-validated cancellation only |
+| Direct aura removal | `RemoveAuraAction` (`ra` command), `WorldBuffStrategy::OnStrategyRemoved` | Removes arbitrary named auras, including hostile debuffs | Denied | remove-aura action and strategy-removed hook | Core-validated cancellation only |
 | Direct item destruction | `SmartDestroyItemAction`/`DestroyItemAction` | Destroys items directly from maintenance/bag-pressure paths | Denied | destroy-item action | Core destroy-item handler |
 | Encounter aura mutation | `KarazhanDungeonActions` (Netherspite): boss beam removal + Perseverance aura | Mutates shared encounter state, can affect real raid members | Denied | encounter action | Core encounter mechanics only |
 | Login item fabrication | `PlayerbotHolder::OnBotLogin` hearthstone/death-gate creation | Recreates items on every login when missing | Denied | login hook | Starter items at managed bootstrap only |
 | Free talent respec | `ChangeTalentsAction` / `TalentSpec::ApplyTalents` | Removes/learns talent spells without respec cost | Denied | talent actions | Core respec rules; earned-point spending stays automation |
 | Direct glyph mutation | `GlyphAction` direct slot application (WotLK) | Applies/removes glyphs outside the core handler | Denied | glyph action | Core glyph handler only |
-| Normal quest acceptance | core-eligible `AddQuest` via quest-giver/shared/item handlers | Legitimate quest intake | Allowed gameplay | existing actions/core | No |
+| Normal quest acceptance | core-eligible `AddQuest` via quest-giver/shared/item handlers | Legitimate quest intake | Allowed gameplay | the core-handler branch inside `QuestAction::AcceptQuest` (not the action entry, which also holds the denied `SyncQuestWithPlayer` fallback) | No |
 | Direct spirit-healer resurrection | `SpiritHealerAction`: resurrects even when no healer was found | Resurrects/damages durability without the core healer handler | Denied | revive action | Core spirit-healer handler only |
 
 The rows from "Account-transfer hire" down were added by the Phase 0 source audit

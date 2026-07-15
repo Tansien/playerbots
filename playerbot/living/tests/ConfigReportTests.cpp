@@ -104,6 +104,13 @@ LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
     for (char const* text : { "", "2", "tru", "yess", "-1", "enabled", "y" })
         LIVING_CHECK(ParseLivingRealmBool(text) == LivingRealmBool::Malformed);
 
+    // Only the ENDS are trimmed: embedded whitespace stays malformed. Stripping
+    // whitespace everywhere turned "o f f" into a valid "off" and silently
+    // disabled Living Realm (or strict enforcement).
+    for (char const* text : { "o f f", "o n", "t rue", "1 0", "y es", "of f", "on\toff" })
+        LIVING_CHECK(ParseLivingRealmBool(text) == LivingRealmBool::Malformed);
+    LIVING_CHECK(ParseLivingRealmBool("\t off \r\n") == LivingRealmBool::False); // ends only
+
     // A malformed Enabled blocks and does not silently switch the realm off.
     LivingRealmConfig const badEnabled = LivingRealmConfig::FromRawValues("tru", "organic", "1");
     LIVING_CHECK(badEnabled.enabledRaw == LivingRealmBool::Malformed);
@@ -111,6 +118,16 @@ LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
     EffectiveConfigReport const enabledReport = BuildEffectiveConfigReport(badEnabled, CleanLegacyInputs());
     LIVING_CHECK(CountReason(enabledReport, ConfigReasonCode::MalformedBoolean) == 1);
     LIVING_CHECK(enabledReport.HasBlockingEntry());
+    // The entry names the operator's actual token, not the word "malformed".
+    for (EffectiveConfigEntry const& entry : enabledReport.entries)
+        if (entry.reason == ConfigReasonCode::MalformedBoolean)
+            LIVING_CHECK(entry.configuredValue == "tru");
+
+    // An embedded-space value blocks rather than resolving to "off".
+    LivingRealmConfig const spaced = LivingRealmConfig::FromRawValues("o f f", "organic", "1");
+    LIVING_CHECK(spaced.enabledRaw == LivingRealmBool::Malformed);
+    LIVING_CHECK(spaced.enabled); // not silently disabled
+    LIVING_CHECK(BuildEffectiveConfigReport(spaced, CleanLegacyInputs()).HasBlockingEntry());
 
     // A malformed Strict blocks and does not downgrade conflicts to warnings.
     LivingRealmConfig const badStrict = LivingRealmConfig::FromRawValues("1", "organic", "2");

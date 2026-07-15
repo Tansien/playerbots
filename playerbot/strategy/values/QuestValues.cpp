@@ -3,6 +3,7 @@
 #include "QuestValues.h"
 #include "SharedValueContext.h"
 #include "ItemUsageValue.h"
+#include "playerbot/living/util/LivingQuestSlots.h"
 #include "playerbot/TravelMgr.h"
 #include "playerbot/strategy/deathknight/DKActions.h"
 
@@ -426,16 +427,12 @@ uint8 FreeQuestLogSlotValue::Calculate()
 	uint8 numQuest = 0;
 	for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
 	{
-		uint32 questId = bot->GetQuestSlotQuestId(slot);
-
-		if (!questId)
-			continue;
-
-		Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
-		if (!quest)
-			continue;
-
-		numQuest++;
+        // Shared occupancy rule: a nonzero slot occupies the log even when its
+        // template is missing. Skipping template-less slots here reported free
+        // space the core would refuse to fill, wedging quest acceptance, and
+        // disagreed with CleanQuestLogAction's own count.
+        if (living::IsQuestSlotOccupied(bot->GetQuestSlotQuestId(slot)))
+            numQuest++;
 	}
 
 	return MAX_QUEST_LOG_SIZE - numQuest;

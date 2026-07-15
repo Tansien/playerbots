@@ -58,6 +58,10 @@ namespace living
         // blocking entries rather than silently choosing a permissive state.
         LivingRealmBool enabledRaw = LivingRealmBool::False;
         LivingRealmBool strictRaw = LivingRealmBool::True;
+        // The operator's raw tokens, kept verbatim so a malformed-value report can
+        // name what actually needs fixing instead of the word "malformed".
+        std::string enabledRawText = "0";
+        std::string strictRawText = "1";
 
         static LivingRealmConfig FromValues(bool enabled, std::string profileName, bool strict);
         static LivingRealmConfig FromRawValues(std::string const& enabled, std::string profileName,
