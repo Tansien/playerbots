@@ -43,6 +43,7 @@ file(GLOB Playerbot_Living_Policy ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/p
 file(GLOB Playerbot_Living_Events ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/events/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/events/*.h)
 file(GLOB Playerbot_Living_Snapshots ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/snapshots/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/snapshots/*.h)
 file(GLOB Playerbot_Living_Testing ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/testing/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/testing/*.h)
+file(GLOB Playerbot_Living_Util ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/util/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/util/*.h)
 
 set(PLAYERBOTS_LIVING_SRCS
     ${Playerbot_Living_Config}
@@ -50,6 +51,7 @@ set(PLAYERBOTS_LIVING_SRCS
     ${Playerbot_Living_Events}
     ${Playerbot_Living_Snapshots}
     ${Playerbot_Living_Testing}
+    ${Playerbot_Living_Util}
 )
 
 if(BUILD_PLAYERBOTS_LIVING_TESTS)

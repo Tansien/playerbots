@@ -1,6 +1,7 @@
 #include "playerbot/playerbot.h"
 #include "GlyphAction.h"
 #include "playerbot/RandomItemMgr.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/strategy/values/GlyphValues.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
 
@@ -10,11 +11,18 @@ bool GlyphAction::Execute(Event& event)
 {
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
     std::string param = event.getParam();
-    ItemIds ids = ChatHelper::parseItems(param);
     ProcessGlyphAction glyphAction = &GlyphAction::List;
 
     std::vector<uint32> glyphs;
     std::vector<uint8> glyphsSlots;
+
+    // The command grammar is selected before any item extraction: parseItems must
+    // not run for the listing/remove grammars, which carry no item link.
+    bool const isRemoveGrammar = param == "remove" || param.find("remove ") == 0;
+    bool const isListGrammar = param == "all" || param == "wanted" || param == "equiped";
+    ItemIds ids;
+    if (!isRemoveGrammar && !isListGrammar)
+        ids = ChatHelper::parseItems(param);
 
     if (param == "all")
     {
@@ -40,7 +48,7 @@ bool GlyphAction::Execute(Event& event)
     }
     // Exact grammar: "remove" (all glyphs) or "remove <slot> [<slot>...]".
     // Matching a bare prefix accepted "removed" and friends as "remove all".
-    else if (param == "remove" || param.find("remove ") == 0)
+    else if (isRemoveGrammar)
     {
         std::vector<uint32> equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
 
@@ -50,24 +58,8 @@ bool GlyphAction::Execute(Event& event)
         {
             for (auto& token : getMultiQualifiers(removeSlots, " "))
             {
-                // Parse without throwing and validate the value BEFORE narrowing:
-                // isValidNumberString accepts a lone sign and any digit count, so
-                // stoi could throw out of the chat-command handler, and narrowing
-                // first turned e.g. slot 256 into slot 0 and mutated it.
-                uint64 parsedSlot = 0;
-                bool validSlot = !token.empty() && token.size() <= 3;
-                for (char c : token)
-                {
-                    if (c < '0' || c > '9')
-                    {
-                        validSlot = false;
-                        break;
-                    }
-
-                    parsedSlot = parsedSlot * 10 + uint64(c - '0');
-                }
-
-                if (!validSlot || parsedSlot >= equipedGlyphs.size())
+                uint8 slotId = 0;
+                if (!living::TryParseSlotIndex(token, uint32(equipedGlyphs.size()), slotId))
                 {
                     std::ostringstream out;
                     out << token << " is not a valid slot number";
@@ -75,7 +67,6 @@ bool GlyphAction::Execute(Event& event)
                     return false;
                 }
 
-                uint8 const slotId = uint8(parsedSlot);
                 glyphs.push_back(equipedGlyphs[slotId]);
                 glyphsSlots.push_back(slotId);
             }
@@ -94,16 +85,33 @@ bool GlyphAction::Execute(Event& event)
     }
     else if (!ids.empty())
     {
+        // Optional explicit slot after the item link. The same checked parser as the
+        // remove grammar: a lone sign or a huge value used to reach stoi and throw,
+        // and the value was narrowed into uint8 before any range check, so slot 256
+        // silently became slot 0 and consumed the glyph there. 99 keeps the legacy
+        // "no slot specified, pick one" sentinel.
+        uint8 requestedSlot = 99;
+        size_t const linkEnd = param.find("|r ");
+        if (linkEnd != std::string::npos)
+        {
+            std::string const slotToken = param.substr(linkEnd + 3);
+            std::vector<uint32> const equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
+            if (!living::TryParseSlotIndex(slotToken, uint32(equipedGlyphs.size()), requestedSlot))
+            {
+                std::ostringstream out;
+                out << slotToken << " is not a valid slot number";
+                ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                return false;
+            }
+        }
+
         for (auto& id : ids)
         {
             if (!id)
                 continue;
 
             glyphs.push_back(id);
-            if (param.find("|r ") != std::string::npos && isValidNumberString(param.substr(param.find("|r ") + 3)))
-                glyphsSlots.push_back(stoi(param.substr(param.find("|r ") + 3)));
-            else
-                glyphsSlots.push_back(99);
+            glyphsSlots.push_back(requestedSlot);
         }
 
         glyphAction = &GlyphAction::Set;
