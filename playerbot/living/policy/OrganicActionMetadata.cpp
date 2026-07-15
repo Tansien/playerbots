@@ -156,6 +156,9 @@ namespace living
             { OrganicActionKind::WORLD_BUFF_APPLY, "WORLD_BUFF_APPLY", OrganicActionCategory::CharacterInit,
               "AiPlayerbot.WorldBuff* / WorldBuffAction direct aura application (can also hit nearby real players in the world-buff travel flow)", OrganicClassification::Deny,
               nullptr, false, false, "0002A 'World buffs'" },
+            { OrganicActionKind::SHARED_RESPAWN_ACCELERATION, "SHARED_RESPAWN_ACCELERATION", OrganicActionCategory::CharacterInit,
+              "PlayerbotAI::AccelerateRespawn shared boundary (XpGainAction kill credit, LootAction release): shortens a creature's respawn delay and can remove its corpse", OrganicClassification::Deny,
+              nullptr, false, false, "0002A A.2 Phase 0 source-audit row (shared-world spawn state; affects real players)" },
             { OrganicActionKind::DIRECT_AURA_REMOVAL, "DIRECT_AURA_REMOVAL", OrganicActionCategory::CharacterInit,
               "RemoveAuraAction ('ra' command) and WorldBuffStrategy::OnStrategyRemoved: direct RemoveAurasDueToSpell/RemoveAura outside core cancellation rules", OrganicClassification::Deny,
               nullptr, false, false, "0002A A.2 Phase 0 source-audit row (core-validated cancellation only)" },
@@ -364,9 +367,12 @@ namespace living
               "future authenticated admin progression bypass", OrganicClassification::Deny,
               nullptr, false, false, "0002A 'Explicit bounded admin mutation' (no approved reconciler in 0.1)" },
 
+            { OrganicActionKind::FIXTURE_CHARACTER_CREATE, "FIXTURE_CHARACTER_CREATE", OrganicActionCategory::Fixture,
+              "fixture-bot character creation under the test profile: pre-identity, like CORE_CHARACTER_CREATE, before the FIXTURE root is committed", OrganicClassification::FixtureBootstrap,
+              nullptr, false, true, "0006 section 7; 0001A A.4 fixture boundary (pre-create half)" },
             { OrganicActionKind::FIXTURE_PROVISION, "FIXTURE_PROVISION", OrganicActionCategory::Fixture,
-              "fixture-bot deterministic provisioning under BUILD_PLAYERBOTS_LIVING_TESTS", OrganicClassification::FixtureOnly,
-              nullptr, false, true, "0006 section 7; 0001A A.4 fixture boundary" },
+              "fixture-bot deterministic provisioning (level/spec/gear grants) AFTER the FIXTURE root is committed; the in-world scenario DSL (GenerateBotTests) is the wider surface", OrganicClassification::FixtureOnly,
+              nullptr, false, true, "0006 section 7; 0001A A.4 fixture boundary (post-create half)" },
         } };
 
         // Compile-time completeness: adding an OrganicActionKind without a metadata
@@ -391,7 +397,10 @@ namespace living
                     || row.classification == OrganicClassification::RequireAudit;
                 if (row.productionEligible != eligible)
                     return false;
-                if (row.fixtureOnly != (row.classification == OrganicClassification::FixtureOnly))
+
+                bool const fixture = row.classification == OrganicClassification::FixtureOnly
+                    || row.classification == OrganicClassification::FixtureBootstrap;
+                if (row.fixtureOnly != fixture)
                     return false;
             }
 
@@ -438,6 +447,7 @@ namespace living
             case OrganicClassification::Deny: return "Deny";
             case OrganicClassification::RequireAudit: return "RequireAudit";
             case OrganicClassification::FixtureOnly: return "FixtureOnly";
+            case OrganicClassification::FixtureBootstrap: return "FixtureBootstrap";
         }
 
         return "INVALID_CLASSIFICATION";

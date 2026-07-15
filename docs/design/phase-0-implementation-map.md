@@ -236,6 +236,17 @@ blockers per 0002A A.2:
   GM state, and group-member locations. 0.1 wiring must require the
   non-production profile and FIXTURE provenance for every affected target,
   including real group members.
+- `SHARED_RESPAWN_ACCELERATION`: guard `PlayerbotAI::AccelerateRespawn` once at
+  the shared boundary (both callers: `XpGainAction` kill credit and
+  `LootAction` release). `AiPlayerbot.RespawnModHostile`/`RespawnModNeutral`
+  ship nonzero, so this shared-world mutation is on by default; it changes
+  respawn delay and can remove a corpse, which real players share.
+- Orphaned quest slots: implement a core-backed ATOMIC repair (slot + quest
+  status map/DB + source items + timers) before any automated cleanup may free
+  one. Phase 0 quarantines instead: the orphan is counted as occupied, logged,
+  and left untouched, and automated cleanup fails rather than dropping valid
+  quests. Clearing only the slot is NOT an acceptable repair - it leaves a
+  status the character can never re-accept if the template returns.
 - Population inspection: implement the database check that moves
   `PopulationInspection` off `NotInspected`.
 

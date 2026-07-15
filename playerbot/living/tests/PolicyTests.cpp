@@ -209,6 +209,7 @@ LIVING_TEST(policy_fabrication_families_are_denied)
         OrganicActionKind::DIRECT_AURA_REMOVAL, OrganicActionKind::ENCOUNTER_AURA_MUTATION,
         OrganicActionKind::LOGIN_ITEM_FABRICATION, OrganicActionKind::FREE_TALENT_RESPEC,
         OrganicActionKind::DIRECT_GLYPH_MUTATION, OrganicActionKind::DIRECT_SPIRIT_HEALER_RESURRECTION,
+        OrganicActionKind::SHARED_RESPAWN_ACCELERATION,
         OrganicActionKind::OFFLINE_PROGRESSION
     };
 
@@ -451,6 +452,86 @@ LIVING_TEST(policy_public_transport_requires_every_gate)
         LIVING_CHECK(denied.decision == OrganicDecision::Deny);
 }
 
+LIVING_TEST(policy_bootstrap_requires_exactly_absent_root)
+{
+    // Only an EXACTLY absent root (guid 0 AND every nonce byte 0) is pre-create
+    // eligible. A half-populated root is malformed input, not "no identity yet",
+    // and must not be waved through.
+    OrganicRequest create;
+    create.kind = OrganicActionKind::CORE_CHARACTER_CREATE;
+    create.source = OrganicSourceKind::FactoryBootstrap;
+    create.mode = LivingRealmMode::Organic;
+    create.managedBootstrapActive = true;
+    create.provenance = BotProvenance::ORGANIC_CREATED;
+
+    // Exact absence: authorized.
+    LIVING_CHECK(EvaluateOrganicPolicy(create).decision == OrganicDecision::AllowGameplay);
+    LIVING_CHECK(EvaluateOrganicPolicy(create).reason == OrganicReasonCode::BootstrapCreation);
+
+    // (nonzero guid, zero nonce): malformed partial root.
+    OrganicRequest guidOnly = create;
+    guidOnly.characterGuid = 1234;
+    LIVING_CHECK(EvaluateOrganicPolicy(guidOnly).decision == OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(guidOnly).reason == OrganicReasonCode::InvalidIdentity);
+
+    // (zero guid, nonzero nonce): malformed partial root.
+    OrganicRequest nonceOnly = create;
+    nonceOnly.identityNonce = { 9 };
+    LIVING_CHECK(EvaluateOrganicPolicy(nonceOnly).decision == OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(nonceOnly).reason == OrganicReasonCode::InvalidIdentity);
+
+    // A complete root means this is not a creation.
+    OrganicRequest complete = create;
+    complete.characterGuid = 1234;
+    complete.identityNonce = { 9 };
+    LIVING_CHECK(EvaluateOrganicPolicy(complete).reason == OrganicReasonCode::BootstrapIdentityPresent);
+}
+
+LIVING_TEST(policy_fixture_creation_is_pre_identity_and_provisioning_is_post_identity)
+{
+    // Fixture creation is the fixture twin of CORE_CHARACTER_CREATE: pre-identity,
+    // so it cannot require the FIXTURE root that only exists after creation.
+    OrganicRequest create;
+    create.kind = OrganicActionKind::FIXTURE_CHARACTER_CREATE;
+    create.source = OrganicSourceKind::TestFixture;
+    create.mode = LivingRealmMode::Organic;
+    create.fixtureTestProfile = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(create).decision == OrganicDecision::AllowAutomation);
+
+    // Outside the test profile, and from a non-fixture source, it is denied.
+    OrganicRequest production = create;
+    production.fixtureTestProfile = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(production).decision == OrganicDecision::Deny);
+
+    OrganicRequest wrongSource = create;
+    wrongSource.source = OrganicSourceKind::AiUpdate;
+    LIVING_CHECK(EvaluateOrganicPolicy(wrongSource).reason == OrganicReasonCode::BootstrapWrongSource);
+
+    // Post-create provisioning requires the committed (guid, nonce, FIXTURE) root.
+    OrganicRequest provision;
+    provision.kind = OrganicActionKind::FIXTURE_PROVISION;
+    provision.source = OrganicSourceKind::TestFixture;
+    provision.mode = LivingRealmMode::Organic;
+    provision.fixtureTestProfile = true;
+    provision.provenance = BotProvenance::FIXTURE;
+    LIVING_CHECK(EvaluateOrganicPolicy(provision).reason == OrganicReasonCode::InvalidIdentity); // no root yet
+
+    provision.characterGuid = 4321;
+    provision.identityNonce = { 7 };
+    LIVING_CHECK(EvaluateOrganicPolicy(provision).decision == OrganicDecision::AllowAutomation);
+    LIVING_CHECK(EvaluateOrganicPolicy(provision).reason == OrganicReasonCode::FixtureAuthorized);
+}
+
+LIVING_TEST(policy_shared_respawn_acceleration_is_denied)
+{
+    // A shared-world mutation: it shortens a creature's respawn delay and can
+    // remove its corpse, which real players share.
+    OrganicPolicyResult const result =
+        EvaluateOrganicPolicy(OrganicRequestFor(OrganicActionKind::SHARED_RESPAWN_ACCELERATION));
+    LIVING_CHECK(result.decision == OrganicDecision::Deny);
+    LIVING_CHECK(result.knownAction);
+}
+
 LIVING_TEST(policy_identity_root_must_be_bindable)
 {
     // A decision that cannot be bound to (guid, nonce) cannot be attached to a
@@ -586,6 +667,20 @@ LIVING_TEST(policy_every_classification_maps_to_its_decision)
                 fixture.provenance = BotProvenance::FIXTURE;
                 fixture.fixtureTestProfile = true;
                 LIVING_CHECK(EvaluateOrganicPolicy(fixture).decision == OrganicDecision::AllowAutomation);
+                break;
+            }
+
+            case OrganicClassification::FixtureBootstrap:
+            {
+                // Pre-identity: denied in production, authorized from the fixture
+                // source inside the test profile with no root yet.
+                LIVING_CHECK(result.decision == OrganicDecision::Deny);
+                OrganicRequest fixtureCreate;
+                fixtureCreate.kind = row.kind;
+                fixtureCreate.source = OrganicSourceKind::TestFixture;
+                fixtureCreate.mode = LivingRealmMode::Organic;
+                fixtureCreate.fixtureTestProfile = true;
+                LIVING_CHECK(EvaluateOrganicPolicy(fixtureCreate).decision == OrganicDecision::AllowAutomation);
                 break;
             }
         }

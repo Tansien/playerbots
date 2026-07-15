@@ -97,7 +97,10 @@ LIVING_TEST(inventory_fixture_only_rows_are_never_production_eligible)
         if (row.fixtureOnly)
         {
             ++fixtureRows;
-            LIVING_CHECK(row.classification == OrganicClassification::FixtureOnly);
+            // Fixture rows come in two shapes: pre-create fixture bootstrap and
+            // post-create fixture grants. Neither is ever production eligible.
+            LIVING_CHECK(row.classification == OrganicClassification::FixtureOnly
+                || row.classification == OrganicClassification::FixtureBootstrap);
             LIVING_CHECK(!row.productionEligible);
         }
 
@@ -107,8 +110,8 @@ LIVING_TEST(inventory_fixture_only_rows_are_never_production_eligible)
     }
 
     // CHEAT_RUNTIME_OVERRIDE, BROAD_MAINTENANCE_COMMAND, DEBUG_MUTATION_COMMAND,
-    // COMMAND_CHARACTER_PROVISION, FIXTURE_PROVISION
-    LIVING_CHECK(fixtureRows == 5);
+    // COMMAND_CHARACTER_PROVISION, FIXTURE_CHARACTER_CREATE, FIXTURE_PROVISION
+    LIVING_CHECK(fixtureRows == 6);
 }
 
 LIVING_TEST(inventory_covers_required_shortcut_families)
@@ -140,6 +143,7 @@ LIVING_TEST(inventory_covers_required_shortcut_families)
         "FREE_PET_HAPPINESS", "DIRECT_AURA_REMOVAL", "DIRECT_ITEM_DESTRUCTION",
         "ENCOUNTER_AURA_MUTATION", "LOGIN_ITEM_FABRICATION", "FREE_TALENT_RESPEC", "DIRECT_GLYPH_MUTATION",
         "GAMEPLAY_QUEST_ACCEPT", "DIRECT_SPIRIT_HEALER_RESURRECTION",
+        "SHARED_RESPAWN_ACCELERATION", "FIXTURE_CHARACTER_CREATE",
         "LEGACY_LOGIN_ROTATION", "LEGACY_TIMED_ROTATION",
         "BROAD_MAINTENANCE_COMMAND", "POPULATION_RESET_RECREATE", "RAW_POPULATION_SQL_RESET",
         "OFFLINE_PROGRESSION", "CHEAT_RUNTIME_OVERRIDE", "CORE_CHARACTER_CREATE",

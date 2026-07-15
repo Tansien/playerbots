@@ -93,6 +93,8 @@ design.
 | Free talent respec | `ChangeTalentsAction` / `TalentSpec::ApplyTalents` | Removes/learns talent spells without respec cost | Denied | talent actions | Core respec rules; earned-point spending stays automation |
 | Direct glyph mutation | `GlyphAction` direct slot application (WotLK) | Applies/removes glyphs outside the core handler | Denied | glyph action | Core glyph handler only |
 | Normal quest acceptance | core-eligible `AddQuest` via quest-giver/shared/item handlers | Legitimate quest intake | Allowed gameplay | the core-handler branch inside `QuestAction::AcceptQuest` (not the action entry, which also holds the denied `SyncQuestWithPlayer` fallback) | No |
+| Shared-world respawn acceleration | `PlayerbotAI::AccelerateRespawn` (XpGain kill credit, Loot release); `RespawnModHostile`/`RespawnModNeutral` ship nonzero | Shortens a creature's respawn delay and can remove its corpse; alters spawn availability real players share | Denied | `AccelerateRespawn` shared boundary | None |
+| Fixture character creation | fixture bootstrap under the test profile | Creates a fixture character before its FIXTURE root exists | Fixture profile only, pre-identity | fixture creation wrapper | Fixture profile only |
 | Direct spirit-healer resurrection | `SpiritHealerAction`: resurrects even when no healer was found | Resurrects/damages durability without the core healer handler | Denied | revive action | Core spirit-healer handler only |
 
 The rows from "Account-transfer hire" down were added by the Phase 0 source audit

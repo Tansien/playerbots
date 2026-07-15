@@ -44,6 +44,7 @@ namespace living
         FreeSummonConflict,
         EnchantConflict,
         WorldBuffConflict,
+        RespawnAccelerationConflict,
         AsyncBotLoginRequired,
         PopulationNotInspected,
         MixedPopulationDetected,
@@ -93,6 +94,10 @@ namespace living
         bool autoLearnDroppedSpells = false;     // AiPlayerbot.AutoLearnDroppedSpells
         bool autoEnchantUpgradeLoot = false;     // AiPlayerbot.AutoEnchantUpgradeLoot
         uint32_t worldBuffCount = 0;             // number of parsed AiPlayerbot.WorldBuff* entries
+        float respawnModHostile = 0.0f;          // AiPlayerbot.RespawnModHostile (ships nonzero)
+        float respawnModNeutral = 0.0f;          // AiPlayerbot.RespawnModNeutral (ships nonzero)
+        bool respawnModForPlayerBots = false;    // AiPlayerbot.RespawnModForPlayerBots
+        bool respawnModForInstances = false;     // AiPlayerbot.RespawnModForInstances
         bool enableRandomTeleports = false;      // AiPlayerbot.EnableRandomTeleports
         bool randomBotTeleportNearPlayer = false;// AiPlayerbot.RandomBotTeleportNearPlayer
         bool enableMinimalMove = false;          // AiPlayerbot.EnableMinimalMove (direct teleport moves)

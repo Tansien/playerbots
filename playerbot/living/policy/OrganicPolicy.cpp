@@ -93,19 +93,29 @@ namespace living
             }
         }
 
+        bool HasZeroNonce(OrganicRequest const& request)
+        {
+            for (uint8_t byte : request.identityNonce)
+                if (byte != 0)
+                    return false;
+
+            return true;
+        }
+
         // A decision must be bindable to the (guid, nonce) identity root: a zero low
         // GUID or an all-zero nonce cannot be attached to a durable audit row or
         // distinguished from a reused GUID (0003 section 2).
         bool HasValidIdentityRoot(OrganicRequest const& request)
         {
-            if (request.characterGuid == 0)
-                return false;
+            return request.characterGuid != 0 && !HasZeroNonce(request);
+        }
 
-            for (uint8_t byte : request.identityNonce)
-                if (byte != 0)
-                    return true;
-
-            return false;
+        // Exactly absent: guid 0 AND every nonce byte 0. A half-populated root
+        // ((guid, zero nonce) or (0, nonce)) is malformed input, not "no identity
+        // yet", and must not be waved through the pre-create branch.
+        bool HasAbsentIdentityRoot(OrganicRequest const& request)
+        {
+            return request.characterGuid == 0 && HasZeroNonce(request);
         }
     }
 
@@ -149,16 +159,39 @@ namespace living
         // ORGANIC_CREATED root here would be circular. This is the one pre-identity
         // decision, and it is bound to the factory running an active managed
         // bootstrap operation rather than to an identity.
+        // Fixture creation is the fixture-profile twin of CORE_CHARACTER_CREATE:
+        // pre-identity, so it cannot require the FIXTURE root that only exists once
+        // the fixture character has been created and committed.
+        if (metadata->classification == OrganicClassification::FixtureBootstrap)
+        {
+            if (!request.fixtureTestProfile)
+                return Result(OrganicDecision::Deny, OrganicReasonCode::FixtureOutsideTestProfile, true);
+            if (request.source != OrganicSourceKind::TestFixture)
+                return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapWrongSource, true);
+            if (!HasAbsentIdentityRoot(request))
+                return Result(OrganicDecision::Deny,
+                    HasValidIdentityRoot(request)
+                        ? OrganicReasonCode::BootstrapIdentityPresent
+                        : OrganicReasonCode::InvalidIdentity,
+                    true);
+            return Result(OrganicDecision::AllowAutomation, OrganicReasonCode::FixtureAuthorized, true);
+        }
+
         if (metadata->classification == OrganicClassification::BootstrapOnly)
         {
             if (request.source != OrganicSourceKind::FactoryBootstrap)
                 return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapWrongSource, true);
             if (!request.managedBootstrapActive)
                 return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapNotActive, true);
-            // A pre-identity request carries no root; a request that already has one
-            // is not a creation and must not be authorized as one.
-            if (HasValidIdentityRoot(request))
-                return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapIdentityPresent, true);
+            // A pre-identity request carries no root at all. A complete root means
+            // this is not a creation; a partial root is malformed and fails closed
+            // rather than being read as "no identity yet".
+            if (!HasAbsentIdentityRoot(request))
+                return Result(OrganicDecision::Deny,
+                    HasValidIdentityRoot(request)
+                        ? OrganicReasonCode::BootstrapIdentityPresent
+                        : OrganicReasonCode::InvalidIdentity,
+                    true);
             return Result(OrganicDecision::AllowGameplay, OrganicReasonCode::BootstrapCreation, true);
         }
 
@@ -213,7 +246,8 @@ namespace living
 
             case OrganicClassification::BootstrapOnly:
             case OrganicClassification::FixtureOnly:
-                break; // both decided before identity validation above; unreachable
+            case OrganicClassification::FixtureBootstrap:
+                break; // all decided before identity validation above; unreachable
         }
 
         return Result(OrganicDecision::Deny, OrganicReasonCode::DeniedByClassification, true);
