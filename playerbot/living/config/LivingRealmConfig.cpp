@@ -32,10 +32,21 @@ namespace living
 
     LivingRealmBool ParseLivingRealmBool(std::string const& value)
     {
-        std::string text;
-        for (char c : value)
-            if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
-                text += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+        // Trim only the ends: stripping whitespace everywhere turned "o f f" into a
+        // valid "off", silently disabling Living Realm or strict enforcement instead
+        // of reporting a malformed value. Embedded whitespace stays malformed.
+        auto const isSpace = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+
+        size_t begin = 0;
+        size_t end = value.size();
+        while (begin < end && isSpace(value[begin]))
+            ++begin;
+        while (end > begin && isSpace(value[end - 1]))
+            --end;
+
+        std::string text = value.substr(begin, end - begin);
+        std::transform(text.begin(), text.end(), text.begin(),
+            [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c; });
 
         if (text == "1" || text == "true" || text == "yes" || text == "on")
             return LivingRealmBool::True;
@@ -62,10 +73,12 @@ namespace living
         LivingRealmConfig config;
         config.enabled = enabled;
         config.enabledRaw = enabled ? LivingRealmBool::True : LivingRealmBool::False;
+        config.enabledRawText = enabled ? "1" : "0";
         config.profile = ParseLivingRealmProfile(profileName);
         config.profileName = std::move(profileName);
         config.strict = strict;
         config.strictRaw = strict ? LivingRealmBool::True : LivingRealmBool::False;
+        config.strictRawText = strict ? "1" : "0";
         return config;
     }
 
@@ -75,6 +88,8 @@ namespace living
         LivingRealmConfig config;
         config.enabledRaw = ParseLivingRealmBool(enabled);
         config.strictRaw = ParseLivingRealmBool(strict);
+        config.enabledRawText = enabled;
+        config.strictRawText = strict;
 
         // Fail-closed interpretation while the report blocks on the malformed value:
         // a malformed Enabled is treated as enabled (so its blocking entry is

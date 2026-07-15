@@ -73,13 +73,15 @@ namespace living
         // A malformed Living Realm boolean is never resolved by guessing: it blocks
         // regardless of strict mode, because the guess itself would pick a
         // permissive effective state.
+        // Report the operator's ACTUAL token, not the literal "malformed": the
+        // point of the entry is to show which value needs fixing.
         if (config.enabledRaw == LivingRealmBool::Malformed)
-            AddEntry(report, LIVING_REALM_ENABLED_KEY, "malformed", "0 or 1",
+            AddEntry(report, LIVING_REALM_ENABLED_KEY, config.enabledRawText, "0 or 1",
                 "startup validation", ConfigClassification::MissingPrerequisite,
                 ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
 
         if (config.strictRaw == LivingRealmBool::Malformed)
-            AddEntry(report, LIVING_REALM_STRICT_KEY, "malformed", "0 or 1",
+            AddEntry(report, LIVING_REALM_STRICT_KEY, config.strictRawText, "0 or 1",
                 "startup validation", ConfigClassification::MissingPrerequisite,
                 ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
 

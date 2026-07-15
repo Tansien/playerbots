@@ -87,16 +87,22 @@ namespace living
         return a == b;
     }
 
-    // Mandatory full validator: a proposal computed from `basis` may act on
-    // `current` only when EVERY state field still matches - identity (guid AND
-    // nonce), versions, generations, desired/observed online state, group and
-    // commitment summary, and location - and the proposal has not expired (0005A
-    // A.1 requires actual online/group/map state to be revalidated, not just
-    // versions). The CURRENT snapshot's proposal expiry is bookkeeping of the new
-    // capture, not character state, so it is excluded from the comparison: expiry
-    // is judged only as the basis' own deadline against `now`. Anything else is
-    // stale and must be discarded without side effects.
-    inline bool IsSnapshotStale(LivingCharacterSnapshot const& basis,
+    // CHARACTER-STATE staleness only. A proposal computed from `basis` may act on
+    // `current` only when every character-state field still matches - identity
+    // (guid AND nonce), versions, generations, desired/observed online state, queue
+    // attempt state, group and commitment summary, and location - and the proposal
+    // has not expired. The CURRENT snapshot's proposal expiry is bookkeeping of the
+    // new capture, not character state, so it is excluded from the comparison:
+    // expiry is judged only as the basis' own deadline against `now`.
+    //
+    // This is deliberately NOT the complete 0005A A.1 revalidation. That contract
+    // also requires role, recent-service, estimated-cost, capacity, and policy
+    // inputs to be revalidated before queueing login/logout, and this snapshot
+    // models none of them (the 0.2 Population Director owns them). Callers MUST
+    // revalidate capacity and policy separately; a future Director-supplied wrapper
+    // is expected to compose this check with those inputs. Naming it a "full"
+    // validator would misrepresent that gap, so it is scoped to what it proves.
+    inline bool IsCharacterStateStale(LivingCharacterSnapshot const& basis,
         LivingCharacterSnapshot const& current, uint64_t nowUtcMs)
     {
         LivingCharacterSnapshot currentState = current;
