@@ -1,6 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "ChatHelper.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/AiFactory.h"
 #include "strategy/values/ItemUsageValue.h"
 #include <numeric>
@@ -406,12 +407,16 @@ std::vector<uint32> ChatHelper::parseItemsUnordered(const std::string& text, boo
             continue;
         }
 
-        if (isNumeric(itemStr))
+        // Non-throwing, full-consumption unsigned parse: std::stoi is signed, so an
+        // all-digit token above INT_MAX (e.g. "2147483648") threw std::out_of_range
+        // out of the chat-command handler, and Engine::ListenAndExecute has no
+        // exception boundary around Action::Execute.
+        uint32 itemID = 0;
+        if (living::TryParseUInt32(itemStr, itemID))
         {
-            const uint32 itemID = std::stoi(itemStr);
             if (!validate || sObjectMgr.GetItemPrototype(itemID) != nullptr)
             {
-                itemIds.push_back(std::stoi(itemStr));
+                itemIds.push_back(itemID);
             }
         }
     }
