@@ -191,6 +191,23 @@ blockers per 0002A A.2:
 - In-world regression scenarios for the quest-cleanup accounting and
   taxi-money restoration fixes (host tests cannot construct core quest/taxi
   objects; use the `playerbot/strategy/tests` DSL on a test realm).
+- `TEMP_MONEY_TRICK` (**data-integrity hazard, not just a shortcut**): the
+  temporary `SetMoney` grant used by the RPG/world-buff flight helpers and the
+  `taxi`/`gold` cheat fare runs `MoneyChanged` synchronously, which can
+  permanently auto-reward a money-required quest (`CompleteQuest` ->
+  `RewardQuest` for `QUEST_FLAGS_AUTO_REWARDED`) and advance WotLK
+  highest-gold achievements. Restoring the balance cannot undo either. The
+  guard must remove the temporary grant at the shared boundary (real fare or
+  no flight), not merely restore the number.
+- `RANDOM_TELEPORT`/`RPG_CAMP_TELEPORT` compound with
+  `RandomPlayerbotMgr::Refresh`, which resurrects, repairs, refills resources,
+  creates consumables, and grants money after the teleport: guard the shared
+  refresh boundary, not only the teleport call.
+- `FIXTURE_PROVISION` currently names the host-test guard; the live in-world
+  scenario DSL (`GenerateBotTests`) can also mutate items, quests, creatures,
+  GM state, and group-member locations. 0.1 wiring must require the
+  non-production profile and FIXTURE provenance for every affected target,
+  including real group members.
 - Population inspection: implement the database check that moves
   `PopulationInspection` off `NotInspected`.
 
