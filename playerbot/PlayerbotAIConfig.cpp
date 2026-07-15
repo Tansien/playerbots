@@ -792,7 +792,7 @@ bool PlayerbotAIConfig::Initialize()
 
     loadFreeAltBotAccounts();
 
-    targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f),
+    targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f);
 
     // Keys/defaults come from the shared constants so the template-parity host test
     // also guards this parser against drift. The booleans are read as raw strings
