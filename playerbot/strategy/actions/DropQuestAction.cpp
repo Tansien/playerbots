@@ -112,20 +112,21 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
         if (!questId)
             continue;
 
-        Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
-        if (!quest)
-            continue;
-
-        // Counting pass: count EVERY occupied slot and mutate nothing. Failed and
-        // class-specific quests occupy log space too; skipping them made a full
-        // log read as having room, and dropping during "counting" could desync the
-        // counter (a uint8 underflow here previously made later pruning stages
-        // discard progressed/completed quests).
+        // Counting pass: count EVERY occupied slot and mutate nothing. Failed,
+        // class-specific, and orphaned (template-less) quests all occupy log space;
+        // skipping any of them made a full log read as having room and wedged quest
+        // acceptance, and dropping during "counting" desynced the counter (an
+        // unconditional decrement could wrap the uint8 to 255 and make the later
+        // pruning stages discard progressed or completed quests).
         if (wantNum == 100)
         {
             numQuest++;
             continue;
         }
+
+        Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
+        if (!quest)
+            continue;
 
         if (bot->GetQuestStatus(questId) != QUEST_STATUS_FAILED)
         {
