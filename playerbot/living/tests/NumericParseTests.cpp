@@ -81,3 +81,29 @@ LIVING_TEST(numeric_parse_slot_index_validates_before_narrowing)
     LIVING_CHECK(TryParseSlotIndex("255", 300, slot) && slot == 255);
     LIVING_CHECK(!TryParseSlotIndex("256", 300, slot));
 }
+
+LIVING_TEST(numeric_chat_link_ids_reject_overflow_without_throwing)
+{
+    // The four ExtractAll*Ids helpers feed this parser from inbound chat, which has
+    // no exception boundary: signed stoi threw std::out_of_range on payloads like
+    // "Hitem:9999999999" straight out of the world/AI path.
+    uint32_t value = 0;
+
+    // The full uint32 range is accepted, including values above INT_MAX where the
+    // old signed parse threw.
+    LIVING_CHECK(living::TryParseUInt32("2147483648", value));  // INT_MAX + 1
+    LIVING_CHECK(value == 2147483648u);
+    LIVING_CHECK(living::TryParseUInt32("4294967295", value));  // UINT32_MAX
+    LIVING_CHECK(value == 4294967295u);
+
+    // Overflow and absurd lengths are skipped, not thrown.
+    LIVING_CHECK(!living::TryParseUInt32("4294967296", value)); // UINT32_MAX + 1
+    LIVING_CHECK(!living::TryParseUInt32("9999999999", value));
+    LIVING_CHECK(!living::TryParseUInt32(std::string(4096, '9'), value));
+
+    // Signs and suffixes are not valid link IDs.
+    LIVING_CHECK(!living::TryParseUInt32("+1", value));
+    LIVING_CHECK(!living::TryParseUInt32("-1", value));
+    LIVING_CHECK(!living::TryParseUInt32("12abc", value));
+    LIVING_CHECK(!living::TryParseUInt32("", value));
+}
