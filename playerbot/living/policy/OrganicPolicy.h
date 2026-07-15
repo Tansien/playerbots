@@ -64,6 +64,8 @@ namespace living
         InvalidSource,
         InvalidIdentity,
         BootstrapNotActive,
+        BootstrapWrongSource,
+        BootstrapIdentityPresent,
         FixtureOutsideTestProfile,
         FixtureProvenanceRequired,
         FixtureIsolated,
@@ -80,6 +82,7 @@ namespace living
         RecoveryLadderNotExhausted,
         ProtectedCommitmentBlocksRecovery,
         NoSafeDestination,
+        IncompatibleProtectedCommitment,
         RouteNotAllowlisted,
         GoalRouteNotBound,
         NotAtOriginNode,
@@ -130,6 +133,11 @@ namespace living
         bool typedGoalRouteBound = false;       // active goal's typed route contains the link
         bool atExactOriginNode = false;         // reached the origin node by normal movement
         bool originWaitSatisfied = false;       // waited the route's deterministic minimum delay
+        // C.3.3 requires rejecting an INCOMPATIBLE protected commitment. This is a
+        // positive, default-false gate: a protected commitment must be explicitly
+        // certified compatible by the owning service, so an unset flag denies rather
+        // than relocating a bot away from a real player's obligation.
+        bool protectedCommitmentCompatible = false;
 
         // TRANSPORT_GROUP_SYNC (C.5)
         bool ownerOnVerifiedTransport = false;  // live same-group owner aboard a verified transport
