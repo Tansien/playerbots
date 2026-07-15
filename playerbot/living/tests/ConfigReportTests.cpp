@@ -38,6 +38,10 @@ namespace
         inputs.autoLearnDroppedSpells = true;
         inputs.autoEnchantUpgradeLoot = true;
         inputs.worldBuffCount = 3;
+        inputs.respawnModHostile = 5.0f;
+        inputs.respawnModNeutral = 10.0f;
+        inputs.respawnModForPlayerBots = true;
+        inputs.respawnModForInstances = true;
         inputs.enableRandomTeleports = true;
         inputs.randomBotTeleportNearPlayer = true;
         inputs.enableMinimalMove = true;
@@ -137,6 +141,15 @@ LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
     LIVING_CHECK(CountReason(strictReport, ConfigReasonCode::MalformedBoolean) == 1);
     LIVING_CHECK(strictReport.HasBlockingEntry());
 
+    // A VALID disabled Enabled validates nothing else, including a malformed
+    // Strict: the public contract is exactly one informational entry.
+    LivingRealmConfig const disabledBadStrict = LivingRealmConfig::FromRawValues("0", "bogus", "nonsense");
+    EffectiveConfigReport const disabledReport =
+        BuildEffectiveConfigReport(disabledBadStrict, ConflictingLegacyInputs());
+    LIVING_CHECK(disabledReport.entries.size() == 1);
+    LIVING_CHECK(disabledReport.entries[0].reason == ConfigReasonCode::LivingRealmDisabled);
+    LIVING_CHECK(!disabledReport.HasBlockingEntry());
+
     // Well-formed raw values behave exactly like the typed constructor.
     LivingRealmConfig const off = LivingRealmConfig::FromRawValues("0", "organic", "1");
     LIVING_CHECK(!off.enabled);
@@ -199,6 +212,7 @@ LIVING_TEST(config_report_represents_every_required_conflict)
     LIVING_CHECK(CountReason(report, ConfigReasonCode::FreeLearningConflict) == 4);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::EnchantConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::WorldBuffConflict) == 1);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::RespawnAccelerationConflict) == 4);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TeleportConflict) == 3);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TransportConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TimedRotationConflict) == 2);

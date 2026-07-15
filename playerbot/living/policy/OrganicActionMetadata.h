@@ -17,7 +17,8 @@ namespace living
         BootstrapOnly,   // ordinary creation path, legal only inside the managed bootstrap operation
         Deny,            // never mutates in Organic mode
         RequireAudit,    // named bounded compatibility/recovery action with an action-specific reconciler
-        FixtureOnly      // denied in production; available only to FIXTURE identities in a test profile
+        FixtureOnly,     // denied in production; available only to FIXTURE identities in a test profile
+        FixtureBootstrap // pre-identity fixture creation: test profile + fixture source, no root yet
     };
 
     enum class OrganicActionCategory : uint8_t

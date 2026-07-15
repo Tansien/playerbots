@@ -85,23 +85,38 @@ bool GlyphAction::Execute(Event& event)
     }
     else if (!ids.empty())
     {
-        // Optional explicit slot after the item link. The same checked parser as the
-        // remove grammar: a lone sign or a huge value used to reach stoi and throw,
-        // and the value was narrowed into uint8 before any range check, so slot 256
-        // silently became slot 0 and consumed the glyph there. 99 keeps the legacy
-        // "no slot specified, pick one" sentinel.
+        // Optional explicit slot AFTER THE FINAL link. Reading the suffix of the
+        // first "|r " treated a second item link as a slot token, so the legacy
+        // multi-link auto-slotting form ("glyph <link1> <link2>") was rejected.
+        // 99 keeps the legacy "no slot specified, pick one" sentinel.
         uint8 requestedSlot = 99;
-        size_t const linkEnd = param.find("|r ");
-        if (linkEnd != std::string::npos)
+        size_t const lastLinkEnd = param.rfind("|r ");
+        if (lastLinkEnd != std::string::npos)
         {
-            std::string const slotToken = param.substr(linkEnd + 3);
-            std::vector<uint32> const equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
-            if (!living::TryParseSlotIndex(slotToken, uint32(equipedGlyphs.size()), requestedSlot))
+            std::string const slotToken = param.substr(lastLinkEnd + 3);
+            if (!slotToken.empty())
             {
-                std::ostringstream out;
-                out << slotToken << " is not a valid slot number";
-                ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
-                return false;
+                // An explicit slot addresses exactly one glyph; combining it with
+                // several links is ambiguous about which link it applies to.
+                if (ids.size() != 1)
+                {
+                    ai->TellPlayer(requester, "Specify a slot with a single glyph link, or omit the slot to auto-slot several",
+                        PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                    return false;
+                }
+
+                // The same checked parser as the remove grammar: a lone sign or a
+                // huge value used to reach stoi and throw, and the value was
+                // narrowed into uint8 before any range check, so slot 256 silently
+                // became slot 0 and consumed the glyph there.
+                std::vector<uint32> const equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
+                if (!living::TryParseSlotIndex(slotToken, uint32(equipedGlyphs.size()), requestedSlot))
+                {
+                    std::ostringstream out;
+                    out << slotToken << " is not a valid slot number";
+                    ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                    return false;
+                }
             }
         }
 

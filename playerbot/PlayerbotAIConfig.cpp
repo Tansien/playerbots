@@ -834,6 +834,10 @@ bool PlayerbotAIConfig::Initialize()
         legacyInputs.autoLearnDroppedSpells = autoLearnDroppedSpells;
         legacyInputs.autoEnchantUpgradeLoot = autoEnchantUpgradeLoot;
         legacyInputs.worldBuffCount = static_cast<uint32>(worldBuffs.size());
+        legacyInputs.respawnModHostile = respawnModHostile;
+        legacyInputs.respawnModNeutral = respawnModNeutral;
+        legacyInputs.respawnModForPlayerBots = respawnModForPlayerBots;
+        legacyInputs.respawnModForInstances = respawnModForInstances;
         legacyInputs.enableRandomTeleports = enableRandomTeleports;
         legacyInputs.randomBotTeleportNearPlayer = randomBotTeleportNearPlayer;
         legacyInputs.enableMinimalMove = enableMinimalMove;

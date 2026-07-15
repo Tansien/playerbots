@@ -70,30 +70,32 @@ namespace living
     {
         EffectiveConfigReport report;
 
-        // A malformed Living Realm boolean is never resolved by guessing: it blocks
-        // regardless of strict mode, because the guess itself would pick a
-        // permissive effective state.
-        // Report the operator's ACTUAL token, not the literal "malformed": the
-        // point of the entry is to show which value needs fixing.
+        // A malformed Enabled is never resolved by guessing: it blocks regardless of
+        // strict mode, because the guess itself would pick a permissive effective
+        // state. Checked before the disabled return because a malformed value is not
+        // a valid "disabled". Report the operator's ACTUAL token, not the literal
+        // "malformed": the point of the entry is to show which value needs fixing.
         if (config.enabledRaw == LivingRealmBool::Malformed)
             AddEntry(report, LIVING_REALM_ENABLED_KEY, config.enabledRawText, "0 or 1",
                 "startup validation", ConfigClassification::MissingPrerequisite,
                 ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
 
-        if (config.strictRaw == LivingRealmBool::Malformed)
-            AddEntry(report, LIVING_REALM_STRICT_KEY, config.strictRawText, "0 or 1",
-                "startup validation", ConfigClassification::MissingPrerequisite,
-                ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
-
-        // Disabled Living Realm validates nothing: no schema, no legacy conflict, no
-        // blocking entry. This is the LR-001 parity guarantee.
-        if (!config.enabled)
+        // A VALID disabled Enabled validates nothing else at all - not Strict, not
+        // the profile, not the schema, not one legacy setting - and yields exactly
+        // one informational entry. This is the LR-001 parity guarantee and the
+        // public contract of this function.
+        if (config.enabledRaw == LivingRealmBool::False)
         {
             AddEntry(report, LIVING_REALM_ENABLED_KEY, "0", "0", "none",
                 ConfigClassification::Informational, ConfigSeverity::Info,
                 ConfigReasonCode::LivingRealmDisabled, false);
             return report;
         }
+
+        if (config.strictRaw == LivingRealmBool::Malformed)
+            AddEntry(report, LIVING_REALM_STRICT_KEY, config.strictRawText, "0 or 1",
+                "startup validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
 
         if (config.profile == LivingRealmProfile::Organic)
             AddEntry(report, LIVING_REALM_PROFILE_KEY, config.profileName, "organic",
@@ -173,6 +175,26 @@ namespace living
         if (legacy.autoEnchantUpgradeLoot)
             AddConflict(report, config.strict, "AiPlayerbot.AutoEnchantUpgradeLoot", "1", "0",
                 "equip/repair/buy/RPG hooks", ConfigReasonCode::EnchantConflict);
+
+        // Shared-world respawn acceleration: both modifiers ship nonzero, so this is
+        // enabled out of the box and mutates spawn state that real players share.
+        if (legacy.respawnModHostile != 0.0f)
+            AddConflict(report, config.strict, "AiPlayerbot.RespawnModHostile",
+                FormatFloatStable(legacy.respawnModHostile), "0", "AccelerateRespawn shared boundary",
+                ConfigReasonCode::RespawnAccelerationConflict);
+
+        if (legacy.respawnModNeutral != 0.0f)
+            AddConflict(report, config.strict, "AiPlayerbot.RespawnModNeutral",
+                FormatFloatStable(legacy.respawnModNeutral), "0", "AccelerateRespawn shared boundary",
+                ConfigReasonCode::RespawnAccelerationConflict);
+
+        if (legacy.respawnModForPlayerBots)
+            AddConflict(report, config.strict, "AiPlayerbot.RespawnModForPlayerBots", "1", "0",
+                "AccelerateRespawn shared boundary", ConfigReasonCode::RespawnAccelerationConflict);
+
+        if (legacy.respawnModForInstances)
+            AddConflict(report, config.strict, "AiPlayerbot.RespawnModForInstances", "1", "0",
+                "AccelerateRespawn shared boundary", ConfigReasonCode::RespawnAccelerationConflict);
 
         if (legacy.worldBuffCount != 0)
             AddConflict(report, config.strict, "AiPlayerbot.WorldBuff*",
@@ -294,6 +316,7 @@ namespace living
             case ConfigReasonCode::FreeSummonConflict: return "FREE_SUMMON_CONFLICT";
             case ConfigReasonCode::EnchantConflict: return "ENCHANT_CONFLICT";
             case ConfigReasonCode::WorldBuffConflict: return "WORLD_BUFF_CONFLICT";
+            case ConfigReasonCode::RespawnAccelerationConflict: return "RESPAWN_ACCELERATION_CONFLICT";
             case ConfigReasonCode::AsyncBotLoginRequired: return "ASYNC_BOT_LOGIN_REQUIRED";
             case ConfigReasonCode::PopulationNotInspected: return "POPULATION_NOT_INSPECTED";
             case ConfigReasonCode::MixedPopulationDetected: return "MIXED_POPULATION_DETECTED";
