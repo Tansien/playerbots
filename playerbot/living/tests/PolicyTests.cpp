@@ -47,6 +47,8 @@ namespace
                 request.atExactOriginNode = true;
                 request.originWaitSatisfied = true;
                 break;
+            case OrganicActionKind::CORE_CHARACTER_CREATE:
+                break;
             case OrganicActionKind::TRANSPORT_GROUP_SYNC:
                 request.protectedRealPlayerCommitment = true;
                 request.ownerOnVerifiedTransport = true;
@@ -263,19 +265,66 @@ LIVING_TEST(policy_broad_maintenance_and_lifecycle_shortcuts_are_denied)
     LIVING_CHECK(admin.reason == OrganicReasonCode::NoApprovedReconciler);
 }
 
-LIVING_TEST(policy_bootstrap_creation_requires_active_managed_bootstrap)
+LIVING_TEST(policy_bootstrap_creation_is_pre_identity_and_factory_bound)
 {
-    OrganicRequest request = OrganicRequestFor(OrganicActionKind::CORE_CHARACTER_CREATE);
-    request.source = OrganicSourceKind::FactoryBootstrap;
+    // The core generates the low GUID inside Player::Create and the managed root
+    // is committed afterwards (0003 section 2), so creation must be authorized
+    // with NO identity yet. Requiring an existing ORGANIC_CREATED root here would
+    // be circular and could only be satisfied by a fake identity.
+    OrganicRequest create;
+    create.kind = OrganicActionKind::CORE_CHARACTER_CREATE;
+    create.mode = LivingRealmMode::Organic;
+    create.source = OrganicSourceKind::FactoryBootstrap;
+    create.managedBootstrapActive = true;
+    create.characterGuid = 0;            // no identity exists yet
+    create.identityNonce = {};           // ...
+    create.provenance = BotProvenance::LEGACY_UNMANAGED; // ...and no provenance either
 
-    OrganicPolicyResult const denied = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(denied.decision == OrganicDecision::Deny);
-    LIVING_CHECK(denied.reason == OrganicReasonCode::BootstrapNotActive);
-
-    request.managedBootstrapActive = true;
-    OrganicPolicyResult const allowed = EvaluateOrganicPolicy(request);
+    OrganicPolicyResult const allowed = EvaluateOrganicPolicy(create);
     LIVING_CHECK(allowed.decision == OrganicDecision::AllowGameplay);
     LIVING_CHECK(allowed.reason == OrganicReasonCode::BootstrapCreation);
+
+    // Only the managed factory may create, and only during an active operation.
+    OrganicRequest wrongSource = create;
+    wrongSource.source = OrganicSourceKind::AiUpdate;
+    LIVING_CHECK(EvaluateOrganicPolicy(wrongSource).decision == OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(wrongSource).reason == OrganicReasonCode::BootstrapWrongSource);
+
+    for (OrganicSourceKind source : { OrganicSourceKind::RandomManager, OrganicSourceKind::PlayerChatCommand,
+        OrganicSourceKind::ConsoleCommand, OrganicSourceKind::AdminSurface, OrganicSourceKind::TestFixture })
+    {
+        OrganicRequest other = create;
+        other.source = source;
+        LIVING_CHECK(EvaluateOrganicPolicy(other).decision == OrganicDecision::Deny);
+    }
+
+    OrganicRequest notBootstrapping = create;
+    notBootstrapping.managedBootstrapActive = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(notBootstrapping).decision == OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(notBootstrapping).reason == OrganicReasonCode::BootstrapNotActive);
+
+    // A request that already carries a root is not a creation.
+    OrganicRequest alreadyCreated = create;
+    alreadyCreated.characterGuid = 1000;
+    alreadyCreated.identityNonce = { 1, 2, 3 };
+    alreadyCreated.provenance = BotProvenance::ORGANIC_CREATED;
+    LIVING_CHECK(EvaluateOrganicPolicy(alreadyCreated).decision == OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(alreadyCreated).reason == OrganicReasonCode::BootstrapIdentityPresent);
+
+    // Post-create, every other action still requires the real root: the
+    // pre-identity exemption is creation-only and does not leak.
+    OrganicRequest postCreate;
+    postCreate.kind = OrganicActionKind::GAMEPLAY_LOOT;
+    postCreate.mode = LivingRealmMode::Organic;
+    postCreate.source = OrganicSourceKind::FactoryBootstrap;
+    postCreate.managedBootstrapActive = true;
+    postCreate.provenance = BotProvenance::ORGANIC_CREATED;
+    LIVING_CHECK(EvaluateOrganicPolicy(postCreate).reason == OrganicReasonCode::InvalidIdentity);
+
+    // Disabled mode remains a passthrough (LR-001).
+    OrganicRequest disabled = create;
+    disabled.mode = LivingRealmMode::Disabled;
+    LIVING_CHECK(EvaluateOrganicPolicy(disabled).reason == OrganicReasonCode::LegacyPassthrough);
 }
 
 LIVING_TEST(policy_stuck_teleport_requires_every_recovery_gate)
@@ -380,6 +429,22 @@ LIVING_TEST(policy_public_transport_requires_every_gate)
     rateLimited.rateLimitOk = false;
     LIVING_CHECK(EvaluateOrganicPolicy(rateLimited).reason == OrganicReasonCode::RateLimitExceeded);
 
+    // 0002C C.3.3: a protected commitment must be explicitly certified compatible.
+    // The gate is positive and default-false, so an uncertified commitment denies
+    // rather than relocating the bot away from a real player's obligation.
+    OrganicRequest committed = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    committed.protectedRealPlayerCommitment = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(committed).decision == OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(committed).reason == OrganicReasonCode::IncompatibleProtectedCommitment);
+
+    committed.protectedCommitmentCompatible = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(committed).decision == OrganicDecision::RequireAudit);
+
+    // Certifying compatibility without a commitment changes nothing.
+    OrganicRequest uncommitted = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    uncommitted.protectedCommitmentCompatible = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(uncommitted).decision == OrganicDecision::RequireAudit);
+
     for (OrganicPolicyResult const& denied : { EvaluateOrganicPolicy(badRoute), EvaluateOrganicPolicy(unboundGoal),
         EvaluateOrganicPolicy(offOrigin), EvaluateOrganicPolicy(early), EvaluateOrganicPolicy(unsafe),
         EvaluateOrganicPolicy(rateLimited) })
@@ -390,22 +455,21 @@ LIVING_TEST(policy_identity_root_must_be_bindable)
 {
     // A decision that cannot be bound to (guid, nonce) cannot be attached to a
     // durable audit row or distinguished from a reused GUID (0003 section 2).
+    // Creation is deliberately excluded: it is the one pre-identity decision and
+    // has its own test. Everything post-create must bind to the real root.
     OrganicActionKind const kinds[] = {
-        OrganicActionKind::GAMEPLAY_LOOT,        // gameplay
-        OrganicActionKind::TRAINER_PURCHASE,     // automation
-        OrganicActionKind::CORE_CHARACTER_CREATE // bootstrap
+        OrganicActionKind::GAMEPLAY_LOOT,    // gameplay
+        OrganicActionKind::TRAINER_PURCHASE  // automation
     };
 
     for (OrganicActionKind kind : kinds)
     {
         OrganicRequest zeroGuid = OrganicRequestFor(kind);
-        zeroGuid.managedBootstrapActive = true;
         zeroGuid.characterGuid = 0;
         LIVING_CHECK(EvaluateOrganicPolicy(zeroGuid).decision == OrganicDecision::Deny);
         LIVING_CHECK(EvaluateOrganicPolicy(zeroGuid).reason == OrganicReasonCode::InvalidIdentity);
 
         OrganicRequest zeroNonce = OrganicRequestFor(kind);
-        zeroNonce.managedBootstrapActive = true;
         zeroNonce.identityNonce = {};
         LIVING_CHECK(EvaluateOrganicPolicy(zeroNonce).decision == OrganicDecision::Deny);
         LIVING_CHECK(EvaluateOrganicPolicy(zeroNonce).reason == OrganicReasonCode::InvalidIdentity);
@@ -451,6 +515,7 @@ LIVING_TEST(policy_only_three_actions_can_ever_require_audit)
         request.ownerOnVerifiedTransport = true;
         request.nearBoardingContext = true;
         request.destinationMapSupported = true;
+        request.protectedCommitmentCompatible = true;
 
         bool const isApproved = kind == OrganicActionKind::STUCK_EMERGENCY_TELEPORT
             || kind == OrganicActionKind::TRANSPORT_GROUP_SYNC
@@ -484,10 +549,25 @@ LIVING_TEST(policy_every_classification_maps_to_its_decision)
                 break;
             case OrganicClassification::BootstrapOnly:
             {
+                // An identity-carrying request is never a creation, and a non-factory
+                // source cannot create even during an active bootstrap.
                 LIVING_CHECK(result.decision == OrganicDecision::Deny);
-                OrganicRequest bootstrap = production;
-                bootstrap.managedBootstrapActive = true;
-                LIVING_CHECK(EvaluateOrganicPolicy(bootstrap).decision == OrganicDecision::AllowGameplay);
+                OrganicRequest identityBearing = production;
+                identityBearing.source = OrganicSourceKind::FactoryBootstrap;
+                identityBearing.managedBootstrapActive = true;
+                LIVING_CHECK(EvaluateOrganicPolicy(identityBearing).decision == OrganicDecision::Deny);
+
+                OrganicRequest aiUpdate = production;
+                aiUpdate.source = OrganicSourceKind::AiUpdate;
+                aiUpdate.managedBootstrapActive = true;
+                LIVING_CHECK(EvaluateOrganicPolicy(aiUpdate).decision == OrganicDecision::Deny);
+
+                OrganicRequest preIdentity = production;
+                preIdentity.source = OrganicSourceKind::FactoryBootstrap;
+                preIdentity.managedBootstrapActive = true;
+                preIdentity.characterGuid = 0;
+                preIdentity.identityNonce = {};
+                LIVING_CHECK(EvaluateOrganicPolicy(preIdentity).decision == OrganicDecision::AllowGameplay);
                 break;
             }
             case OrganicClassification::RequireAudit:
@@ -559,5 +639,8 @@ LIVING_TEST(policy_string_conversions_are_stable)
     LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::UnsafeStateForCompatibilityAction),
         "UNSAFE_STATE_FOR_COMPATIBILITY_ACTION") == 0);
     LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::OriginWaitNotSatisfied), "ORIGIN_WAIT_NOT_SATISFIED") == 0);
+    LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::BootstrapWrongSource), "BOOTSTRAP_WRONG_SOURCE") == 0);
+    LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::IncompatibleProtectedCommitment),
+        "INCOMPATIBLE_PROTECTED_COMMITMENT") == 0);
     LIVING_CHECK(std::strcmp(ToString(OrganicClassification::RequireAudit), "RequireAudit") == 0);
 }

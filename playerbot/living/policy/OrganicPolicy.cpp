@@ -80,6 +80,10 @@ namespace living
                         return Result(OrganicDecision::Deny, OrganicReasonCode::NotAtOriginNode, true);
                     if (!request.originWaitSatisfied)
                         return Result(OrganicDecision::Deny, OrganicReasonCode::OriginWaitNotSatisfied, true);
+                    // C.3.3: never relocate away from an obligation the owning
+                    // service has not certified as compatible with the transfer.
+                    if (request.protectedRealPlayerCommitment && !request.protectedCommitmentCompatible)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::IncompatibleProtectedCommitment, true);
                     return Result(OrganicDecision::RequireAudit, OrganicReasonCode::AuditRequired, true);
 
                 default:
@@ -139,7 +143,27 @@ namespace living
         if (request.mode != LivingRealmMode::Organic)
             return Result(OrganicDecision::Deny, OrganicReasonCode::UnsupportedProfile, true);
 
-        // Every enabled-mode decision must be bindable to an identity root.
+        // Managed character creation is authorized BEFORE an identity exists: the
+        // core generates the low GUID inside Player::Create and the managed root and
+        // nonce are committed afterwards (0003 section 2), so requiring an existing
+        // ORGANIC_CREATED root here would be circular. This is the one pre-identity
+        // decision, and it is bound to the factory running an active managed
+        // bootstrap operation rather than to an identity.
+        if (metadata->classification == OrganicClassification::BootstrapOnly)
+        {
+            if (request.source != OrganicSourceKind::FactoryBootstrap)
+                return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapWrongSource, true);
+            if (!request.managedBootstrapActive)
+                return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapNotActive, true);
+            // A pre-identity request carries no root; a request that already has one
+            // is not a creation and must not be authorized as one.
+            if (HasValidIdentityRoot(request))
+                return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapIdentityPresent, true);
+            return Result(OrganicDecision::AllowGameplay, OrganicReasonCode::BootstrapCreation, true);
+        }
+
+        // Every other enabled-mode decision is post-create and must be bindable to
+        // the real (guid, nonce) identity root.
         if (!HasValidIdentityRoot(request))
             return Result(OrganicDecision::Deny, OrganicReasonCode::InvalidIdentity, true);
 
@@ -181,19 +205,15 @@ namespace living
             case OrganicClassification::AllowAutomation:
                 return Result(OrganicDecision::AllowAutomation, OrganicReasonCode::AllowedAutomation, true);
 
-            case OrganicClassification::BootstrapOnly:
-                if (!request.managedBootstrapActive)
-                    return Result(OrganicDecision::Deny, OrganicReasonCode::BootstrapNotActive, true);
-                return Result(OrganicDecision::AllowGameplay, OrganicReasonCode::BootstrapCreation, true);
-
             case OrganicClassification::Deny:
                 return Result(OrganicDecision::Deny, DenyReasonFor(request.kind), true);
 
             case OrganicClassification::RequireAudit:
                 return EvaluateAuditedAction(request);
 
+            case OrganicClassification::BootstrapOnly:
             case OrganicClassification::FixtureOnly:
-                break; // handled above; unreachable
+                break; // both decided before identity validation above; unreachable
         }
 
         return Result(OrganicDecision::Deny, OrganicReasonCode::DeniedByClassification, true);
@@ -262,6 +282,8 @@ namespace living
             case OrganicReasonCode::InvalidSource: return "INVALID_SOURCE";
             case OrganicReasonCode::InvalidIdentity: return "INVALID_IDENTITY";
             case OrganicReasonCode::BootstrapNotActive: return "BOOTSTRAP_NOT_ACTIVE";
+            case OrganicReasonCode::BootstrapWrongSource: return "BOOTSTRAP_WRONG_SOURCE";
+            case OrganicReasonCode::BootstrapIdentityPresent: return "BOOTSTRAP_IDENTITY_PRESENT";
             case OrganicReasonCode::FixtureOutsideTestProfile: return "FIXTURE_OUTSIDE_TEST_PROFILE";
             case OrganicReasonCode::FixtureProvenanceRequired: return "FIXTURE_PROVENANCE_REQUIRED";
             case OrganicReasonCode::FixtureIsolated: return "FIXTURE_ISOLATED";
@@ -277,6 +299,7 @@ namespace living
             case OrganicReasonCode::RecoveryLadderNotExhausted: return "RECOVERY_LADDER_NOT_EXHAUSTED";
             case OrganicReasonCode::ProtectedCommitmentBlocksRecovery: return "PROTECTED_COMMITMENT_BLOCKS_RECOVERY";
             case OrganicReasonCode::NoSafeDestination: return "NO_SAFE_DESTINATION";
+            case OrganicReasonCode::IncompatibleProtectedCommitment: return "INCOMPATIBLE_PROTECTED_COMMITMENT";
             case OrganicReasonCode::RouteNotAllowlisted: return "ROUTE_NOT_ALLOWLISTED";
             case OrganicReasonCode::GoalRouteNotBound: return "GOAL_ROUTE_NOT_BOUND";
             case OrganicReasonCode::NotAtOriginNode: return "NOT_AT_ORIGIN_NODE";

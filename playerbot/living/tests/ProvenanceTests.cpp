@@ -106,7 +106,6 @@ LIVING_TEST(provenance_fixture_identity_cannot_enter_production_semantics)
         OrganicActionKind::GAMEPLAY_LOOT,
         OrganicActionKind::MAIL_TRANSACTION,
         OrganicActionKind::TRAINER_PURCHASE,
-        OrganicActionKind::CORE_CHARACTER_CREATE,
         OrganicActionKind::TRANSPORT_GROUP_SYNC,
         OrganicActionKind::STUCK_EMERGENCY_TELEPORT,
         OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER
