@@ -30,6 +30,41 @@ namespace
         return request;
     }
 
+    // A request with every 0002C gate for `kind` satisfied: the single eligible
+    // shape from which each negative test removes exactly one gate.
+    OrganicRequest EligibleAuditedRequest(OrganicActionKind kind)
+    {
+        OrganicRequest request = OrganicRequestFor(kind);
+        request.source = OrganicSourceKind::TransportService;
+        request.safeForCompatibilityAction = true;
+        request.rateLimitOk = true;
+
+        switch (kind)
+        {
+            case OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER:
+                request.canonicalRouteAllowlisted = true;
+                request.typedGoalRouteBound = true;
+                request.atExactOriginNode = true;
+                request.originWaitSatisfied = true;
+                break;
+            case OrganicActionKind::TRANSPORT_GROUP_SYNC:
+                request.protectedRealPlayerCommitment = true;
+                request.ownerOnVerifiedTransport = true;
+                request.nearBoardingContext = true;
+                request.destinationMapSupported = true;
+                break;
+            case OrganicActionKind::STUCK_EMERGENCY_TELEPORT:
+                request.source = OrganicSourceKind::RecoveryService;
+                request.recoveryLadderExhausted = true;
+                request.safeDestinationSelected = true;
+                break;
+            default:
+                break;
+        }
+
+        return request;
+    }
+
     bool SameResult(OrganicPolicyResult const& a, OrganicPolicyResult const& b)
     {
         return a.decision == b.decision && a.reason == b.reason && a.knownAction == b.knownAction;
@@ -129,6 +164,8 @@ LIVING_TEST(policy_legal_automation_is_distinguishable_from_gameplay)
         == OrganicDecision::AllowGameplay);
     LIVING_CHECK(EvaluateOrganicPolicy(OrganicRequestFor(OrganicActionKind::GAMEPLAY_DEATH_RECOVERY)).decision
         == OrganicDecision::AllowGameplay);
+    LIVING_CHECK(EvaluateOrganicPolicy(OrganicRequestFor(OrganicActionKind::GAMEPLAY_QUEST_ACCEPT)).decision
+        == OrganicDecision::AllowGameplay);
 }
 
 LIVING_TEST(policy_fabrication_families_are_denied)
@@ -169,7 +206,7 @@ LIVING_TEST(policy_fabrication_families_are_denied)
         OrganicActionKind::UNOBSERVED_MOVE_TELEPORT, OrganicActionKind::FREE_PET_HAPPINESS,
         OrganicActionKind::DIRECT_AURA_REMOVAL, OrganicActionKind::ENCOUNTER_AURA_MUTATION,
         OrganicActionKind::LOGIN_ITEM_FABRICATION, OrganicActionKind::FREE_TALENT_RESPEC,
-        OrganicActionKind::DIRECT_GLYPH_MUTATION,
+        OrganicActionKind::DIRECT_GLYPH_MUTATION, OrganicActionKind::DIRECT_SPIRIT_HEALER_RESURRECTION,
         OrganicActionKind::OFFLINE_PROGRESSION
     };
 
@@ -241,57 +278,156 @@ LIVING_TEST(policy_bootstrap_creation_requires_active_managed_bootstrap)
     LIVING_CHECK(allowed.reason == OrganicReasonCode::BootstrapCreation);
 }
 
-LIVING_TEST(policy_stuck_teleport_requires_exhausted_ladder_and_owner_consent)
+LIVING_TEST(policy_stuck_teleport_requires_every_recovery_gate)
 {
-    OrganicRequest request = OrganicRequestFor(OrganicActionKind::STUCK_EMERGENCY_TELEPORT);
-    request.source = OrganicSourceKind::RecoveryService;
+    // The eligible shape is audited; each gate removed individually denies with its
+    // own reason (0002C C.6/C.7).
+    LIVING_CHECK(EvaluateOrganicPolicy(
+        EligibleAuditedRequest(OrganicActionKind::STUCK_EMERGENCY_TELEPORT)).decision
+        == OrganicDecision::RequireAudit);
 
-    OrganicPolicyResult const ladderNotDone = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(ladderNotDone.decision == OrganicDecision::Deny);
-    LIVING_CHECK(ladderNotDone.reason == OrganicReasonCode::RecoveryLadderNotExhausted);
+    OrganicRequest ladder = EligibleAuditedRequest(OrganicActionKind::STUCK_EMERGENCY_TELEPORT);
+    ladder.recoveryLadderExhausted = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(ladder).reason == OrganicReasonCode::RecoveryLadderNotExhausted);
 
-    request.recoveryLadderExhausted = true;
-    OrganicPolicyResult const audit = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(audit.decision == OrganicDecision::RequireAudit);
-    LIVING_CHECK(audit.reason == OrganicReasonCode::AuditRequired);
+    OrganicRequest unsafe = EligibleAuditedRequest(OrganicActionKind::STUCK_EMERGENCY_TELEPORT);
+    unsafe.safeForCompatibilityAction = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(unsafe).reason == OrganicReasonCode::UnsafeStateForCompatibilityAction);
 
-    request.protectedRealPlayerCommitment = true;
-    OrganicPolicyResult const blockedByCommitment = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(blockedByCommitment.decision == OrganicDecision::Deny);
-    LIVING_CHECK(blockedByCommitment.reason == OrganicReasonCode::ProtectedCommitmentBlocksRecovery);
+    OrganicRequest rateLimited = EligibleAuditedRequest(OrganicActionKind::STUCK_EMERGENCY_TELEPORT);
+    rateLimited.rateLimitOk = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(rateLimited).reason == OrganicReasonCode::RateLimitExceeded);
 
-    request.ownerAuthorizedRecovery = true;
-    LIVING_CHECK(EvaluateOrganicPolicy(request).decision == OrganicDecision::RequireAudit);
+    OrganicRequest noDestination = EligibleAuditedRequest(OrganicActionKind::STUCK_EMERGENCY_TELEPORT);
+    noDestination.safeDestinationSelected = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(noDestination).reason == OrganicReasonCode::NoSafeDestination);
+
+    // A protected commitment blocks recovery unless the owner authorized it.
+    OrganicRequest committed = EligibleAuditedRequest(OrganicActionKind::STUCK_EMERGENCY_TELEPORT);
+    committed.protectedRealPlayerCommitment = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(committed).reason == OrganicReasonCode::ProtectedCommitmentBlocksRecovery);
+    committed.ownerAuthorizedRecovery = true;
+    LIVING_CHECK(EvaluateOrganicPolicy(committed).decision == OrganicDecision::RequireAudit);
+
+    for (OrganicPolicyResult const& denied : { EvaluateOrganicPolicy(ladder), EvaluateOrganicPolicy(unsafe),
+        EvaluateOrganicPolicy(rateLimited), EvaluateOrganicPolicy(noDestination) })
+        LIVING_CHECK(denied.decision == OrganicDecision::Deny);
 }
 
-LIVING_TEST(policy_transport_group_sync_requires_protected_commitment)
+LIVING_TEST(policy_transport_group_sync_requires_every_gate)
 {
-    OrganicRequest request = OrganicRequestFor(OrganicActionKind::TRANSPORT_GROUP_SYNC);
-    request.source = OrganicSourceKind::TransportService;
+    LIVING_CHECK(EvaluateOrganicPolicy(
+        EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC)).decision
+        == OrganicDecision::RequireAudit);
 
-    OrganicPolicyResult const denied = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(denied.decision == OrganicDecision::Deny);
-    LIVING_CHECK(denied.reason == OrganicReasonCode::MissingProtectedCommitment);
+    OrganicRequest noCommitment = EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC);
+    noCommitment.protectedRealPlayerCommitment = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(noCommitment).reason == OrganicReasonCode::MissingProtectedCommitment);
 
-    request.protectedRealPlayerCommitment = true;
-    OrganicPolicyResult const audit = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(audit.decision == OrganicDecision::RequireAudit);
-    LIVING_CHECK(audit.reason == OrganicReasonCode::AuditRequired);
+    OrganicRequest ownerOff = EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC);
+    ownerOff.ownerOnVerifiedTransport = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(ownerOff).reason == OrganicReasonCode::OwnerNotOnVerifiedTransport);
+
+    OrganicRequest farAway = EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC);
+    farAway.nearBoardingContext = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(farAway).reason == OrganicReasonCode::NotNearBoardingContext);
+
+    OrganicRequest badMap = EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC);
+    badMap.destinationMapSupported = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(badMap).reason == OrganicReasonCode::DestinationMapUnsupported);
+
+    OrganicRequest unsafe = EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC);
+    unsafe.safeForCompatibilityAction = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(unsafe).reason == OrganicReasonCode::UnsafeStateForCompatibilityAction);
+
+    OrganicRequest rateLimited = EligibleAuditedRequest(OrganicActionKind::TRANSPORT_GROUP_SYNC);
+    rateLimited.rateLimitOk = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(rateLimited).reason == OrganicReasonCode::RateLimitExceeded);
+
+    for (OrganicPolicyResult const& denied : { EvaluateOrganicPolicy(noCommitment), EvaluateOrganicPolicy(ownerOff),
+        EvaluateOrganicPolicy(farAway), EvaluateOrganicPolicy(badMap), EvaluateOrganicPolicy(unsafe),
+        EvaluateOrganicPolicy(rateLimited) })
+        LIVING_CHECK(denied.decision == OrganicDecision::Deny);
 }
 
-LIVING_TEST(policy_public_transport_requires_allowlisted_route)
+LIVING_TEST(policy_public_transport_requires_every_gate)
 {
-    OrganicRequest request = OrganicRequestFor(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
-    request.source = OrganicSourceKind::TransportService;
+    LIVING_CHECK(EvaluateOrganicPolicy(
+        EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER)).decision
+        == OrganicDecision::RequireAudit);
 
-    OrganicPolicyResult const denied = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(denied.decision == OrganicDecision::Deny);
-    LIVING_CHECK(denied.reason == OrganicReasonCode::RouteNotAllowlisted);
+    OrganicRequest badRoute = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    badRoute.canonicalRouteAllowlisted = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(badRoute).reason == OrganicReasonCode::RouteNotAllowlisted);
 
-    request.canonicalRouteAllowlisted = true;
-    OrganicPolicyResult const audit = EvaluateOrganicPolicy(request);
-    LIVING_CHECK(audit.decision == OrganicDecision::RequireAudit);
-    LIVING_CHECK(audit.reason == OrganicReasonCode::AuditRequired);
+    OrganicRequest unboundGoal = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    unboundGoal.typedGoalRouteBound = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(unboundGoal).reason == OrganicReasonCode::GoalRouteNotBound);
+
+    OrganicRequest offOrigin = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    offOrigin.atExactOriginNode = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(offOrigin).reason == OrganicReasonCode::NotAtOriginNode);
+
+    OrganicRequest early = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    early.originWaitSatisfied = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(early).reason == OrganicReasonCode::OriginWaitNotSatisfied);
+
+    OrganicRequest unsafe = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    unsafe.safeForCompatibilityAction = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(unsafe).reason == OrganicReasonCode::UnsafeStateForCompatibilityAction);
+
+    OrganicRequest rateLimited = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    rateLimited.rateLimitOk = false;
+    LIVING_CHECK(EvaluateOrganicPolicy(rateLimited).reason == OrganicReasonCode::RateLimitExceeded);
+
+    for (OrganicPolicyResult const& denied : { EvaluateOrganicPolicy(badRoute), EvaluateOrganicPolicy(unboundGoal),
+        EvaluateOrganicPolicy(offOrigin), EvaluateOrganicPolicy(early), EvaluateOrganicPolicy(unsafe),
+        EvaluateOrganicPolicy(rateLimited) })
+        LIVING_CHECK(denied.decision == OrganicDecision::Deny);
+}
+
+LIVING_TEST(policy_identity_root_must_be_bindable)
+{
+    // A decision that cannot be bound to (guid, nonce) cannot be attached to a
+    // durable audit row or distinguished from a reused GUID (0003 section 2).
+    OrganicActionKind const kinds[] = {
+        OrganicActionKind::GAMEPLAY_LOOT,        // gameplay
+        OrganicActionKind::TRAINER_PURCHASE,     // automation
+        OrganicActionKind::CORE_CHARACTER_CREATE // bootstrap
+    };
+
+    for (OrganicActionKind kind : kinds)
+    {
+        OrganicRequest zeroGuid = OrganicRequestFor(kind);
+        zeroGuid.managedBootstrapActive = true;
+        zeroGuid.characterGuid = 0;
+        LIVING_CHECK(EvaluateOrganicPolicy(zeroGuid).decision == OrganicDecision::Deny);
+        LIVING_CHECK(EvaluateOrganicPolicy(zeroGuid).reason == OrganicReasonCode::InvalidIdentity);
+
+        OrganicRequest zeroNonce = OrganicRequestFor(kind);
+        zeroNonce.managedBootstrapActive = true;
+        zeroNonce.identityNonce = {};
+        LIVING_CHECK(EvaluateOrganicPolicy(zeroNonce).decision == OrganicDecision::Deny);
+        LIVING_CHECK(EvaluateOrganicPolicy(zeroNonce).reason == OrganicReasonCode::InvalidIdentity);
+    }
+
+    // Audited actions and the fixture profile are bound the same way.
+    OrganicRequest audited = EligibleAuditedRequest(OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER);
+    audited.identityNonce = {};
+    LIVING_CHECK(EvaluateOrganicPolicy(audited).reason == OrganicReasonCode::InvalidIdentity);
+
+    OrganicRequest fixture = OrganicRequestFor(OrganicActionKind::FIXTURE_PROVISION);
+    fixture.provenance = BotProvenance::FIXTURE;
+    fixture.fixtureTestProfile = true;
+    fixture.characterGuid = 0;
+    LIVING_CHECK(EvaluateOrganicPolicy(fixture).reason == OrganicReasonCode::InvalidIdentity);
+
+    // Explicit disabled-mode parity is preserved (LR-001).
+    OrganicRequest disabled = DisabledRequestFor(OrganicActionKind::GAMEPLAY_LOOT);
+    disabled.characterGuid = 0;
+    disabled.identityNonce = {};
+    LIVING_CHECK(EvaluateOrganicPolicy(disabled).decision != OrganicDecision::Deny);
+    LIVING_CHECK(EvaluateOrganicPolicy(disabled).reason == OrganicReasonCode::LegacyPassthrough);
 }
 
 LIVING_TEST(policy_only_three_actions_can_ever_require_audit)
@@ -302,12 +438,19 @@ LIVING_TEST(policy_only_three_actions_can_ever_require_audit)
 
         // Grant every context flag; only the three named 0002C actions may reach
         // RequireAudit even then.
-        OrganicRequest request = OrganicRequestFor(kind);
+        OrganicRequest request = EligibleAuditedRequest(kind);
         request.protectedRealPlayerCommitment = true;
         request.managedBootstrapActive = true;
         request.recoveryLadderExhausted = true;
         request.ownerAuthorizedRecovery = true;
+        request.safeDestinationSelected = true;
         request.canonicalRouteAllowlisted = true;
+        request.typedGoalRouteBound = true;
+        request.atExactOriginNode = true;
+        request.originWaitSatisfied = true;
+        request.ownerOnVerifiedTransport = true;
+        request.nearBoardingContext = true;
+        request.destinationMapSupported = true;
 
         bool const isApproved = kind == OrganicActionKind::STUCK_EMERGENCY_TELEPORT
             || kind == OrganicActionKind::TRANSPORT_GROUP_SYNC
@@ -348,9 +491,14 @@ LIVING_TEST(policy_every_classification_maps_to_its_decision)
                 break;
             }
             case OrganicClassification::RequireAudit:
-                // Without action-specific context the audited kinds deny...
+            {
+                // Without action-specific context the audited kinds deny; with every
+                // 0002C gate satisfied they reach RequireAudit.
                 LIVING_CHECK(result.decision == OrganicDecision::Deny);
+                LIVING_CHECK(EvaluateOrganicPolicy(EligibleAuditedRequest(row.kind)).decision
+                    == OrganicDecision::RequireAudit);
                 break;
+            }
             case OrganicClassification::FixtureOnly:
             {
                 LIVING_CHECK(result.decision == OrganicDecision::Deny);
@@ -407,5 +555,9 @@ LIVING_TEST(policy_string_conversions_are_stable)
     LIVING_CHECK(std::strcmp(ToString(OrganicSourceKind::TestFixture), "TestFixture") == 0);
     LIVING_CHECK(std::strcmp(ToString(LivingRealmMode::Unspecified), "Unspecified") == 0);
     LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::ModeUnspecified), "MODE_UNSPECIFIED") == 0);
+    LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::InvalidIdentity), "INVALID_IDENTITY") == 0);
+    LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::UnsafeStateForCompatibilityAction),
+        "UNSAFE_STATE_FOR_COMPATIBILITY_ACTION") == 0);
+    LIVING_CHECK(std::strcmp(ToString(OrganicReasonCode::OriginWaitNotSatisfied), "ORIGIN_WAIT_NOT_SATISFIED") == 0);
     LIVING_CHECK(std::strcmp(ToString(OrganicClassification::RequireAudit), "RequireAudit") == 0);
 }

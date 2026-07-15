@@ -35,27 +35,51 @@ namespace living
         }
 
         // The three named 0.1 compatibility/recovery actions (0002C). Each returns
-        // RequireAudit only when its required pure-data context is present; every
-        // missing precondition is a Deny, never a silent downgrade to gameplay.
+        // RequireAudit only when EVERY mandatory eligibility gate for that action is
+        // satisfied; any missing gate is a Deny with its own reason code, never a
+        // silent downgrade to gameplay. Admitting an ineligible request into the
+        // durable 0002B protocol is the failure mode these gates exist to prevent.
         OrganicPolicyResult EvaluateAuditedAction(OrganicRequest const& request)
         {
+            // Shared safety envelope: no compatibility action may run in combat,
+            // trade, a taxi/transport transition, a BG/arena, or an instance
+            // transition, and all are rate limited.
+            if (!request.safeForCompatibilityAction)
+                return Result(OrganicDecision::Deny, OrganicReasonCode::UnsafeStateForCompatibilityAction, true);
+            if (!request.rateLimitOk)
+                return Result(OrganicDecision::Deny, OrganicReasonCode::RateLimitExceeded, true);
+
             switch (request.kind)
             {
-                case OrganicActionKind::STUCK_EMERGENCY_TELEPORT:
+                case OrganicActionKind::STUCK_EMERGENCY_TELEPORT: // 0002C C.6/C.7
                     if (!request.recoveryLadderExhausted)
                         return Result(OrganicDecision::Deny, OrganicReasonCode::RecoveryLadderNotExhausted, true);
                     if (request.protectedRealPlayerCommitment && !request.ownerAuthorizedRecovery)
                         return Result(OrganicDecision::Deny, OrganicReasonCode::ProtectedCommitmentBlocksRecovery, true);
+                    if (!request.safeDestinationSelected)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::NoSafeDestination, true);
                     return Result(OrganicDecision::RequireAudit, OrganicReasonCode::AuditRequired, true);
 
-                case OrganicActionKind::TRANSPORT_GROUP_SYNC:
+                case OrganicActionKind::TRANSPORT_GROUP_SYNC: // 0002C C.5
                     if (!request.protectedRealPlayerCommitment)
                         return Result(OrganicDecision::Deny, OrganicReasonCode::MissingProtectedCommitment, true);
+                    if (!request.ownerOnVerifiedTransport)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::OwnerNotOnVerifiedTransport, true);
+                    if (!request.nearBoardingContext)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::NotNearBoardingContext, true);
+                    if (!request.destinationMapSupported)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::DestinationMapUnsupported, true);
                     return Result(OrganicDecision::RequireAudit, OrganicReasonCode::AuditRequired, true);
 
-                case OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER:
+                case OrganicActionKind::PUBLIC_TRANSPORT_TRANSFER: // 0002C C.3
                     if (!request.canonicalRouteAllowlisted)
                         return Result(OrganicDecision::Deny, OrganicReasonCode::RouteNotAllowlisted, true);
+                    if (!request.typedGoalRouteBound)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::GoalRouteNotBound, true);
+                    if (!request.atExactOriginNode)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::NotAtOriginNode, true);
+                    if (!request.originWaitSatisfied)
+                        return Result(OrganicDecision::Deny, OrganicReasonCode::OriginWaitNotSatisfied, true);
                     return Result(OrganicDecision::RequireAudit, OrganicReasonCode::AuditRequired, true);
 
                 default:
@@ -63,6 +87,21 @@ namespace living
                     // metadata completeness test enforces it. Fail closed regardless.
                     return Result(OrganicDecision::Deny, OrganicReasonCode::DeniedByClassification, true);
             }
+        }
+
+        // A decision must be bindable to the (guid, nonce) identity root: a zero low
+        // GUID or an all-zero nonce cannot be attached to a durable audit row or
+        // distinguished from a reused GUID (0003 section 2).
+        bool HasValidIdentityRoot(OrganicRequest const& request)
+        {
+            if (request.characterGuid == 0)
+                return false;
+
+            for (uint8_t byte : request.identityNonce)
+                if (byte != 0)
+                    return true;
+
+            return false;
         }
     }
 
@@ -99,6 +138,10 @@ namespace living
         // an out-of-range mode value is corrupted input; neither may proceed.
         if (request.mode != LivingRealmMode::Organic)
             return Result(OrganicDecision::Deny, OrganicReasonCode::UnsupportedProfile, true);
+
+        // Every enabled-mode decision must be bindable to an identity root.
+        if (!HasValidIdentityRoot(request))
+            return Result(OrganicDecision::Deny, OrganicReasonCode::InvalidIdentity, true);
 
         // Fixture-only actions exist solely for FIXTURE identities inside an explicit
         // test profile; production Organic identities can never be authorized.
@@ -217,6 +260,7 @@ namespace living
             case OrganicReasonCode::ModeUnspecified: return "MODE_UNSPECIFIED";
             case OrganicReasonCode::UnsupportedProfile: return "UNSUPPORTED_PROFILE";
             case OrganicReasonCode::InvalidSource: return "INVALID_SOURCE";
+            case OrganicReasonCode::InvalidIdentity: return "INVALID_IDENTITY";
             case OrganicReasonCode::BootstrapNotActive: return "BOOTSTRAP_NOT_ACTIVE";
             case OrganicReasonCode::FixtureOutsideTestProfile: return "FIXTURE_OUTSIDE_TEST_PROFILE";
             case OrganicReasonCode::FixtureProvenanceRequired: return "FIXTURE_PROVENANCE_REQUIRED";
@@ -227,10 +271,19 @@ namespace living
             case OrganicReasonCode::ManagedOperationRequired: return "MANAGED_OPERATION_REQUIRED";
             case OrganicReasonCode::RawResetUnsupported: return "RAW_RESET_UNSUPPORTED";
             case OrganicReasonCode::NoApprovedReconciler: return "NO_APPROVED_RECONCILER";
+            case OrganicReasonCode::UnsafeStateForCompatibilityAction: return "UNSAFE_STATE_FOR_COMPATIBILITY_ACTION";
+            case OrganicReasonCode::RateLimitExceeded: return "RATE_LIMIT_EXCEEDED";
             case OrganicReasonCode::MissingProtectedCommitment: return "MISSING_PROTECTED_COMMITMENT";
             case OrganicReasonCode::RecoveryLadderNotExhausted: return "RECOVERY_LADDER_NOT_EXHAUSTED";
             case OrganicReasonCode::ProtectedCommitmentBlocksRecovery: return "PROTECTED_COMMITMENT_BLOCKS_RECOVERY";
+            case OrganicReasonCode::NoSafeDestination: return "NO_SAFE_DESTINATION";
             case OrganicReasonCode::RouteNotAllowlisted: return "ROUTE_NOT_ALLOWLISTED";
+            case OrganicReasonCode::GoalRouteNotBound: return "GOAL_ROUTE_NOT_BOUND";
+            case OrganicReasonCode::NotAtOriginNode: return "NOT_AT_ORIGIN_NODE";
+            case OrganicReasonCode::OriginWaitNotSatisfied: return "ORIGIN_WAIT_NOT_SATISFIED";
+            case OrganicReasonCode::OwnerNotOnVerifiedTransport: return "OWNER_NOT_ON_VERIFIED_TRANSPORT";
+            case OrganicReasonCode::NotNearBoardingContext: return "NOT_NEAR_BOARDING_CONTEXT";
+            case OrganicReasonCode::DestinationMapUnsupported: return "DESTINATION_MAP_UNSUPPORTED";
         }
 
         return "INVALID_REASON";

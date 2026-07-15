@@ -62,6 +62,7 @@ namespace living
         ModeUnspecified,
         UnsupportedProfile,
         InvalidSource,
+        InvalidIdentity,
         BootstrapNotActive,
         FixtureOutsideTestProfile,
         FixtureProvenanceRequired,
@@ -72,10 +73,20 @@ namespace living
         ManagedOperationRequired,
         RawResetUnsupported,
         NoApprovedReconciler,
+        // 0002C eligibility gates
+        UnsafeStateForCompatibilityAction,
+        RateLimitExceeded,
         MissingProtectedCommitment,
         RecoveryLadderNotExhausted,
         ProtectedCommitmentBlocksRecovery,
-        RouteNotAllowlisted
+        NoSafeDestination,
+        RouteNotAllowlisted,
+        GoalRouteNotBound,
+        NotAtOriginNode,
+        OriginWaitNotSatisfied,
+        OwnerNotOnVerifiedTransport,
+        NotNearBoardingContext,
+        DestinationMapUnsupported
     };
 
     // Immutable pure-data request context (design 0002 section 2). Every input the
@@ -101,10 +112,34 @@ namespace living
         bool protectedRealPlayerCommitment = false;
         bool managedBootstrapActive = false;
 
-        // action-specific pure-data context for the three audited 0.1 actions (0002C)
-        bool recoveryLadderExhausted = false;   // STUCK_EMERGENCY_TELEPORT: C.6 ladder completed
-        bool ownerAuthorizedRecovery = false;   // STUCK_EMERGENCY_TELEPORT: owner consent under commitment
-        bool canonicalRouteAllowlisted = false; // PUBLIC_TRANSPORT_TRANSFER: registry route on typed goal path
+        // Pure-data eligibility gates for the three audited 0.1 actions (0002C).
+        // Every gate is mandatory for its action: the evaluator must not admit an
+        // ineligible request into the durable 0002B audit protocol, so each flag
+        // defaults false and a missing gate denies with its own reason code. The
+        // caller (the 0.1 transport/recovery service) observes these on the world
+        // thread; the policy stays pure.
+
+        // shared by every compatibility/recovery action: no combat, trade,
+        // taxi/transport transition, BG/arena, or instance transition (C.3.3, C.5,
+        // C.6), and per-bot/per-owner rate limits pass (C.5, C.6)
+        bool safeForCompatibilityAction = false;
+        bool rateLimitOk = false;
+
+        // PUBLIC_TRANSPORT_TRANSFER (C.3)
+        bool canonicalRouteAllowlisted = false; // registry route, allowlisted link
+        bool typedGoalRouteBound = false;       // active goal's typed route contains the link
+        bool atExactOriginNode = false;         // reached the origin node by normal movement
+        bool originWaitSatisfied = false;       // waited the route's deterministic minimum delay
+
+        // TRANSPORT_GROUP_SYNC (C.5)
+        bool ownerOnVerifiedTransport = false;  // live same-group owner aboard a verified transport
+        bool nearBoardingContext = false;       // at the boarding context or just failed group-follow
+        bool destinationMapSupported = false;   // not an instance/BG/arena/unsupported map
+
+        // STUCK_EMERGENCY_TELEPORT (C.6/C.7)
+        bool recoveryLadderExhausted = false;   // the complete normal recovery ladder failed
+        bool ownerAuthorizedRecovery = false;   // owner consent under a protected commitment
+        bool safeDestinationSelected = false;   // a prevalidated safe node was selected
     };
 
     struct OrganicPolicyResult
