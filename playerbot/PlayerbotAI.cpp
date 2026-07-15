@@ -2764,7 +2764,10 @@ std::vector<const Quest*> PlayerbotAI::GetAllCurrentQuests()
             continue;
         }
 
-        result.push_back(sObjectMgr.GetQuestTemplate(questId));
+        // An orphaned slot (quest ID present, template gone) must not publish a null
+        // template into the result: every caller dereferences these.
+        if (Quest const* quest = sObjectMgr.GetQuestTemplate(questId))
+            result.push_back(quest);
     }
 
     return result;
@@ -2785,7 +2788,9 @@ std::vector<const Quest*> PlayerbotAI::GetCurrentIncompleteQuests()
         QuestStatus status = bot->GetQuestStatus(questId);
         if (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_NONE)
         {
-            result.push_back(sObjectMgr.GetQuestTemplate(questId));
+            // Skip orphaned slots rather than publishing a null template.
+            if (Quest const* quest = sObjectMgr.GetQuestTemplate(questId))
+                result.push_back(quest);
         }
     }
 
@@ -2884,6 +2889,11 @@ std::vector<std::pair<const Quest*, uint32>> PlayerbotAI::GetCurrentQuestsRequir
 
         QuestStatus status = bot->GetQuestStatus(questId);
         const Quest* quest = sObjectMgr.GetQuestTemplate(questId);
+        // An orphaned slot (quest ID present, template gone) reaches this loop from
+        // the loot/item-update path and dereferenced a null template.
+        if (!quest)
+            continue;
+
         for (uint8 i = 0; i < std::size(quest->ReqItemId); ++i)
         {
             if (quest->ReqItemId[i] == itemId)
