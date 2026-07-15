@@ -305,7 +305,13 @@ std::set<uint32> ChatHelper::ExtractAllQuestIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 7)));
+        // Inbound chat reaches these extractors (PlayerbotAI chat handling) with
+        // no exception boundary, and the regex accepts an unbounded [0-9]+, so
+        // signed stoi threw std::out_of_range on a payload like "Hquest:9999999999".
+        // Skip anything that is not a full uint32 instead of throwing.
+        uint32 id = 0;
+        if (living::TryParseUInt32(match.str().erase(0, 7), id))
+            ids.insert(id);
     }
 
     return ids;
@@ -321,7 +327,13 @@ std::set<uint32> ChatHelper::ExtractAllItemIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 6)));
+        // Inbound chat reaches these extractors (PlayerbotAI chat handling) with
+        // no exception boundary, and the regex accepts an unbounded [0-9]+, so
+        // signed stoi threw std::out_of_range on a payload like "Hitem:9999999999".
+        // Skip anything that is not a full uint32 instead of throwing.
+        uint32 id = 0;
+        if (living::TryParseUInt32(match.str().erase(0, 6), id))
+            ids.insert(id);
     }
 
     return ids;
@@ -337,7 +349,13 @@ std::set<uint32> ChatHelper::ExtractAllSkillIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 7)));
+        // Inbound chat reaches these extractors (PlayerbotAI chat handling) with
+        // no exception boundary, and the regex accepts an unbounded [0-9]+, so
+        // signed stoi threw std::out_of_range on a payload like "Hskill:9999999999".
+        // Skip anything that is not a full uint32 instead of throwing.
+        uint32 id = 0;
+        if (living::TryParseUInt32(match.str().erase(0, 7), id))
+            ids.insert(id);
     }
 
     return ids;
@@ -353,7 +371,13 @@ std::set<uint32> ChatHelper::ExtractAllFactionIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 9)));
+        // Inbound chat reaches these extractors (PlayerbotAI chat handling) with
+        // no exception boundary, and the regex accepts an unbounded [0-9]+, so
+        // signed stoi threw std::out_of_range on a payload like "Hfaction:9999999999".
+        // Skip anything that is not a full uint32 instead of throwing.
+        uint32 id = 0;
+        if (living::TryParseUInt32(match.str().erase(0, 9), id))
+            ids.insert(id);
     }
 
     return ids;
