@@ -70,6 +70,19 @@ namespace living
     {
         EffectiveConfigReport report;
 
+        // A malformed Living Realm boolean is never resolved by guessing: it blocks
+        // regardless of strict mode, because the guess itself would pick a
+        // permissive effective state.
+        if (config.enabledRaw == LivingRealmBool::Malformed)
+            AddEntry(report, LIVING_REALM_ENABLED_KEY, "malformed", "0 or 1",
+                "startup validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
+
+        if (config.strictRaw == LivingRealmBool::Malformed)
+            AddEntry(report, LIVING_REALM_STRICT_KEY, "malformed", "0 or 1",
+                "startup validation", ConfigClassification::MissingPrerequisite,
+                ConfigSeverity::Blocking, ConfigReasonCode::MalformedBoolean, true);
+
         // Disabled Living Realm validates nothing: no schema, no legacy conflict, no
         // blocking entry. This is the LR-001 parity guarantee.
         if (!config.enabled)
@@ -265,6 +278,7 @@ namespace living
             case ConfigReasonCode::LivingRealmDisabled: return "LIVING_REALM_DISABLED";
             case ConfigReasonCode::OrganicProfileActive: return "ORGANIC_PROFILE_ACTIVE";
             case ConfigReasonCode::UnknownProfile: return "UNKNOWN_PROFILE";
+            case ConfigReasonCode::MalformedBoolean: return "MALFORMED_BOOLEAN";
             case ConfigReasonCode::RandomizationConflict: return "RANDOMIZATION_CONFLICT";
             case ConfigReasonCode::CheatMaskConflict: return "CHEAT_MASK_CONFLICT";
             case ConfigReasonCode::XpRateConflict: return "XP_RATE_CONFLICT";

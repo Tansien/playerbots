@@ -21,6 +21,19 @@ namespace living
         bool operator==(LivingIdentity const&) const = default;
     };
 
+    // Ephemeral login-queue attempt state (0003 section 1): an attempt, never
+    // durable truth, but 0005A A.1 requires it to be revalidated before a proposal
+    // queues login/logout.
+    enum class LivingQueueState : uint8_t
+    {
+        Offline,
+        OnLoginQueue,
+        Online,
+        OnLogoutQueue
+    };
+
+    char const* ToString(LivingQueueState value);
+
     enum class LivingMapKind : uint8_t
     {
         OpenWorld,
@@ -46,7 +59,8 @@ namespace living
         bool inGroup = false;
         uint8_t memberCount = 0;
         bool protectedRealPlayerCommitment = false;
-        uint32_t commitmentOwnerGuid = 0; // real player's low guid; 0 when unprotected
+        uint32_t commitmentOwnerGuid = 0;      // real player's low guid; 0 when unprotected
+        uint64_t commitmentGeneration = 0;     // bumped by every commitment transition
 
         bool operator==(LivingGroupSummary const&) const = default;
     };
@@ -60,6 +74,7 @@ namespace living
         uint64_t snapshotGeneration = 0;
         bool desiredOnline = false;
         bool actualObservedOnline = false;
+        LivingQueueState queueState = LivingQueueState::Offline;
         LivingGroupSummary group;
         LivingLocationSummary location;
         uint64_t proposalExpiresAtMs = 0; // UTC epoch ms; proposals from this snapshot expire here

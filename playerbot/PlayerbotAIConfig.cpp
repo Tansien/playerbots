@@ -795,10 +795,21 @@ bool PlayerbotAIConfig::Initialize()
     targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f),
 
     // Keys/defaults come from the shared constants so the template-parity host test
-    // also guards this parser against drift.
-    livingRealmEnabled = config.GetBoolDefault(living::LIVING_REALM_ENABLED_KEY, living::LIVING_REALM_ENABLED_DEFAULT);
-    livingRealmProfile = config.GetStringDefault(living::LIVING_REALM_PROFILE_KEY, living::LIVING_REALM_PROFILE_DEFAULT);
-    livingRealmStrict = config.GetBoolDefault(living::LIVING_REALM_STRICT_KEY, living::LIVING_REALM_STRICT_DEFAULT);
+    // also guards this parser against drift. The booleans are read as raw strings
+    // and parsed by Living Realm: the core's GetBoolDefault maps every unrecognized
+    // value to false, which would silently pick a permissive effective state
+    // (Living Realm quietly off, or Strict quietly downgraded to warnings).
+    {
+        living::LivingRealmConfig const livingConfig = living::LivingRealmConfig::FromRawValues(
+            config.GetStringDefault(living::LIVING_REALM_ENABLED_KEY, living::LIVING_REALM_ENABLED_DEFAULT ? "1" : "0"),
+            config.GetStringDefault(living::LIVING_REALM_PROFILE_KEY, living::LIVING_REALM_PROFILE_DEFAULT),
+            config.GetStringDefault(living::LIVING_REALM_STRICT_KEY, living::LIVING_REALM_STRICT_DEFAULT ? "1" : "0"));
+
+        livingRealmEnabled = livingConfig.enabled;
+        livingRealmProfile = livingConfig.profileName;
+        livingRealmStrict = livingConfig.strict;
+        livingRealmConfigModel = livingConfig;
+    }
 
     if (livingRealmEnabled)
     {
@@ -837,9 +848,8 @@ bool PlayerbotAIConfig::Initialize()
         legacyInputs.populationInspection = living::PopulationInspection::NotInspected;
         legacyInputs.livingSchemaPresent = false;     // Phase 0 defines no Living Realm schema
 
-        living::EffectiveConfigReport const report = living::BuildEffectiveConfigReport(
-            living::LivingRealmConfig::FromValues(livingRealmEnabled, livingRealmProfile, livingRealmStrict),
-            legacyInputs);
+        living::EffectiveConfigReport const report =
+            living::BuildEffectiveConfigReport(livingRealmConfigModel, legacyInputs);
 
         sLog.outString("Living Realm effective configuration (Phase 0, report only):");
         for (auto const& entry : report.entries)

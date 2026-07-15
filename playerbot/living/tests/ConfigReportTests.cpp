@@ -93,6 +93,39 @@ LIVING_TEST(config_parses_profiles_case_insensitively)
     LIVING_CHECK(defaults.strict);
 }
 
+LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
+{
+    // Every accepted spelling, ASCII case-insensitive, whitespace tolerated.
+    for (char const* text : { "1", "true", "TRUE", "Yes", "on", " 1 " })
+        LIVING_CHECK(ParseLivingRealmBool(text) == LivingRealmBool::True);
+    for (char const* text : { "0", "false", "FALSE", "No", "off", " 0 " })
+        LIVING_CHECK(ParseLivingRealmBool(text) == LivingRealmBool::False);
+    // The core's GetBoolDefault would silently map all of these to false.
+    for (char const* text : { "", "2", "tru", "yess", "-1", "enabled", "y" })
+        LIVING_CHECK(ParseLivingRealmBool(text) == LivingRealmBool::Malformed);
+
+    // A malformed Enabled blocks and does not silently switch the realm off.
+    LivingRealmConfig const badEnabled = LivingRealmConfig::FromRawValues("tru", "organic", "1");
+    LIVING_CHECK(badEnabled.enabledRaw == LivingRealmBool::Malformed);
+    LIVING_CHECK(badEnabled.enabled); // fail-closed interpretation while the report blocks
+    EffectiveConfigReport const enabledReport = BuildEffectiveConfigReport(badEnabled, CleanLegacyInputs());
+    LIVING_CHECK(CountReason(enabledReport, ConfigReasonCode::MalformedBoolean) == 1);
+    LIVING_CHECK(enabledReport.HasBlockingEntry());
+
+    // A malformed Strict blocks and does not downgrade conflicts to warnings.
+    LivingRealmConfig const badStrict = LivingRealmConfig::FromRawValues("1", "organic", "2");
+    LIVING_CHECK(badStrict.strictRaw == LivingRealmBool::Malformed);
+    LIVING_CHECK(badStrict.strict);
+    EffectiveConfigReport const strictReport = BuildEffectiveConfigReport(badStrict, CleanLegacyInputs());
+    LIVING_CHECK(CountReason(strictReport, ConfigReasonCode::MalformedBoolean) == 1);
+    LIVING_CHECK(strictReport.HasBlockingEntry());
+
+    // Well-formed raw values behave exactly like the typed constructor.
+    LivingRealmConfig const off = LivingRealmConfig::FromRawValues("0", "organic", "1");
+    LIVING_CHECK(!off.enabled);
+    LIVING_CHECK(!BuildEffectiveConfigReport(off, ConflictingLegacyInputs()).HasBlockingEntry());
+}
+
 LIVING_TEST(config_disabled_realm_validates_nothing_and_needs_no_schema)
 {
     // LR-001: disabled mode produces one informational entry even when every legacy

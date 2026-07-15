@@ -30,6 +30,7 @@ namespace living
         LivingRealmDisabled,
         OrganicProfileActive,
         UnknownProfile,
+        MalformedBoolean,
         RandomizationConflict,
         CheatMaskConflict,
         XpRateConflict,
