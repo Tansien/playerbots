@@ -23,6 +23,23 @@ namespace living
         Unknown
     };
 
+    // Tri-state boolean parse result. The cores' GetBoolDefault maps every value
+    // other than true/1/yes to false, so a typo silently selects a permissive
+    // effective state (Living Realm quietly off, or Strict quietly downgraded to
+    // warnings). Living Realm parses its own keys and reports malformed values.
+    enum class LivingRealmBool : uint8_t
+    {
+        Malformed = 0,
+        False,
+        True
+    };
+
+    // Accepts exactly: 1/0, true/false, yes/no, on/off (ASCII case-insensitive,
+    // surrounding whitespace ignored). Anything else - including an empty value -
+    // is Malformed.
+    LivingRealmBool ParseLivingRealmBool(std::string const& value);
+    char const* ToString(LivingRealmBool value);
+
     // Exact ASCII case-insensitive match of "organic"; anything else is Unknown and
     // becomes a blocking validation failure when Living Realm is enabled.
     LivingRealmProfile ParseLivingRealmProfile(std::string const& name);
@@ -37,6 +54,13 @@ namespace living
         LivingRealmProfile profile = LivingRealmProfile::Organic;
         bool strict = LIVING_REALM_STRICT_DEFAULT;
 
+        // Malformed booleans are recorded, not guessed: the report turns them into
+        // blocking entries rather than silently choosing a permissive state.
+        LivingRealmBool enabledRaw = LivingRealmBool::False;
+        LivingRealmBool strictRaw = LivingRealmBool::True;
+
         static LivingRealmConfig FromValues(bool enabled, std::string profileName, bool strict);
+        static LivingRealmConfig FromRawValues(std::string const& enabled, std::string profileName,
+            std::string const& strict);
     };
 }

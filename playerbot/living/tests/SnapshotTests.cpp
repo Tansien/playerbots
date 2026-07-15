@@ -29,6 +29,8 @@ namespace
         snapshot.group.memberCount = 4;
         snapshot.group.protectedRealPlayerCommitment = true;
         snapshot.group.commitmentOwnerGuid = 42;
+    snapshot.group.commitmentGeneration = 6;
+    snapshot.queueState = LivingQueueState::Offline;
         snapshot.location.mapId = 0;
         snapshot.location.zoneId = 12;
         snapshot.location.instanceId = 0;
@@ -121,6 +123,16 @@ LIVING_TEST(snapshot_staleness_is_detected_per_dimension)
 
     changed = BaseSnapshot();
     changed.location.zoneId = 999;
+    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+
+    // Login-queue attempt state and commitment generation are revalidated too
+    // (0005A A.1): a proposal must not act on a stale queue or commitment view.
+    changed = BaseSnapshot();
+    changed.queueState = LivingQueueState::OnLoginQueue;
+    LIVING_CHECK(IsSnapshotStale(basis, changed, now));
+
+    changed = BaseSnapshot();
+    changed.group.commitmentGeneration += 1;
     LIVING_CHECK(IsSnapshotStale(basis, changed, now));
 
     // A freshly captured snapshot carries its own new proposal expiry; that is

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Config/Config.h"
+#include "playerbot/living/config/LivingRealmConfig.h"
 #include "Talentspec.h"
 #include "Globals/SharedDefines.h"
 #include "SystemConfig.h"
@@ -353,6 +354,7 @@ public:
     bool livingRealmEnabled;
     std::string livingRealmProfile;
     bool livingRealmStrict;
+    living::LivingRealmConfig livingRealmConfigModel; // raw tri-state parse result
     uint32 freeRoomForNonSpareBots;
     uint32 loginBotsNearPlayerRange;
     std::vector<std::string> defaultLoginCriteria;
