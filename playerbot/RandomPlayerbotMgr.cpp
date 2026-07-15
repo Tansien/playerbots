@@ -2387,30 +2387,32 @@ void RandomPlayerbotMgr::Revive(Player* player)
     }
 }
 
-void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, bool hearth, bool activeOnly)
+// Returns true only when the bot was actually relocated, so callers do not
+// Refresh() (free revive/repair/resource refill/money) after a failed relocation.
+bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, bool hearth, bool activeOnly)
 {
     if (bot->IsBeingTeleported())
-        return;
+        return false;
 
     if (bot->InBattleGround())
-        return;
+        return false;
 
     if (bot->InBattleGroundQueue())
-        return;
+        return false;
 
 	if (bot->GetLevel() < 5)
-		return;
+        return false;
 
     if (bot->GetGroup() && !bot->GetGroup()->IsLeader(bot->GetObjectGuid()))
-        return;
+        return false;
 
     if (bot->IsTaxiFlying() && bot->GetPlayerbotAI()->HasPlayerNearby())
-        return;
+        return false;
 
     if (locs.empty())
     {
         sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
-        return;
+        return false;
     }
 
     std::vector<WorldPosition> tlocs;
@@ -2575,15 +2577,19 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
     {
         if (activeOnly)
         {
+            // Both helpers perform their own relocation + Refresh; report false so
+            // the caller does not Refresh a second time.
             if (hearth)
-                return RandomTeleportForRpg(bot, false);
+                RandomTeleportForRpg(bot, false);
             else
-                return RandomTeleportForLevel(bot, false);
+                RandomTeleportForLevel(bot, false);
+
+            return false;
         }
 
         sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
 
-        return;
+        return false;
     }
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleportByLocations");
@@ -2654,27 +2660,36 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                 for (GroupReference* gref = bot->GetGroup()->GetFirstMember(); gref; gref = gref->next())
                 {
                     Player* member = gref->getSource();
-                    PlayerbotAI* ai = bot->GetPlayerbotAI();
-                    if (ai && bot != member)
-                    {
-                        if (member->IsTaxiFlying())
-                            member->GetMotionMaster()->MovementExpired();
-                        if (hearth)
-                            member->SetHomebindToLocation(loc, area->ID);
+                    if (!member || member == bot)
+                        continue;
 
-                        member->GetMotionMaster()->Clear();
-                        member->TeleportTo(loc.mapid, x, y, z, 0);
-                        member->SendHeartBeat();
-                        member->GetPlayerbotAI()->Reset(true);
-                    }
+                    // Preflight the member BEFORE any mutation: this used to read
+                    // bot->GetPlayerbotAI() (the teleporting bot's own AI), which is
+                    // non-null for every member, so a real player in the group had
+                    // their homebind rewritten and was teleported, and then
+                    // member->GetPlayerbotAI()->Reset() dereferenced null and crashed
+                    // after the damage was already done.
+                    PlayerbotAI* memberAi = member->GetPlayerbotAI();
+                    if (!memberAi)
+                        continue;
 
+                    if (member->IsTaxiFlying())
+                        member->GetMotionMaster()->MovementExpired();
+                    if (hearth)
+                        member->SetHomebindToLocation(loc, area->ID);
+
+                    member->GetMotionMaster()->Clear();
+                    member->TeleportTo(loc.mapid, x, y, z, 0);
+                    member->SendHeartBeat();
+                    memberAi->Reset(true);
                 }
             }
-            return;
+            return true;
         }
     }
 
     sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
+    return false;
 }
 
 std::vector<std::pair<uint32, uint32>> RandomPlayerbotMgr::RpgLocationsNear(WorldLocation pos, const std::map<uint32, std::map<uint32, std::vector<std::string>>>& areaNames, uint32 radius)
@@ -2955,7 +2970,9 @@ void RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
         return;
 
     sLog.outDetail("Preparing location to random teleporting bot %s for level %u", bot->GetName(), bot->GetLevel());
-    RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], false, activeOnly);
+    if (!RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], false, activeOnly))
+        return; // no relocation happened: do not Refresh (free revive/repair/money)
+
     Refresh(bot);
 
     WorldPosition botPos(bot);
@@ -3000,8 +3017,12 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
         for (std::list<Unit *>::iterator i = targets.begin(); i != targets.end(); ++i)
         {
             Unit* unit = *i;
-            bot->SetPosition(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), 0);
-            FleeManager manager(bot, sPlayerbotAIConfig.sightDistance, 0, true);
+            // Calculate from the unit's position WITHOUT moving the live player:
+            // this used to SetPosition() the bot onto each candidate in turn, so a
+            // failed or empty calculation left it silently relocated to the last
+            // unit, and the following Refresh() could resurrect it there.
+            // FleeManager takes the start position explicitly for exactly this.
+            FleeManager manager(bot, sPlayerbotAIConfig.sightDistance, 0, true, WorldPosition(unit));
             float rx, ry, rz;
             if (manager.CalculateDestination(&rx, &ry, &rz))
             {
@@ -3009,15 +3030,23 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
                 locs.push_back(loc);
             }
         }
-    }
-    else
-    {
-        RandomTeleportForLevel(bot, true);
+
+        pmo.reset();
+
+        // Actually consume the candidates: they were computed and then dropped, so
+        // this path never relocated the bot at all.
+        if (!locs.empty() && RandomTeleport(bot, locs, false, true))
+            Refresh(bot);
+
+        return;
     }
 
     pmo.reset();
 
-    Refresh(bot);
+    // RandomTeleportForLevel already calls Refresh() after relocating; calling it
+    // again here refreshed a second time (and refreshed even when relocation
+    // failed).
+    RandomTeleportForLevel(bot, true);
 }
 
 void RandomPlayerbotMgr::InstaRandomize(Player* bot)
@@ -4029,7 +4058,9 @@ void RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly)
     uint32 race = bot->getRace();
     uint32 level = bot->GetLevel();
     sLog.outDetail("Random teleporting bot %s for RPG (%zu locations available)", bot->GetName(), rpgLocsCacheLevel[race][level].size());
-    RandomTeleport(bot, rpgLocsCacheLevel[race][level], true, activeOnly);
+    if (!RandomTeleport(bot, rpgLocsCacheLevel[race][level], true, activeOnly))
+        return; // no relocation happened: do not Refresh (free revive/repair/money)
+
     Refresh(bot);
 
     //Travel cooldown for 10 minutes.
