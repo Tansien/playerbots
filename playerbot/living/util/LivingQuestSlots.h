@@ -18,8 +18,14 @@ namespace living
     }
 
     // An orphaned slot is occupied but has no quest template. It cannot be evaluated
-    // for pruning (no level, no progress, no class requirement), so it is repaired
-    // by clearing the slot rather than being skipped.
+    // for pruning (no level, no progress, no class requirement) and it MUST NOT be
+    // partially repaired: clearing only the slot leaves the in-memory/persisted quest
+    // status, source items, and timers behind, so a restored template would leave the
+    // character holding an invisible status it can never re-accept. Until a
+    // cross-expansion, core-backed atomic repair exists (slot + status map/DB +
+    // source items + timers), an orphan is quarantined: counted as occupied, logged,
+    // and left untouched while automated cleanup fails rather than dropping valid
+    // quests.
     inline bool IsOrphanedQuestSlot(uint32_t questId, bool hasTemplate)
     {
         return IsQuestSlotOccupied(questId) && !hasTemplate;

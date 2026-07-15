@@ -128,18 +128,14 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
         Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
         if (living::IsOrphanedQuestSlot(questId, quest != nullptr))
         {
-            // Repair the orphan through the same slot boundary DropQuestAction uses.
-            // An orphan cannot be evaluated for pruning (no level/progress/class), so
-            // skipping it meant cleanup discarded valid quests while keeping the bad
-            // entry, and a log full of orphans could never be freed at all. Clearing
-            // the slot frees real capacity and destroys no valid quest.
-            sLog.outError("Bot %s: clearing orphaned quest-log slot %u (quest %u has no template)",
+            // Quarantine, do not repair. Clearing just the slot left the quest status
+            // map/DB, source items, and timers behind, so a restored template would
+            // leave an invisible status the character could never re-accept. The
+            // orphan stays counted as occupied (capacity stays honest) and untouched;
+            // automated cleanup fails below rather than discarding valid quests.
+            sLog.outError("Bot %s: quarantined orphaned quest-log slot %u (quest %u has no template); "
+                "automated cleanup cannot free this slot until a core-backed atomic repair exists",
                 bot->GetName(), uint32(slot), questId);
-            bot->SetQuestSlot(slot, 0);
-
-            if (numQuest > 0)
-                numQuest--;
-
             continue;
         }
 
