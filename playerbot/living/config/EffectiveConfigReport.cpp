@@ -178,6 +178,12 @@ namespace living
 
         // Shared-world respawn acceleration: both modifiers ship nonzero, so this is
         // enabled out of the box and mutates spawn state that real players share.
+        // With BOTH modifiers zero AccelerateRespawn cannot mutate anything, so the
+        // scope flags alone are inert and must not block an effectively disabled
+        // configuration.
+        bool const respawnAccelerationActive =
+            legacy.respawnModHostile != 0.0f || legacy.respawnModNeutral != 0.0f;
+
         if (legacy.respawnModHostile != 0.0f)
             AddConflict(report, config.strict, "AiPlayerbot.RespawnModHostile",
                 FormatFloatStable(legacy.respawnModHostile), "0", "AccelerateRespawn shared boundary",
@@ -188,11 +194,11 @@ namespace living
                 FormatFloatStable(legacy.respawnModNeutral), "0", "AccelerateRespawn shared boundary",
                 ConfigReasonCode::RespawnAccelerationConflict);
 
-        if (legacy.respawnModForPlayerBots)
+        if (respawnAccelerationActive && legacy.respawnModForPlayerBots)
             AddConflict(report, config.strict, "AiPlayerbot.RespawnModForPlayerBots", "1", "0",
                 "AccelerateRespawn shared boundary", ConfigReasonCode::RespawnAccelerationConflict);
 
-        if (legacy.respawnModForInstances)
+        if (respawnAccelerationActive && legacy.respawnModForInstances)
             AddConflict(report, config.strict, "AiPlayerbot.RespawnModForInstances", "1", "0",
                 "AccelerateRespawn shared boundary", ConfigReasonCode::RespawnAccelerationConflict);
 

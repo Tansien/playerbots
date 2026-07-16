@@ -110,8 +110,15 @@ LIVING_TEST(inventory_fixture_only_rows_are_never_production_eligible)
     }
 
     // CHEAT_RUNTIME_OVERRIDE, BROAD_MAINTENANCE_COMMAND, DEBUG_MUTATION_COMMAND,
-    // COMMAND_CHARACTER_PROVISION, FIXTURE_CHARACTER_CREATE, FIXTURE_PROVISION
-    LIVING_CHECK(fixtureRows == 6);
+    // FIXTURE_CHARACTER_CREATE, FIXTURE_PROVISION. COMMAND_CHARACTER_PROVISION is
+    // NOT here: the compound create-plus-grants command is denied even for
+    // fixtures because it cannot satisfy the create -> commit root -> provision
+    // identity boundary.
+    LIVING_CHECK(fixtureRows == 5);
+    OrganicActionMetadata const* compound = FindOrganicActionByName("COMMAND_CHARACTER_PROVISION");
+    LIVING_CHECK(compound != nullptr);
+    LIVING_CHECK(compound->classification == OrganicClassification::Deny);
+    LIVING_CHECK(!compound->fixtureOnly);
 }
 
 LIVING_TEST(inventory_covers_required_shortcut_families)
