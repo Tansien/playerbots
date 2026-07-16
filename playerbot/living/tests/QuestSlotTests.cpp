@@ -124,6 +124,51 @@ LIVING_TEST(quest_slots_cleanup_preflight_quarantines_before_any_pruning)
     LIVING_CHECK(QuestLogPreflight{}.CleanupPermitted());
 }
 
+LIVING_TEST(quest_slots_orphan_fingerprint_dedupes_recurring_logs)
+{
+    // Cleanup runs from a recurring trigger; the caller logs the quarantine only
+    // when this fingerprint changes, so an unchanged orphan set is logged once.
+    QuestLogPreflight healthy;
+    healthy.Observe(100, true);
+    LIVING_CHECK(healthy.OrphanFingerprint() == 0); // no orphans -> sentinel 0
+
+    QuestLogPreflight first;
+    first.Observe(100, true);
+    first.Observe(4242, false);
+    first.Observe(9999, false);
+    LIVING_CHECK(first.OrphanFingerprint() != 0);
+
+    // The same orphan set observed on a later attempt fingerprints identically.
+    QuestLogPreflight repeat;
+    repeat.Observe(100, true);
+    repeat.Observe(4242, false);
+    repeat.Observe(9999, false);
+    LIVING_CHECK(repeat.OrphanFingerprint() == first.OrphanFingerprint());
+
+    // Valid quests do not contribute: only the orphan set identifies the log.
+    QuestLogPreflight differentValid;
+    differentValid.Observe(555, true);
+    differentValid.Observe(4242, false);
+    differentValid.Observe(9999, false);
+    LIVING_CHECK(differentValid.OrphanFingerprint() == first.OrphanFingerprint());
+
+    // A changed orphan set (grown, shrunk, or different IDs) logs again.
+    QuestLogPreflight grown;
+    grown.Observe(4242, false);
+    grown.Observe(9999, false);
+    grown.Observe(1234, false);
+    LIVING_CHECK(grown.OrphanFingerprint() != first.OrphanFingerprint());
+
+    QuestLogPreflight shrunk;
+    shrunk.Observe(4242, false);
+    LIVING_CHECK(shrunk.OrphanFingerprint() != first.OrphanFingerprint());
+
+    QuestLogPreflight otherIds;
+    otherIds.Observe(4243, false);
+    otherIds.Observe(9999, false);
+    LIVING_CHECK(otherIds.OrphanFingerprint() != first.OrphanFingerprint());
+}
+
 LIVING_TEST(quest_slots_orphan_rule_never_targets_valid_quests)
 {
     // Only template-less occupied slots are orphans. A valid quest is never

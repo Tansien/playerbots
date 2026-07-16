@@ -1108,26 +1108,38 @@ public:
 
     virtual std::string Filter(std::string message) override
     {
-        if (message.find("@random=") == 0)
+        // Inbound chat has no exception boundary before authorization: the old
+        // stoul on the raw selector threw on "@random=+ hello" or an oversized
+        // integer. Parse ONLY the selector token, require full consumption and
+        // 0..100, and reject a malformed selector without dispatching the trailing
+        // command; the remaining command is preserved by the base Filter strip.
+        for (auto const& prefix : { std::string("@random="), std::string("@fixedrandom=") })
         {
-            std::string num = message.substr(message.find("=") + 1, message.find(" ") - message.find("=")-1);            
-            if (urand(0, 100) < stoul(num))
-                return ChatFilter::Filter(message);
+            if (message.find(prefix) != 0)
+                continue;
 
-            return message;
+            size_t const spacePos = message.find(' ');
+            size_t const valueLen = (spacePos == std::string::npos ? message.size() : spacePos) - prefix.size();
+            std::string const value = message.substr(prefix.size(), valueLen);
+
+            uint32 chance = 0;
+            if (!living::TryParseUInt32InRange(value, 0, 100, chance))
+                return "";
+
+            bool const selected = prefix == "@random="
+                ? urand(0, 100) < chance
+                : ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER) < chance;
+            if (!selected)
+                return message;
+
+            // Selector matched: strip it, keeping the remaining command. With no
+            // command after the selector there is nothing to dispatch.
+            return spacePos == std::string::npos ? "" : ChatFilter::Filter(message);
         }
         if (message.find("@random") == 0)
         {
             if (urand(0, 100) < 50)
                 return ChatFilter::Filter(message);
-        }
-        if (message.find("@fixedrandom=") == 0)
-        {
-            std::string num = message.substr(message.find("=") + 1, message.find(" ") - message.find("=") - 1);
-            if (ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER) < stoul(num))
-                return ChatFilter::Filter(message);
-
-            return message;
         }
         if (message.find("@fixedrandom") == 0)
         {
@@ -1187,41 +1199,66 @@ public:
 
             std::set<uint32> questIds = ChatHelper::ExtractAllQuestIds(questString);
 
-            // Inbound chat has no exception boundary: the old isValidNumberString +
-            // stoi pair accepted a lone "+" and threw on overflow ("@quest=9999999999"),
-            // and a valid-uint32 ID with no template reached formatQuest(nullptr).
-            uint32 bareQuestId = 0;
-            if (questIds.empty() && living::TryParseUInt32(questString, bareQuestId))
-                questIds.insert(bareQuestId);
-            else
+            // The bare numeric form carries the ID in the FIRST token only, with
+            // the command after it ("@quest=523 status"). Inbound chat has no
+            // exception boundary: the old isValidNumberString + stoi pair accepted
+            // a lone "+" and threw on overflow ("@quest=9999999999").
+            bool bareForm = false;
+            std::string bareRemainder;
+            if (questIds.empty())
             {
-                for (auto& questId : questIds)
-                {
-                    Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
-                    if (!questTemplate)
-                        continue;
+                size_t const spacePos = questString.find(' ');
+                std::string const token = spacePos == std::string::npos ? questString : questString.substr(0, spacePos);
 
-                    replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
-                    replaceCaseInsensitive(message, ChatHelper::formatQuest(questTemplate), "");
-                }
+                uint32 bareQuestId = 0;
+                if (!living::TryParseUInt32(token, bareQuestId))
+                    return ""; // malformed selector: never dispatch the trailing command
+
+                questIds.insert(bareQuestId);
+                bareForm = true;
+                if (spacePos != std::string::npos)
+                    bareRemainder = questString.substr(spacePos + 1);
             }
 
+            // Match only quests that still have a live template: a quarantined
+            // orphan slot occupies the log for capacity but is not a live quest and
+            // must not select this bot.
             Player* bot = ai->GetBot();
             auto botQuestIds = bot->GetPlayerbotAI()->GetAllCurrentQuestIds();
 
-            std::set<uint32> matchingQuestIds;
-            for (auto botQuestId : botQuestIds)
+            bool matched = false;
+            for (auto questId : questIds)
             {
-                if (questIds.count(botQuestId) != 0)
+                if (botQuestIds.count(questId) != 0 && sObjectMgr.GetQuestTemplate(questId))
                 {
-                    matchingQuestIds.insert(botQuestId);
+                    matched = true;
+                    break;
                 }
             }
 
-            if (!matchingQuestIds.empty())
-                return ChatFilter::Filter(message);
+            // Strip the selector only AFTER a match, so an unmatched bot's message
+            // is returned untouched.
+            if (!matched)
+                return message;
 
-            return message;
+            if (bareForm)
+                return bareRemainder;
+
+            for (auto& questId : questIds)
+            {
+                Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
+                if (!questTemplate)
+                    continue;
+
+                replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
+                replaceCaseInsensitive(message, ChatHelper::formatQuest(questTemplate), "");
+            }
+
+            // Only the selector remains: matched, but nothing to dispatch.
+            if (message.find(' ') == std::string::npos)
+                return "";
+
+            return ChatFilter::Filter(message);
         }
 
         return message;

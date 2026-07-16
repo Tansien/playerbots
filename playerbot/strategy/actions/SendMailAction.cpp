@@ -42,8 +42,10 @@ bool SendMailAction::Execute(Event& event)
 
     if (ids.empty())
     {
-        uint32 money = chat->parseMoney(text);
-        if (!money)
+        // Branch on the parse status: money-like but malformed input must not
+        // proceed as a zero-value request, and only an Ok parse funds the mail.
+        uint32 money = 0;
+        if (chat->parseMoney(text, money) != living::MoneyParseStatus::Ok || !money)
             return false;
 
         if (randomBot)

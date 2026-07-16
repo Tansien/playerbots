@@ -62,14 +62,25 @@ bool CleanQuestLogAction::Execute(Event& event)
     // one valid quest used to drop the only valid quest and keep all 24 orphans).
     // Orphans stay counted, logged, and untouched; cleanup fails instead.
     living::QuestLogPreflight preflight;
+    std::ostringstream orphanList;
     for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
     {
         uint32 questId = bot->GetQuestSlotQuestId(slot);
         bool const hasTemplate = questId != 0 && sObjectMgr.GetQuestTemplate(questId) != nullptr;
         if (preflight.Observe(questId, hasTemplate))
-            sLog.outError("Bot %s: quarantined orphaned quest-log slot %u (quest %u has no template); "
+            orphanList << (preflight.orphans > 1 ? ", " : "") << "slot " << uint32(slot) << " quest " << questId;
+    }
+
+    // Cleanup runs from a recurring trigger: log the quarantine once per orphan-set
+    // change, not once per orphan per attempt.
+    uint64 const fingerprint = preflight.OrphanFingerprint();
+    if (fingerprint != loggedOrphanFingerprint)
+    {
+        loggedOrphanFingerprint = fingerprint;
+        if (!preflight.CleanupPermitted())
+            sLog.outError("Bot %s: quarantined %u orphaned quest-log slot(s) with no template (%s); "
                 "automated quest-log cleanup is disabled for this character until a core-backed atomic repair exists",
-                bot->GetName(), uint32(slot), questId);
+                bot->GetName(), uint32(preflight.orphans), orphanList.str().c_str());
     }
 
     if (!preflight.CleanupPermitted())

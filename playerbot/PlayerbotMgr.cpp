@@ -14,6 +14,7 @@
 #include "strategy/actions/InviteToGroupAction.h"
 #include "AiFactory.h"
 #include "Guilds/GuildMgr.h"
+#include "Groups/Group.h"
 
 #ifdef GenerateBotTests
 #include "strategy/tests/TestAction.h"
@@ -1863,69 +1864,159 @@ std::string PlayerbotHolder::HandleBotRemoveLogout(Player* bot, Player* master, 
     return "ok";
 }
 
-void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::list<std::string>& messages, ObjectGuid& guid)
-{    
+namespace
+{
+    // Every CreateBot argument, parsed and validated BEFORE any account or
+    // character mutation. Absent optional fields keep the legacy default/random
+    // behavior; an explicitly supplied but invalid field fails the parse, so a
+    // typo like "level=x" or "race=-1" can never reach GetOrCreateAccount, stat
+    // initialization or SaveToDB.
+    struct CreateBotOptions
+    {
+        std::string name;
+        std::string testName;
+        uint8 race = 0;                    // 0 = absent -> random
+        uint8 cls = 0;                     // 0 = absent -> random
+        uint32 level = 0;                  // 0 = absent -> level 1
+        uint8 gender = GENDER_NONE;        // GENDER_NONE = absent -> random
+        Team team = Team::TEAM_BOTH_ALLOWED; // absent -> master's team
+        BotRoles role = BotRoles::BOT_ROLE_NONE; // absent -> auto talents
+        bool autoAdd = false;
+        bool temporary = false;
+        std::string groupWith;
+        std::string gear = "default";
+
+        bool Parse(Player* master, std::string const& param, std::string& error)
+        {
+            autoAdd = master;
+            groupWith = master ? master->GetName() : "";
+
+            std::vector<std::string> args = Qualified::getMultiQualifiers(param, " ");
+            for (const auto& arg : args)
+            {
+                size_t eqPos = arg.find('=');
+                if (eqPos == std::string::npos)
+                    continue;
+
+                std::string key = arg.substr(0, eqPos);
+                std::string value = arg.substr(eqPos + 1);
+
+                if (key == "name")
+                    name = value;
+                else if (key == "faction")
+                {
+                    team = ChatHelper::parseTeam(value);
+                    if (team == Team::TEAM_BOTH_ALLOWED)
+                    {
+                        error = "Invalid faction: " + value;
+                        return false;
+                    }
+                }
+                else if (key == "race")
+                {
+                    uint32 parsedRace = ChatHelper::parseRace(value);
+                    if (!parsedRace)
+                    {
+                        error = "Invalid race: " + value;
+                        return false;
+                    }
+                    race = static_cast<uint8>(parsedRace);
+                }
+                else if (key == "class")
+                {
+                    uint32 parsedClass = ChatHelper::parseClass(value);
+                    if (!parsedClass)
+                    {
+                        error = "Invalid class: " + value;
+                        return false;
+                    }
+                    cls = static_cast<uint8>(parsedClass);
+                }
+                else if (key == "gender")
+                {
+                    uint32 parsedGender = ChatHelper::parseGender(value);
+                    if (parsedGender == GENDER_NONE)
+                    {
+                        error = "Invalid gender: " + value;
+                        return false;
+                    }
+                    gender = static_cast<uint8>(parsedGender);
+                }
+                else if (key == "level")
+                {
+                    // The old std::stoul had no catch in holder-command dispatch and
+                    // no domain check, so "level=4294967295" reached SetLevel, stat
+                    // initialization and SaveToDB.
+                    if (!living::TryParseUInt32InRange(value, 1, sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL), level))
+                    {
+                        error = "Invalid level: " + value;
+                        return false;
+                    }
+                }
+                else if (key == "role")
+                {
+                    role = ChatHelper::parseRole(value);
+                    if (role == BotRoles::BOT_ROLE_NONE)
+                    {
+                        error = "Invalid role: " + value;
+                        return false;
+                    }
+                }
+                else if (key == "login")
+                    autoAdd = (value == "1" || value == "true" || value == "yes");
+                else if (key == "group")
+                    groupWith = value;
+                else if (key == "gear")
+                    gear = value;
+                else if (key == "test")
+                {
+                    testName = value;
+                    autoAdd = true;
+                }
+                else if (key == "temporary")
+                    temporary = (value == "1" || value == "true" || value == "yes");
+            }
+
+            // Cross-field compatibility, still before any mutation.
+            if (race && team != Team::TEAM_BOTH_ALLOWED && Player::TeamForRace(race) != team)
+            {
+                error = "Race does not match the requested faction";
+                return false;
+            }
+
+            if (race && cls && !sObjectMgr.GetPlayerInfo(race, cls))
+            {
+                error = "Invalid race/class combination";
+                return false;
+            }
+
+            return true;
+        }
+    };
+}
+
+BotCreationResult PlayerbotHolder::CreateBot(Player* master, const std::string param)
+{
     // Allow null master for RA/console usage
     // Player* master can be null when called via .rndbot commands
 
-    std::string name;
-    std::string testName;
-    uint8 race = 0;
-    uint8 cls = 0;
-    uint32 level = 0;
-    bool autoAdd = master;
-    bool temporary = false;
-    uint8 gender = GENDER_NONE;
-    Team team = Team::TEAM_BOTH_ALLOWED;
-    BotRoles role = BotRoles::BOT_ROLE_NONE;
-    std::string groupWith = master ? master->GetName() : "";
-    std::string gear = "default";
+    BotCreationResult result;
 
-    std::vector<std::string> args = Qualified::getMultiQualifiers(param, " ");
-    for (const auto& arg : args)
+    CreateBotOptions options;
+    std::string error;
+    if (!options.Parse(master, param, error))
     {
-        size_t eqPos = arg.find('=');
-        if (eqPos == std::string::npos)
-            continue;
-
-        std::string key = arg.substr(0, eqPos);
-        std::string value = arg.substr(eqPos + 1);
-
-        if (key == "name")
-            name = value;
-        else if (key == "faction")
-            team = ChatHelper::parseTeam(value);
-        else if (key == "race")
-            race = ChatHelper::parseRace(value);
-        else if (key == "class")
-            cls = ChatHelper::parseClass(value);
-        else if (key == "gender")
-            gender = ChatHelper::parseGender(value);
-        else if (key == "level")
-            level = std::stoul(value);
-        else if (key == "role")
-            role = ChatHelper::parseRole(value);
-        else if (key == "login")
-            autoAdd = (value == "1" || value == "true" || value == "yes");
-        else if (key == "group")
-            groupWith = value;
-        else if (key == "gear")
-            gear = value;
-        else if (key == "test")
-        {
-            testName = value;
-            autoAdd = true;
-        }
-        else if (key == "temporary")
-            temporary = (value == "1" || value == "true" || value == "yes");
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back(error);
+        return result;
     }
 
-    std::string error;
     uint32 accountId = GetOrCreateAccount(master, error);
     if (accountId == 0)
     {
-        messages.push_back(error);
-        return;
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back(error);
+        return result;
     }
 
     uint32 maxCharsPerAccount = 9;
@@ -1935,33 +2026,41 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
 
     if (sAccountMgr.GetCharactersCount(accountId) >= maxCharsPerAccount)
     {
-        messages.push_back("Account has max characters");
-        return;
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back("Account has max characters");
+        return result;
     }
 
     uint8 skin = 0, face = 0, hairStyle = 0, hairColor = 0, facialHair = 0;
 
+    std::string name = options.name;
     if (!name.empty())
     {
-        auto result = CharacterDatabase.PQuery("SELECT guid FROM characters WHERE name = '%s'", name.c_str());
-        if (result)
+        auto nameQuery = CharacterDatabase.PQuery("SELECT guid FROM characters WHERE name = '%s'", name.c_str());
+        if (nameQuery)
         {
-            messages.push_back("Name already exists");
-            return;
+            // An explicitly requested name can never succeed on retry.
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back("Name already exists");
+            return result;
         }
     }
 
+    Team team = options.team;
     if (team == TEAM_BOTH_ALLOWED && master)
         team = master->GetTeam();
 
+    uint8 gender = options.gender;
     if (gender == GENDER_NONE)
         gender = urand(GENDER_MALE, GENDER_FEMALE);
 
     RandomPlayerbotFactory factory(0);
 
+    uint8 cls = options.cls;
     if (cls == 0)
-        cls = factory.GetRandomClass(race);
+        cls = factory.GetRandomClass(options.race);
 
+    uint8 race = options.race;
     if (race == 0)
     {
         race = factory.GetRandomRace(cls, team);
@@ -1997,8 +2096,11 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
         {
             delete botSession;
             delete newBot;
-            messages.push_back("Failed to create character");
-            return;
+            // A randomly generated name/appearance may fail here; another attempt
+            // can roll differently.
+            result.status = living::BotCreateStatus::RetryableFailure;
+            result.messages.push_back("Failed to create character");
+            return result;
         }
 
         newBot->setCinematic(2);
@@ -2006,11 +2108,11 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
         sObjectAccessor.AddObject(newBot);
 
         uint32 botGuid = newBot->GetGUIDLow();
-        guid = newBot->GetObjectGuid();
+        result.guid = newBot->GetObjectGuid();
 
-        if (level > 1)
+        if (options.level > 1)
         {
-            newBot->SetLevel(level);
+            newBot->SetLevel(options.level);
             newBot->SetUInt32Value(PLAYER_XP, 0);
             newBot->InitStatsForLevel(true);
 #ifdef MANGOSBOT_ZERO
@@ -2023,22 +2125,22 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
             newBot->learnDefaultSpells();
 
             std::ostringstream out;
-            ChangeTalentsAction::AutoSelectTalents(newBot, &out, role);
+            ChangeTalentsAction::AutoSelectTalents(newBot, &out, options.role);
 
             sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 1);
-            sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, groupWith);
-            sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, gear);
+            sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, options.groupWith);
+            sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, options.gear);
         }
         else
             newBot->SetLevel(1);
 
-        if (!testName.empty())
+        if (!options.testName.empty())
         {
-            testName = std::regex_replace(testName, std::regex("'"), "\\'");
+            std::string testName = std::regex_replace(options.testName, std::regex("'"), "\\'");
 
             sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, testName);
         }
-        if (temporary)
+        if (options.temporary)
         {
             sRandomPlayerbotMgr.SetValue(botGuid, "temporary", 1, name);
         }
@@ -2051,34 +2153,30 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
 
         newBot->SaveToDB();
 
-        messages.push_back("Bot created: " + name);
+        result.status = living::BotCreateStatus::Created;
+        result.messages.push_back("Bot created: " + name);
 
         botSession->LogoutPlayer();
         sObjectAccessor.RemoveObject(newBot);
         delete newBot;
         delete botSession;
 
-        if (autoAdd)
+        if (options.autoAdd)
         {
             sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(accountId, botGuid));
-            messages.push_back("Bot is now online");
+            result.messages.push_back("Bot is now online");
         }
         else
         {
-            messages.push_back("Use '.rndbot add " + name + "' to bring this bot online");
+            result.messages.push_back("Use '.rndbot add " + name + "' to bring this bot online");
         }
 
-        return;
+        return result;
 }
 
 std::list<std::string> PlayerbotHolder::HandleCreate(Player* master, const std::string param, AccountTypes security)
 {
-    std::list<std::string> messages;
-    ObjectGuid guid;
-
-    CreateBot(master, param, messages, guid);
-
-    return messages;
+    return CreateBot(master, param).messages;
 }
 
 std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::string param, AccountTypes security)
@@ -2095,8 +2193,8 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     uint8 masterClass = master->getClass();
     Team team = master->GetTeam();
     BotRoles masterRole = AiFactory::GetPlayerRoles(master);
-    uint8 groupSize = 5;
-    uint8 currentGroupSize = 1;
+    uint32 groupSize = 5;
+    uint32 currentGroupSize = 1;
     Group* group = master->GetGroup();
     if (group)
         currentGroupSize = group->GetMembersCount();
@@ -2113,22 +2211,35 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         std::string key = arg.substr(0, eqPos);
         std::string value = arg.substr(eqPos + 1);
 
-        uint32 sizeValue = 0;
-        if (key == "size" && living::TryParseUInt32(value, sizeValue))
+        if (key == "size")
+        {
+            // Validate against the core raid maximum BEFORE any narrowing or bot
+            // mutation: "size=256" used to wrap a uint8 to 0 and "size=4294967295"
+            // to 255, driving hundreds of unexpected creation attempts.
+            uint32 sizeValue = 0;
+            if (!living::TryParseUInt32InRange(value, 1, MAX_RAID_SIZE, sizeValue))
+            {
+                messages.push_back("Invalid group size: " + value + " (expected 1.." + std::to_string(MAX_RAID_SIZE) + ")");
+                return messages;
+            }
             groupSize = sizeValue;
+        }
         else
             passThroughParam += key + "=" + value + " ";
     }
     
-    std::unordered_map<uint8, std::unordered_map<BotRoles, uint32>> allowedClassNr = LfgAction::AllowedClassRoleNr(master, groupSize);
+    // groupSize was validated against 1..MAX_RAID_SIZE above, so this narrowing
+    // cannot alias.
+    std::unordered_map<uint8, std::unordered_map<BotRoles, uint32>> allowedClassNr = LfgAction::AllowedClassRoleNr(master, static_cast<uint8>(groupSize));
 
     RandomPlayerbotFactory factory(0);
 
     uint32 maxTries = 10*groupSize;
 
-    uint32 botsCreated = 0;
+    living::GroupCreationLedger ledger;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     std::map<uint8, uint32> classesCreated;
+    bool stoppedOnTerminalFailure = false;
 
     while (currentGroupSize < groupSize)
     {
@@ -2168,30 +2279,44 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         std::ostringstream paramStr;
         paramStr << "level=" << masterLevel << " class=" << ChatHelper::formatClass(cls) << " group=" << master->GetName() << " " << passThroughParam; //Passthrough will override.
 
-        auto result = HandleCreate(master, paramStr.str(), security);
-        messages.splice(messages.end(), result);
+        // Success is decided by THIS attempt's typed result. The old code sniffed
+        // "Bot created:" out of messages.front() after splicing, so one early
+        // success made every later failure count as created (and vice versa),
+        // drifting size/class/quota counters away from persisted reality.
+        BotCreationResult result = CreateBot(master, paramStr.str());
+        bool const terminal = ledger.Record(result.status);
+        messages.splice(messages.end(), result.messages);
 
-        if (!messages.empty())
+        if (living::GroupCreationLedger::Counted(result.status))
         {
-            auto lastMsg = messages.front();
-            if (lastMsg.find("Bot created:") != std::string::npos)
-            {
-                classesCreated[cls]++;
-                botsCreated++;
-                currentGroupSize++;
-            }
+            classesCreated[cls]++;
+            currentGroupSize++;
+
+            // Role/class quotas shrink only when a bot actually filled the slot;
+            // decrementing on failure starved roles that were never created.
+            allowedClassNr[0][role]--;
+
+            if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
+                allowedClassNr[cls][role]--;
         }
-    
-        allowedClassNr[0][role]--; 
-        
-        if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
-            allowedClassNr[cls][role]--;
+
+        // A terminal failure (invalid arguments, no account capacity) cannot
+        // succeed on retry; stop instead of burning through maxTries.
+        if (terminal)
+        {
+            stoppedOnTerminalFailure = true;
+            break;
+        }
     }
 
+    uint32 botsCreated = ledger.created;
+
     std::ostringstream debugInfo;
-    debugInfo << "DEBUG group: target=" << (int)groupSize << ", created=" << botsCreated;
+    debugInfo << "DEBUG group: target=" << groupSize << ", created=" << botsCreated;
     if (maxTries == 0)
         debugInfo << " (maxTries exhausted)";
+    if (stoppedOnTerminalFailure)
+        debugInfo << " (stopped on terminal failure)";
     debugInfo << ", continues: role=" << continue_role << ", race=" << continue_race << ", class=" << continue_class;
     debugInfo << ", classes: ";
     for (auto& kv : classesCreated)

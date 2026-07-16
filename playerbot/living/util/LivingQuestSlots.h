@@ -41,6 +41,7 @@ namespace living
     {
         uint8_t occupied = 0;
         uint8_t orphans = 0;
+        uint64_t orphanFingerprint = 0;
 
         // Observe one slot; returns true when the slot is a newly counted orphan so
         // the caller can log it.
@@ -54,9 +55,34 @@ namespace living
                 return false;
 
             ++orphans;
+
+            // FNV-1a over the orphan IDs in slot order. Cleanup runs from a
+            // recurring trigger, so the caller logs the quarantine only when this
+            // fingerprint changes instead of once per orphan per attempt. Bounded
+            // per-bot state: one uint64 remembered by the caller, no global map.
+            if (orphanFingerprint == 0)
+                orphanFingerprint = 14695981039346656037ull;
+            for (int shift = 0; shift < 32; shift += 8)
+            {
+                orphanFingerprint ^= (questId >> shift) & 0xFF;
+                orphanFingerprint *= 1099511628211ull;
+            }
+
             return true;
         }
 
         bool CleanupPermitted() const { return orphans == 0; }
+
+        // 0 when the log holds no orphans, a stable nonzero fingerprint of the
+        // orphan ID sequence otherwise.
+        uint64_t OrphanFingerprint() const
+        {
+            // The FNV accumulator is nonzero for any observed orphan; guarantee the
+            // "no orphans" sentinel stays distinct even if a pathological sequence
+            // hashed to 0.
+            if (orphans == 0)
+                return 0;
+            return orphanFingerprint != 0 ? orphanFingerprint : 1;
+        }
     };
 }

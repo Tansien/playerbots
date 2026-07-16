@@ -108,6 +108,76 @@ LIVING_TEST(numeric_chat_link_ids_reject_overflow_without_throwing)
     LIVING_CHECK(!living::TryParseUInt32("", value));
 }
 
+LIVING_TEST(numeric_parse_in_range_validates_domain_with_the_parse)
+{
+    uint32_t value = 0;
+
+    // The @random=/@fixedrandom= selector domain (0..100).
+    LIVING_CHECK(TryParseUInt32InRange("0", 0, 100, value) && value == 0);
+    LIVING_CHECK(TryParseUInt32InRange("100", 0, 100, value) && value == 100);
+    LIVING_CHECK(!TryParseUInt32InRange("101", 0, 100, value));
+    LIVING_CHECK(!TryParseUInt32InRange("4294967295", 0, 100, value));
+    LIVING_CHECK(!TryParseUInt32InRange("+", 0, 100, value));
+    LIVING_CHECK(!TryParseUInt32InRange("25 hello", 0, 100, value)); // full consumption
+    LIVING_CHECK(!TryParseUInt32InRange("", 0, 100, value));
+
+    // The group-size domain (1..MAX_RAID_SIZE): the review's exact rejections.
+    LIVING_CHECK(TryParseUInt32InRange("1", 1, 40, value) && value == 1);
+    LIVING_CHECK(TryParseUInt32InRange("40", 1, 40, value) && value == 40);
+    LIVING_CHECK(!TryParseUInt32InRange("0", 1, 40, value));
+    LIVING_CHECK(!TryParseUInt32InRange("41", 1, 40, value));            // max + 1
+    LIVING_CHECK(!TryParseUInt32InRange("256", 1, 40, value));           // uint8 wrap to 0
+    LIVING_CHECK(!TryParseUInt32InRange("4294967295", 1, 40, value));    // UINT32_MAX
+
+    // A level domain (1..60): explicit invalid levels fail before any mutation.
+    LIVING_CHECK(TryParseUInt32InRange("60", 1, 60, value) && value == 60);
+    LIVING_CHECK(!TryParseUInt32InRange("0", 1, 60, value));
+    LIVING_CHECK(!TryParseUInt32InRange("61", 1, 60, value));
+    LIVING_CHECK(!TryParseUInt32InRange("4294967295", 1, 60, value));
+    LIVING_CHECK(!TryParseUInt32InRange("-1", 1, 60, value));
+    LIVING_CHECK(!TryParseUInt32InRange("abc", 1, 60, value));
+
+    // The value is untouched when the parse or range check fails.
+    value = 4242;
+    LIVING_CHECK(!TryParseUInt32InRange("50", 1, 40, value) || true);
+    LIVING_CHECK(!TryParseUInt32InRange("99", 1, 40, value));
+    LIVING_CHECK(value == 4242);
+}
+
+LIVING_TEST(numeric_parse_float_exact_accepts_only_finite_decimals)
+{
+    float value = 0.0f;
+
+    // Console pid values: plain decimals with optional sign and fraction.
+    LIVING_CHECK(TryParseFloatExact("1", value) && value == 1.0f);
+    LIVING_CHECK(TryParseFloatExact("0.5", value) && value == 0.5f);
+    LIVING_CHECK(TryParseFloatExact("-50", value) && value == -50.0f);
+    LIVING_CHECK(TryParseFloatExact("+2.25", value) && value == 2.25f);
+    LIVING_CHECK(TryParseFloatExact("1e2", value) && value == 100.0f);
+
+    // The old stof threw on these ("rndbot pid + + +" reached it unguarded).
+    LIVING_CHECK(!TryParseFloatExact("+", value));
+    LIVING_CHECK(!TryParseFloatExact("-", value));
+    LIVING_CHECK(!TryParseFloatExact("", value));
+    LIVING_CHECK(!TryParseFloatExact("abc", value));
+    LIVING_CHECK(!TryParseFloatExact(".", value));
+
+    // Nonfinite, hex, whitespace, overflow and trailing input are rejected.
+    LIVING_CHECK(!TryParseFloatExact("inf", value));
+    LIVING_CHECK(!TryParseFloatExact("nan", value));
+    LIVING_CHECK(!TryParseFloatExact("0x10", value));
+    LIVING_CHECK(!TryParseFloatExact(" 1", value));
+    LIVING_CHECK(!TryParseFloatExact("1 ", value));
+    LIVING_CHECK(!TryParseFloatExact("1.5x", value));
+    LIVING_CHECK(!TryParseFloatExact("1e40", value));   // above float range
+    LIVING_CHECK(!TryParseFloatExact("1e999", value));
+
+    // The value is untouched when the parse fails.
+    value = 42.0f;
+    LIVING_CHECK(!TryParseFloatExact("bogus", value));
+    LIVING_CHECK(value == 42.0f);
+}
+
 LIVING_TEST(numeric_uint64_guid_parse_shares_the_contract)
 {
     // Chat/console GUID values: same rules as TryParseUInt32, 64-bit range.

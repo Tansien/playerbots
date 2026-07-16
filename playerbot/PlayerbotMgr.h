@@ -6,6 +6,7 @@
 #include "Entities/ObjectGuid.h"
 #include "Database/DatabaseEnv.h"
 #include "Globals/SharedDefines.h"
+#include "playerbot/living/util/LivingBotCreation.h"
 
 
 class WorldPacket;
@@ -16,6 +17,16 @@ class Item;
 
 typedef std::map<uint32, Player*> PlayerBotMap;
 typedef std::map<std::string, std::set<std::string> > PlayerBotErrorMap;
+
+// Typed outcome of PlayerbotHolder::CreateBot. Callers must branch on `status`
+// (and use `guid` for the created character); `messages` is display text only
+// and must never be parsed to infer success.
+struct BotCreationResult
+{
+    living::BotCreateStatus status = living::BotCreateStatus::TerminalFailure;
+    ObjectGuid guid;
+    std::list<std::string> messages;
+};
 
 class PlayerbotHolder : public PlayerbotAIBase
 {
@@ -50,7 +61,7 @@ public:
     static std::string GetCommandTexts(const std::string& command);
     static std::unordered_map<std::string, std::string> GetCommandTexts();
 
-    void CreateBot(Player* master, const std::string param, std::list<std::string>& messages, ObjectGuid& guid);
+    BotCreationResult CreateBot(Player* master, const std::string param);
     bool DeleteBot(ObjectGuid guid, bool allowInstant = true);
 #ifdef GenerateBotTests
     void DepositTestResult(const std::string& testName, const std::string& result);

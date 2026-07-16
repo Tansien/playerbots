@@ -46,8 +46,18 @@ bool TradeAction::Execute(Event& event)
         }
     }
     
-    uint32 copper = chat->parseMoney(text);
-    if (copper > 0)
+    uint32 copper = 0;
+    living::MoneyParseStatus moneyStatus = chat->parseMoney(text, copper);
+    if (moneyStatus == living::MoneyParseStatus::Invalid)
+    {
+        // Money-like but malformed or out of range: refuse the whole trade command
+        // instead of executing it as a zero-gold (or wrapped small-value) trade.
+        Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
+        ai->TellError(requester, "Invalid money amount: " + text.substr(0, text.find(' ')));
+        return false;
+    }
+
+    if (moneyStatus == living::MoneyParseStatus::Ok && copper > 0)
     {
         WorldPacket packet(CMSG_SET_TRADE_GOLD, 4);
         packet << copper;

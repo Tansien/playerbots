@@ -260,39 +260,15 @@ std::string ChatHelper::formatMoney(uint32 copper)
     return out.str();
 }
 
-uint32 ChatHelper::parseMoney(const std::string& text)
+living::MoneyParseStatus ChatHelper::parseMoney(const std::string& text, uint32& copper)
 {
-    // if user specified money in ##g##s##c format
-    std::string acum = "";
-    uint32 copper = 0;
-    for (uint8 i = 0; i < text.length(); i++)
-    {
-        if (text[i] == 'g')
-        {
-            copper += (atol(acum.c_str()) * 100 * 100);
-            acum = "";
-        }
-        else if (text[i] == 'c')
-        {
-            copper += atol(acum.c_str());
-            acum = "";
-        }
-        else if (text[i] == 's')
-        {
-            copper += (atol(acum.c_str()) * 100);
-            acum = "";
-        }
-        else if (text[i] == ' ')
-            break;
-        else if (text[i] >= 48 && text[i] <= 57)
-            acum += text[i];
-        else
-        {
-            copper = 0;
-            break;
-        }
-    }
-    return copper;
+    // User-specified money in the documented ##g##s##c format. The old parser used
+    // atol, a uint8 loop index and an unchecked uint32 accumulator: "4294967297g"
+    // wrapped to exactly 10000 copper and executed as a tiny real transaction, and
+    // strings over 255 bytes wrapped the loop index. The checked parser rejects
+    // overflow, repeated/out-of-order units, trailing garbage and totals above the
+    // core money cap instead.
+    return living::TryParseMoneyPrefix(text, MAX_MONEY_AMOUNT, copper);
 }
 
 std::set<uint32> ChatHelper::ExtractAllQuestIds(const std::string& text)
@@ -966,6 +942,7 @@ uint32 ChatHelper::parseSlot(const std::string& text)
 
 bool ChatHelper::parseable(const std::string& text)
 {
+    uint32 copper = 0;
     return text.find("|H") != std::string::npos ||
         text.find("[h:") != std::string::npos ||
             text == "questitem" ||
@@ -976,7 +953,7 @@ bool ChatHelper::parseable(const std::string& text)
             (substrContainsInMap<uint32>(text, slots) && text.find("rtsc ") == std::string::npos) ||
             (substrContainsInMap<ChatMsg>(text, chats) && text.find(" on party") == std::string::npos) ||
             substrContainsInMap<uint32>(text, skills) ||
-            parseMoney(text) > 0;
+            (parseMoney(text, copper) == living::MoneyParseStatus::Ok && copper > 0);
 }
 
         ;
@@ -1089,16 +1066,17 @@ std::string ChatHelper::formatTeam(Team team)
 
 uint32 ChatHelper::parseClass(const std::string& text)
 {
+    // Numeric IDs are parsed from the RAW token: NormalizeChatToken turns '-' into
+    // a space and trims, so "-1" normalized to "1" and selected a real class.
+    uint32 id = 0;
+    if (living::TryParseUInt32(text, id))
+        return classes.count(id) ? id : 0;
+
     std::string normalized = NormalizeChatToken(text);
 
     for (auto& [classId, className] : classes)
         if (NormalizeChatToken(className) == normalized)
             return classId;
-
-    // Same chat-supplied trust boundary as parseGender.
-    uint32 id = 0;
-    if (living::TryParseUInt32(normalized, id) && classes.count(id))
-        return id;
 
     return 0;
 }
@@ -1110,16 +1088,17 @@ std::string ChatHelper::formatClass(uint8 cls)
 
 uint32 ChatHelper::parseRace(const std::string& text)
 {
+    // Numeric IDs are parsed from the RAW token: NormalizeChatToken turns '-' into
+    // a space and trims, so "-1" normalized to "1" and selected a real race.
+    uint32 id = 0;
+    if (living::TryParseUInt32(text, id))
+        return races.count(id) ? id : 0;
+
     std::string normalized = NormalizeChatToken(text);
 
     for (auto& [raceId, raceName] : races)
         if (NormalizeChatToken(raceName) == normalized)
             return raceId;
-
-    // Same chat-supplied trust boundary as parseGender.
-    uint32 id = 0;
-    if (living::TryParseUInt32(normalized, id) && races.count(id))
-        return id;
 
     return 0;
 }

@@ -34,4 +34,38 @@ namespace living
     // becoming 0 in a uint8). Returns false for any input TryParseUInt32 rejects
     // and for every value >= slotCount.
     bool TryParseSlotIndex(std::string const& text, uint32_t slotCount, uint8_t& out);
+
+    // TryParseUInt32 plus an inclusive range check, so callers validate the domain
+    // in the same step as the parse instead of narrowing first and checking later.
+    bool TryParseUInt32InRange(std::string const& text, uint32_t minValue, uint32_t maxValue, uint32_t& out);
+
+    // Parses text as a finite decimal float. Requires: non-empty, full consumption,
+    // a finite result within float range. Rejects inf/nan/hex forms, whitespace and
+    // trailing garbage. Accepts an optional leading sign. Returns false and leaves
+    // `out` untouched otherwise.
+    bool TryParseFloatExact(std::string const& text, float& out);
+
+    // Result of parsing a chat-supplied money amount. The distinction matters at
+    // transactional call sites: NoMoney means "this text is not a money amount"
+    // (callers may fall through to item handling), Invalid means "this text LOOKS
+    // like a money amount but is malformed or out of range" and must never be
+    // executed as a zero-value (or wrapped small-value) transaction.
+    enum class MoneyParseStatus
+    {
+        NoMoney,
+        Ok,
+        Invalid,
+    };
+
+    // Parses the leading whitespace-delimited token of `text` as a money amount in
+    // the documented NgNsNc grammar: up to one gold, one silver and one copper
+    // component, each "digits+unit", in that order, at least one component, and
+    // nothing else in the token. Text after the first space is left for the caller
+    // (trade/mail commands carry item links after the amount).
+    //
+    // The total is accumulated with checked uint64 arithmetic and validated against
+    // maxCopper (the core money cap) BEFORE narrowing to uint32, so an input like
+    // "4294967297g" is Invalid instead of wrapping to a small real transaction.
+    // maxCopper must fit in uint32; larger caps are clamped to uint32 range.
+    MoneyParseStatus TryParseMoneyPrefix(std::string const& text, uint64_t maxCopper, uint32_t& outCopper);
 }

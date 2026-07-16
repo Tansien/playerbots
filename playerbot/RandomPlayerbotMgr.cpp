@@ -1,8 +1,10 @@
 #include "Config/Config.h"
 
 #include "playerbot/playerbot.h"
+#include "playerbot/living/util/LivingBotCreation.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "Maps/MapManager.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "strategy/values/LastMovementValue.h"
 #include "Accounts/AccountMgr.h"
@@ -2356,8 +2358,12 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
             if (sPlayerbotAIConfig.enableRandomTeleports)
             {
                 sLog.outDetail("Bot #%d %s:%d <%s>: sent to grind", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
-                RandomTeleportForLevel(player, true);
-                ScheduleTeleport(bot);
+                // Schedule the next teleport only when this one happened: marking a
+                // failed attempt as done converted it into completed work for the
+                // whole (long, random) teleport interval. On failure the event value
+                // stays 0 and the next update cycle retries.
+                if (RandomTeleportForLevel(player, true))
+                    ScheduleTeleport(bot);
             }
             else
             {
@@ -2370,22 +2376,30 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
     return false;
 }
 
-void RandomPlayerbotMgr::Revive(Player* player)
+bool RandomPlayerbotMgr::Revive(Player* player)
 {
     uint32 bot = player->GetGUIDLow();
+
+    // Attempt the recovery FIRST: the dead/revive markers used to be cleared up
+    // front, so a refused relocation (e.g. a grouped bot) left the bot dead with
+    // its bookkeeping gone and the command still reporting success.
+    bool recovered;
+    if (sServerFacade.GetDeathState(player) == CORPSE)
+    {
+        recovered = RandomTeleport(player);
+    }
+    else
+    {
+        recovered = RandomTeleportForLevel(player, false);
+    }
+
+    if (!recovered)
+        return false;
 
     //sLog.outString("Bot %d revived", bot);
     SetEventValue(bot, "dead", 0, 0);
     SetEventValue(bot, "revive", 0, 0);
-
-    if (sServerFacade.GetDeathState(player) == CORPSE)
-    {
-        RandomTeleport(player);
-    }
-    else
-    {
-        RandomTeleportForLevel(player, false);
-    }
+    return true;
 }
 
 // Returns true only when the bot was actually relocated, so callers do not
@@ -2452,11 +2466,25 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
 	if (bot->GetLevel() < 5)
         return false;
 
-    if (bot->GetGroup() && !bot->GetGroup()->IsLeader(bot->GetObjectGuid()))
+    // The remaining core TeleportTo rejection paths (verified against all three
+    // pinned cores) are preflighted here so a rejection can never happen after
+    // destructive preparation:
+    // - a charmed player is rejected inside TeleportTo (HasCharmer());
+    // - a taxi-flying bot needs its taxi path and motion destroyed BEFORE
+    //   TeleportTo can succeed, and that state cannot be restored if the call
+    //   then fails, so taxi-flying bots are conservatively refused;
+    // - invalid coordinates are rejected per candidate below.
+    if (bot->HasCharmer())
+    {
+        sLog.outDetail("Random teleport skipped for bot %s: bot is charmed", bot->GetName());
         return false;
+    }
 
-    if (bot->IsTaxiFlying() && bot->GetPlayerbotAI()->HasPlayerNearby())
+    if (bot->IsTaxiFlying())
+    {
+        sLog.outDetail("Random teleport skipped for bot %s: bot is taxi flying", bot->GetName());
         return false;
+    }
 
     if (locs.empty())
     {
@@ -2624,19 +2652,11 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
 
     if (tlocs.empty())
     {
-        if (activeOnly)
-        {
-            // Both helpers perform their own relocation + Refresh; report false so
-            // the caller does not Refresh a second time.
-            if (hearth)
-                RandomTeleportForRpg(bot, false);
-            else
-                RandomTeleportForLevel(bot, false);
-
-            return false;
-        }
-
-        sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
+        // The activeOnly fallback (retry without the active-zone restriction)
+        // lives in the public helpers now, so this helper reports plain
+        // success/failure and never hides a fallback's own Refresh/result.
+        if (!activeOnly)
+            sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
 
         return false;
     }
@@ -2690,24 +2710,30 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                 continue;
 
             z = 0.05f + ground;
+
+            // Preflight the core's own coordinate rejection so TeleportTo cannot
+            // fail after this point for a reason known in advance.
+            if (!MapManager::IsValidMapCoord(loc.mapid, x, y, z, 0))
+                continue;
+
             sLog.outDetail("Random teleporting bot %s to %s %f,%f,%f (%u/%zu locations)",
                 bot->GetName(), area->area_name[0], x, y, z, attemtps, tlocs.size());
 
-            // Taxi/motion interruption is required for TeleportTo to succeed and is
-            // transient AI state; everything persistent (homebind) or observable
-            // (heartbeat, AI reset) happens only AFTER a successful teleport. The
-            // result used to be ignored, so a failed teleport still rewrote the
-            // homebind and reset the AI.
-            if (bot->IsTaxiFlying())
-                bot->GetMotionMaster()->MovementExpired();
-            bot->GetMotionMaster()->Clear();
-
+            // NO state is mutated before TeleportTo: taxi-flying bots were already
+            // refused in the preflight (their taxi path cannot be restored on
+            // failure), and motion is cleared only after the move succeeded.
+            // Everything persistent (homebind) or observable (heartbeat, AI reset)
+            // also happens only AFTER a successful teleport - the result used to be
+            // ignored, so a failed teleport still rewrote the homebind, cleared the
+            // motion stack and reset the AI.
             if (!bot->TeleportTo(loc.mapid, x, y, z, 0))
             {
                 sLog.outDetail("Random teleport of bot %s to map %u failed; trying next location",
                     bot->GetName(), loc.mapid);
                 continue;
             }
+
+            bot->GetMotionMaster()->Clear();
 
             if (hearth)
                 bot->SetHomebindToLocation(loc, area->ID);
@@ -2994,29 +3020,33 @@ void RandomPlayerbotMgr::PrintTeleportCache()
     }
 }
 
-void RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
+bool RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
 {
     if (bot->InBattleGround())
-        return;
+        return false;
 
     sLog.outDetail("Preparing location to random teleporting bot %s for level %u", bot->GetName(), bot->GetLevel());
     if (!RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], false, activeOnly))
-        return; // no relocation happened: do not Refresh (free revive/repair/money)
+    {
+        // Legacy fallback: when the active-zone restriction leaves nothing, retry
+        // without it. The fallback used to hide inside the locs helper, where its
+        // success could not be reported without double-Refreshing.
+        if (!activeOnly || !RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], false, false))
+            return false; // no relocation happened: do not Refresh (free revive/repair/money)
+    }
 
     Refresh(bot);
 
     WorldPosition botPos(bot);
 
+    // The old -1.0f sentinel made every nonnegative squared distance compare as
+    // "not closer", so no inn was ever selected and the bind packet never sent.
     ObjectGuid closestInn;
-    float minDistance = -1.0f;
+    living::MinimumTracker closest;
     for (auto& [innGuid, innPosition] : innCacheLevel[bot->getRace()][bot->GetLevel()])
     {
-        float distance = botPos.sqDistance(innPosition);
-        if (minDistance > 0 || distance >= minDistance)
-            continue;
-
-        minDistance = distance;
-        closestInn = innGuid;
+        if (closest.Consider(botPos.sqDistance(innPosition)))
+            closestInn = innGuid;
     }
 
     if (closestInn)
@@ -3026,12 +3056,14 @@ void RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
         data << uint32(3286);                                   // Bind
         bot->GetSession()->SendPacket(data);
     }
+
+    return true;
 }
 
-void RandomPlayerbotMgr::RandomTeleport(Player* bot)
+bool RandomPlayerbotMgr::RandomTeleport(Player* bot)
 {
     if (bot->InBattleGround())
-        return;
+        return false;
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleport");
     std::vector<WorldLocation> locs;
@@ -3066,9 +3098,12 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
         // Actually consume the candidates: they were computed and then dropped, so
         // this path never relocated the bot at all.
         if (!locs.empty() && RandomTeleport(bot, locs, false, true))
+        {
             Refresh(bot);
+            return true;
+        }
 
-        return;
+        // Fall through to the level-based relocation when no flee spot worked.
     }
 
     pmo.reset();
@@ -3076,7 +3111,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
     // RandomTeleportForLevel already calls Refresh() after relocating; calling it
     // again here refreshed a second time (and refreshed even when relocation
     // failed).
-    RandomTeleportForLevel(bot, true);
+    return RandomTeleportForLevel(bot, true);
 }
 
 void RandomPlayerbotMgr::InstaRandomize(Player* bot)
@@ -3484,9 +3519,8 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
     handlers["reset"] = &RandomPlayerbotMgr::HandleConsoleReset;
     handlers["stats"] = &RandomPlayerbotMgr::HandleConsoleStats;
     handlers["update"] = &RandomPlayerbotMgr::HandleConsoleUpdate;
-    handlers["pid "] = &RandomPlayerbotMgr::HandleConsolePid;
+    handlers["pid"] = &RandomPlayerbotMgr::HandleConsolePid;
     handlers["diff"] = &RandomPlayerbotMgr::HandleConsoleDiff;
-    handlers["diff "] = &RandomPlayerbotMgr::HandleConsoleDiff;
     handlers["clean map"] = &RandomPlayerbotMgr::HandleConsoleCleanMap;
     handlers["login debug"] = &RandomPlayerbotMgr::HandleConsoleLoginDebug;
 
@@ -4071,25 +4105,32 @@ void RandomPlayerbotMgr::ChangeStrategy(Player* player)
     if (urand(0, 100) > 100 * sPlayerbotAIConfig.randomBotRpgChance) // select grind / pvp
     {
         sLog.outDetail("Bot #%d %s:%d <%s>: sent to grind spot", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
-        // teleport in different places only if players are online
-        RandomTeleportForLevel(player, players.size());
-        ScheduleTeleport(bot);
+        // teleport in different places only if players are online.
+        // A failed relocation is not scheduled as completed work; the next update
+        // cycle retries it.
+        if (RandomTeleportForLevel(player, players.size()))
+            ScheduleTeleport(bot);
     }
     else
     {
         sLog.outDetail("Bot #%d %s:%d <%s>: sent to inn", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
-        RandomTeleportForRpg(player, players.size());
-        ScheduleTeleport(bot);
+        if (RandomTeleportForRpg(player, players.size()))
+            ScheduleTeleport(bot);
     }
 }
 
-void RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly)
+bool RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly)
 {
     uint32 race = bot->getRace();
     uint32 level = bot->GetLevel();
     sLog.outDetail("Random teleporting bot %s for RPG (%zu locations available)", bot->GetName(), rpgLocsCacheLevel[race][level].size());
     if (!RandomTeleport(bot, rpgLocsCacheLevel[race][level], true, activeOnly))
-        return; // no relocation happened: do not Refresh (free revive/repair/money)
+    {
+        // Legacy fallback: when the active-zone restriction leaves nothing, retry
+        // without it (see RandomTeleportForLevel).
+        if (!activeOnly || !RandomTeleport(bot, rpgLocsCacheLevel[race][level], true, false))
+            return false; // no relocation happened: do not Refresh (free revive/repair/money)
+    }
 
     Refresh(bot);
 
@@ -4103,6 +4144,8 @@ void RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly)
         travelTarget->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
         travelTarget->SetExpireIn(10 * MINUTE * IN_MILLISECONDS);
     }
+
+    return true;
 }
 
 void RandomPlayerbotMgr::Remove(Player* bot)
@@ -4442,8 +4485,10 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleportForLevel(Player* 
         messages.push_back("Bot not found");
         return messages;
     }
-    RandomTeleportForLevel(bot);
-    messages.push_back("teleport applied to " + std::string(bot->GetName()));
+    if (RandomTeleportForLevel(bot))
+        messages.push_back("teleport applied to " + std::string(bot->GetName()));
+    else
+        messages.push_back("teleport failed for " + std::string(bot->GetName()));
     return messages;
 }
 
@@ -4455,8 +4500,10 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleportForRpg(Player* bo
         messages.push_back("Bot not found");
         return messages;
     }
-    RandomTeleportForRpg(bot);
-    messages.push_back("rpg applied to " + std::string(bot->GetName()));
+    if (RandomTeleportForRpg(bot))
+        messages.push_back("rpg applied to " + std::string(bot->GetName()));
+    else
+        messages.push_back("rpg failed for " + std::string(bot->GetName()));
     return messages;
 }
 
@@ -4468,8 +4515,12 @@ std::list<std::string> RandomPlayerbotMgr::HandleRevive(Player* bot)
         messages.push_back("Bot not found");
         return messages;
     }
-    Revive(bot);
-    messages.push_back("revive applied to " + std::string(bot->GetName()));
+    // A refused recovery (e.g. a grouped bot that cannot be safely relocated)
+    // keeps its dead/revive markers and must not report success.
+    if (Revive(bot))
+        messages.push_back("revive applied to " + std::string(bot->GetName()));
+    else
+        messages.push_back("revive failed for " + std::string(bot->GetName()));
     return messages;
 }
 
@@ -4481,8 +4532,10 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleport(Player* bot)
         messages.push_back("Bot not found");
         return messages;
     }
-    RandomTeleport(bot);
-    messages.push_back("grind applied to " + std::string(bot->GetName()));
+    if (RandomTeleport(bot))
+        messages.push_back("grind applied to " + std::string(bot->GetName()));
+    else
+        messages.push_back("grind failed for " + std::string(bot->GetName()));
     return messages;
 }
 
@@ -4561,19 +4614,24 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleUpdate(std::string param
 
 std::list<std::string> RandomPlayerbotMgr::HandleConsolePid(std::string param)
 {
+    // The dispatcher already stripped the "pid " prefix; the old handler stripped
+    // four more characters (dropping valid input, or throwing from substr on short
+    // input) and then parsed each token twice with throwing stof.
+    std::vector<std::string> pid = Qualified::getMultiQualifiers(param, " ");
+
+    float p = 0.0f, i = 0.0f, d = 0.0f;
+    if (pid.size() != 3 ||
+        !living::TryParseFloatExact(pid[0], p) ||
+        !living::TryParseFloatExact(pid[1], i) ||
+        !living::TryParseFloatExact(pid[2], d))
+    {
+        return {"Usage: pid p i d (three finite numbers)"};
+    }
+
+    sRandomPlayerbotMgr.pid.adjust(p, i, d);
+
     std::list<std::string> messages;
-    std::string pids = param.substr(4);
-    std::vector<std::string> pid = Qualified::getMultiQualifiers(pids, " ");
-
-    if (pid.size() == 0)
-        pid.push_back("0");
-    if (pid.size() == 1)
-        pid.push_back("0");
-    if (pid.size() == 2)
-        pid.push_back("0");
-    sRandomPlayerbotMgr.pid.adjust(stof(pid[0]), stof(pid[1]), stof(pid[2]));
-
-    std::string msg = "Pid set to p:" + std::to_string(stof(pid[0])) + " i:" + std::to_string(stof(pid[1])) + " d:" + std::to_string(stof(pid[2]));
+    std::string msg = "Pid set to p:" + std::to_string(p) + " i:" + std::to_string(i) + " d:" + std::to_string(d);
     messages.push_back(msg);
     return messages;
 }
@@ -4593,20 +4651,26 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleDiff(std::string param)
         messages.push_back(ss.str());
         return messages;
     }
-    else if (param.find(" ") != std::string::npos)
-    {
-        std::vector<std::string> diff = Qualified::getMultiQualifiers(param, " ");
-        if (diff.size() == 0)
-            diff.push_back("100");
-        if (diff.size() == 1)
-            diff.push_back(diff[0]);
-        sPlayerbotAIConfig.diffWithPlayer = stoi(diff[0]);
-        sPlayerbotAIConfig.diffEmpty = stoi(diff[1]);
+    // Documented usage: diff [player_diff] [empty_diff]. One value sets both.
+    // The old handler parsed each token twice with throwing stoi and silently
+    // ignored the single-value form.
+    std::vector<std::string> diff = Qualified::getMultiQualifiers(param, " ");
 
-        std::string msg = "Diff set to " + std::to_string(stoi(diff[0])) + " (player), " + std::to_string(stoi(diff[1])) + " (empty)";
-        messages.push_back(msg);
-        return messages;
+    uint32 diffWithPlayer = 0;
+    uint32 diffEmpty = 0;
+    constexpr uint32 maxDiffMs = 60000;
+    if (diff.size() < 1 || diff.size() > 2 ||
+        !living::TryParseUInt32InRange(diff[0], 1, maxDiffMs, diffWithPlayer) ||
+        !living::TryParseUInt32InRange(diff.size() == 2 ? diff[1] : diff[0], 1, maxDiffMs, diffEmpty))
+    {
+        return {"Usage: diff [player_diff] [empty_diff] (1.." + std::to_string(maxDiffMs) + " ms)"};
     }
+
+    sPlayerbotAIConfig.diffWithPlayer = diffWithPlayer;
+    sPlayerbotAIConfig.diffEmpty = diffEmpty;
+
+    std::string msg = "Diff set to " + std::to_string(diffWithPlayer) + " (player), " + std::to_string(diffEmpty) + " (empty)";
+    messages.push_back(msg);
     return messages;
 }
 
