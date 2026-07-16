@@ -1,6 +1,7 @@
 #include "playerbot/playerbot.h"
 #include "GlyphAction.h"
 #include "playerbot/RandomItemMgr.h"
+#include "playerbot/living/util/LivingLinkGrammar.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/strategy/values/GlyphValues.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
@@ -85,38 +86,36 @@ bool GlyphAction::Execute(Event& event)
     }
     else if (!ids.empty())
     {
-        // Optional explicit slot AFTER THE FINAL link. Reading the suffix of the
-        // first "|r " treated a second item link as a slot token, so the legacy
-        // multi-link auto-slotting form ("glyph <link1> <link2>") was rejected.
-        // 99 keeps the legacy "no slot specified, pick one" sentinel.
+        // Optional explicit slot after the FINAL link terminator. A link ends in
+        // bare "|r": searching for "|r " (with a space) found the FIRST link's
+        // terminator in "<link1> <link2>" and misread link 2 as a slot token, so
+        // the legacy multi-link auto-slotting form was rejected. An empty suffix
+        // keeps legacy auto-slotting (99 = "no slot specified, pick one").
         uint8 requestedSlot = 99;
-        size_t const lastLinkEnd = param.rfind("|r ");
-        if (lastLinkEnd != std::string::npos)
+        std::string slotToken;
+        if (living::TryExtractTokenAfterFinalLink(param, slotToken) && !slotToken.empty())
         {
-            std::string const slotToken = param.substr(lastLinkEnd + 3);
-            if (!slotToken.empty())
+            // An explicit slot addresses exactly one glyph. Count ACTUAL link
+            // occurrences: duplicate links collapse in the ids set, so ids.size()
+            // is not the number of links the user supplied.
+            if (living::CountOccurrences(param, "|Hitem:") != 1)
             {
-                // An explicit slot addresses exactly one glyph; combining it with
-                // several links is ambiguous about which link it applies to.
-                if (ids.size() != 1)
-                {
-                    ai->TellPlayer(requester, "Specify a slot with a single glyph link, or omit the slot to auto-slot several",
-                        PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
-                    return false;
-                }
+                ai->TellPlayer(requester, "Specify a slot with a single glyph link, or omit the slot to auto-slot several",
+                    PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                return false;
+            }
 
-                // The same checked parser as the remove grammar: a lone sign or a
-                // huge value used to reach stoi and throw, and the value was
-                // narrowed into uint8 before any range check, so slot 256 silently
-                // became slot 0 and consumed the glyph there.
-                std::vector<uint32> const equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
-                if (!living::TryParseSlotIndex(slotToken, uint32(equipedGlyphs.size()), requestedSlot))
-                {
-                    std::ostringstream out;
-                    out << slotToken << " is not a valid slot number";
-                    ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
-                    return false;
-                }
+            // The same checked parser as the remove grammar: a lone sign or a
+            // huge value used to reach stoi and throw, and the value was
+            // narrowed into uint8 before any range check, so slot 256 silently
+            // became slot 0 and consumed the glyph there.
+            std::vector<uint32> const equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
+            if (!living::TryParseSlotIndex(slotToken, uint32(equipedGlyphs.size()), requestedSlot))
+            {
+                std::ostringstream out;
+                out << slotToken << " is not a valid slot number";
+                ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                return false;
             }
         }
 
