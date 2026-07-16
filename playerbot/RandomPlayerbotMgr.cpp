@@ -1,6 +1,7 @@
 #include "Config/Config.h"
 
 #include "playerbot/playerbot.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "strategy/values/LastMovementValue.h"
@@ -2414,41 +2415,28 @@ namespace
         return sPlayerbotAIConfig.IsInRandomAccountList(player->GetSession()->GetAccountId());
     }
 
-    // Two-phase: nothing may be mutated - not even the initiating bot - until every
-    // member of its group has passed, so a mixed group is never partially
-    // teleported.
-    bool GroupIsTeleportable(Player* bot)
-    {
-        if (!IsFreeSyntheticRandomBot(bot))
-            return false;
-
-        Group* group = bot->GetGroup();
-        if (!group)
-            return true;
-
-        for (GroupReference* gref = group->GetFirstMember(); gref; gref = gref->next())
-        {
-            Player* member = gref->getSource();
-            if (!member || member == bot)
-                continue;
-
-            if (!IsFreeSyntheticRandomBot(member))
-                return false;
-        }
-
-        return true;
-    }
 }
 
 bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, bool hearth, bool activeOnly)
 {
     // Complete preflight BEFORE any mutation (taxi, homebind, motion, position,
-    // heartbeat, AI reset). The initiating bot used to be fully teleported before
-    // any member was inspected, so a mixed group was left split.
-    if (!GroupIsTeleportable(bot))
+    // heartbeat, AI reset).
+    if (!IsFreeSyntheticRandomBot(bot))
     {
-        sLog.outDetail("Random teleport skipped for bot %s: group contains a real player or a player-owned bot",
+        sLog.outDetail("Random teleport skipped for bot %s: not a free synthetic random bot",
             bot ? bot->GetName() : "<null>");
+        return false;
+    }
+
+    // A grouped bot is never randomly relocated (standalone legacy safety fix).
+    // There is no core-backed way to relocate a group atomically: once one member
+    // has teleported or had its homebind rewritten, a later member's TeleportTo
+    // failure leaves the group split with no way back. Sequential "best effort"
+    // relocation is therefore not attempted at all; a core-backed group relocation
+    // is future design work.
+    if (bot->GetGroup())
+    {
+        sLog.outDetail("Random teleport skipped for bot %s: bot is in a group", bot->GetName());
         return false;
     }
 
@@ -2705,39 +2693,27 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
             sLog.outDetail("Random teleporting bot %s to %s %f,%f,%f (%u/%zu locations)",
                 bot->GetName(), area->area_name[0], x, y, z, attemtps, tlocs.size());
 
+            // Taxi/motion interruption is required for TeleportTo to succeed and is
+            // transient AI state; everything persistent (homebind) or observable
+            // (heartbeat, AI reset) happens only AFTER a successful teleport. The
+            // result used to be ignored, so a failed teleport still rewrote the
+            // homebind and reset the AI.
             if (bot->IsTaxiFlying())
                 bot->GetMotionMaster()->MovementExpired();
+            bot->GetMotionMaster()->Clear();
+
+            if (!bot->TeleportTo(loc.mapid, x, y, z, 0))
+            {
+                sLog.outDetail("Random teleport of bot %s to map %u failed; trying next location",
+                    bot->GetName(), loc.mapid);
+                continue;
+            }
 
             if (hearth)
                 bot->SetHomebindToLocation(loc, area->ID);
 
-            bot->GetMotionMaster()->Clear();
-            bot->TeleportTo(loc.mapid, x, y, z, 0);
             bot->SendHeartBeat();
             bot->GetPlayerbotAI()->Reset(true);
-
-            if (bot->GetGroup())
-            {
-                for (GroupReference* gref = bot->GetGroup()->GetFirstMember(); gref; gref = gref->next())
-                {
-                    Player* member = gref->getSource();
-                    if (!member || member == bot)
-                        continue;
-
-                    // GroupIsTeleportable() already proved every member is a free
-                    // synthetic random bot, so this loop only mutates.
-                    PlayerbotAI* memberAi = member->GetPlayerbotAI();
-                    if (member->IsTaxiFlying())
-                        member->GetMotionMaster()->MovementExpired();
-                    if (hearth)
-                        member->SetHomebindToLocation(loc, area->ID);
-
-                    member->GetMotionMaster()->Clear();
-                    member->TeleportTo(loc.mapid, x, y, z, 0);
-                    member->SendHeartBeat();
-                    memberAi->Reset(true);
-                }
-            }
             return true;
         }
     }
@@ -4548,7 +4524,10 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleReset(std::string param)
 
 std::list<std::string> RandomPlayerbotMgr::HandleConsoleStats(std::string param)
 {
-    if (!Qualified::isValidNumberString(param))
+    // Console-supplied token: the old isValidNumberString + stoull pair accepted
+    // a lone sign and threw on overflow.
+    uint64 guidRaw = 0;
+    if (!living::TryParseUInt64(param, guidRaw))
     {
         return {"Stats: Error parsing " + param};
     }
@@ -4557,7 +4536,7 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleStats(std::string param)
     std::string msg = "Stats requested.";
     messages.push_back(msg);
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    ObjectGuid guid = ObjectGuid(guidRaw);
     activatePrintStatsThread(guid);
     return messages;
 }
