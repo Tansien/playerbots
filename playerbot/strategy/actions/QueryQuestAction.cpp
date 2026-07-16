@@ -40,8 +40,19 @@ bool QueryQuestAction::Execute(Event& event)
         if (questId != bot->GetQuestSlotQuestId(slot))
             continue;
 
+        // A quarantined orphan resolves no template; formatting it would
+        // dereference null.
+        Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
+        if (!questTemplate)
+        {
+            std::ostringstream out;
+            out << "--- quest " << questId << " (no template) ---";
+            ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            return true;
+        }
+
         std::ostringstream out;
-        out << "--- " << chat->formatQuest(sObjectMgr.GetQuestTemplate(questId)) << " ";
+        out << "--- " << chat->formatQuest(questTemplate) << " ";
         if (bot->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE)
         {
             out << "|c0000FF00completed|r ---";
@@ -63,6 +74,9 @@ bool QueryQuestAction::Execute(Event& event)
 void QueryQuestAction::TellObjectives(Player* requester, uint32 questId)
 {
     Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
+    if (!questTemplate)
+        return; // quarantined orphan: no objectives to tell
+
     QuestStatusData questStatus = bot->getQuestStatusMap()[questId];
 
     for (int i = 0; i < QUEST_OBJECTIVES_COUNT; i++)
