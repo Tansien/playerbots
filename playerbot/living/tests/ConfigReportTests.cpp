@@ -213,6 +213,27 @@ LIVING_TEST(config_report_represents_every_required_conflict)
     LIVING_CHECK(CountReason(report, ConfigReasonCode::EnchantConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::WorldBuffConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::RespawnAccelerationConflict) == 4);
+
+    // With BOTH respawn modifiers zero, AccelerateRespawn cannot mutate anything:
+    // the scope flags alone are inert and must not block an effectively disabled
+    // configuration in strict mode.
+    {
+        LegacyCompatibilityInputs inert = CleanLegacyInputs();
+        inert.respawnModHostile = 0.0f;
+        inert.respawnModNeutral = 0.0f;
+        inert.respawnModForPlayerBots = true;
+        inert.respawnModForInstances = true;
+        EffectiveConfigReport const inertReport = BuildEffectiveConfigReport(
+            LivingRealmConfig::FromValues(true, "organic", true), inert);
+        LIVING_CHECK(CountReason(inertReport, ConfigReasonCode::RespawnAccelerationConflict) == 0);
+        LIVING_CHECK(!inertReport.HasBlockingEntry());
+
+        // One nonzero modifier reactivates the scope-flag conflicts.
+        inert.respawnModHostile = 5.0f;
+        EffectiveConfigReport const activeReport = BuildEffectiveConfigReport(
+            LivingRealmConfig::FromValues(true, "organic", true), inert);
+        LIVING_CHECK(CountReason(activeReport, ConfigReasonCode::RespawnAccelerationConflict) == 3);
+    }
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TeleportConflict) == 3);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TransportConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::TimedRotationConflict) == 2);

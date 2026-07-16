@@ -27,7 +27,7 @@ partial, with the remainder enumerated here.
 | Snapshots | `playerbot/living/snapshots/LivingSnapshots.h/.cpp` |
 | Events | `playerbot/living/events/LivingEvents.h/.cpp` (15 stable names, no-op and ordered test sinks) |
 | Determinism/fault seams | `playerbot/living/testing/LivingDeterminism.h/.cpp` (clocks, nonce/token providers, seeded random, named 0002B fault points) |
-| Shared pure helpers | `playerbot/living/util/LivingNumericParse.h/.cpp` (non-throwing full-consumption `uint32`/slot parsing used by `ChatHelper::parseItemsUnordered` and both `GlyphAction` slot branches), `playerbot/living/util/LivingQuestSlots.h` (single quest-log occupancy/orphan rule used by `CleanQuestLogAction` and `FreeQuestLogSlotValue`). These live under `living/` because they have no core dependency, which is what lets the host tests compile and regression-test the exact functions the runtime calls. |
+| Shared pure helpers | `playerbot/living/util/LivingNumericParse.h/.cpp` (non-throwing full-consumption `uint32`/slot parsing used by `ChatHelper`, `ChatFilter`, `ChooseTravelTargetAction`, and both `GlyphAction` slot branches), `playerbot/living/util/LivingQuestSlots.h` (quest-log occupancy/orphan rule plus the `QuestLogPreflight` cleanup-quarantine decision used by `CleanQuestLogAction` and `FreeQuestLogSlotValue`), `playerbot/living/util/LivingLinkGrammar.h` (final-link terminator and link-occurrence rules used by `GlyphAction`). These live under `living/` because they have no core dependency, which is what lets the host tests compile and regression-test the exact functions the runtime calls. |
 | CI | `.github/workflows/cmangos-ubuntu-build.yml` (self-hosted Ubuntu only, fork-PR guard, pinned core baselines, host-test job) |
 
 ## Requirement traceability
@@ -188,9 +188,16 @@ blockers per 0002A A.2:
   identities.
 - `DIRECT_AUCTION_MUTATION` / `DIRECT_ITEM_*_TRANSFER`: route through the core
   session handlers or deny at the call site.
-- `COMMAND_CHARACTER_PROVISION` / `GUILD_BANK_TAB_MUTATION` /
-  `REMOTE_QUEST_ACCEPT` / `WORLD_BUFF_APPLY`: guard the command, guild-bank,
-  hardcoded-quest, and world-buff call sites for managed identities.
+- `COMMAND_CHARACTER_PROVISION`: the existing `PlayerbotHolder::CreateBot`
+  compound is denied outright, including in the fixture profile - it creates and
+  grants before the first save, so it cannot satisfy the identity boundary.
+  Fixtures need a dedicated wrapper that runs the explicit sequence: authorize
+  `FIXTURE_CHARACTER_CREATE`, create through the core, commit the
+  `(guid, nonce, FIXTURE)` root, then authorize `FIXTURE_PROVISION` grants.
+  No placeholder persistence exists in Phase 0; the wrapper is 0.1 work.
+- `GUILD_BANK_TAB_MUTATION` / `REMOTE_QUEST_ACCEPT` / `WORLD_BUFF_APPLY`: guard
+  the guild-bank, hardcoded-quest, and world-buff call sites for managed
+  identities.
 - `DIRECT_QUEST_ABANDON`: route quest abandonment through the core abandon
   handler (item cleanup included) instead of direct `DropQuest` pruning. The
   guard belongs at the shared `PlayerbotAI::DropQuest` boundary, which
@@ -200,12 +207,6 @@ blockers per 0002A A.2:
   `QuestAction::AcceptQuest` (the core handler call, then the
   `syncQuestWithPlayer` `AddQuest` fallback). The guard must bind to those two
   branches individually; an action-entry allow would expose the denied sync.
-- Orphaned quest-log slots are repaired by clearing the slot
-  (`SetQuestSlot(slot, 0)`), the same boundary `DropQuestAction` already uses.
-  A cross-expansion-safe repair that also reconciles `m_questStatus`/source
-  items for a template-less quest does not exist in the current core API, so the
-  0.1 guard must either accept slot clearing as the repair or quarantine the
-  character; it must not discard valid quests to work around the orphan.
 - `DIRECT_AURA_REMOVAL`: restrict the `ra` command to core-validated
   cancellation of positive, cancelable auras.
 - `DIRECT_ITEM_DESTRUCTION` / `FREE_PET_HAPPINESS`: use the core destroy-item
@@ -216,9 +217,13 @@ blockers per 0002A A.2:
 - `DIRECT_QUEST_ABANDON` guard belongs at the shared `PlayerbotAI::DropQuest`
   boundary so the pruning, failed-timer, and guild-order callers are all
   covered.
-- In-world regression scenarios for the quest-cleanup accounting and
-  taxi-money restoration fixes (host tests cannot construct core quest/taxi
-  objects; use the `playerbot/strategy/tests` DSL on a test realm).
+- In-world regression scenarios for paths the host tests cannot construct
+  (no core `Player`/`WorldSession`/`Group`/DB objects): quest-cleanup
+  accounting and orphan quarantine (orphan-plus-loot, save/reload), the
+  taxi-money restoration fix, the `@quest`/travel chat entry points with
+  malformed and overflowing IDs, solo random-teleport success/failure and
+  grouped-bot denial, and the glyph command grammar. Use the
+  `playerbot/strategy/tests` DSL on a test realm.
 - `TEMP_MONEY_TRICK` (**data-integrity hazard, not just a shortcut**): the
   temporary `SetMoney` grant used by the RPG/world-buff flight helpers and the
   `taxi`/`gold` cheat fare runs `MoneyChanged` synchronously, which can

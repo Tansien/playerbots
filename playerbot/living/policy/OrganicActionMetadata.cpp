@@ -16,8 +16,8 @@ namespace living
               "Player::Create via RandomPlayerbotFactory::CreateRandomBots", OrganicClassification::BootstrapOnly,
               nullptr, true, false, "0002A 'Core character creation'" },
             { OrganicActionKind::COMMAND_CHARACTER_PROVISION, "COMMAND_CHARACTER_PROVISION", OrganicActionCategory::Bootstrap,
-              "PlayerbotHolder::CreateBot addclass-style command: creation plus post-create level/XP/stats/taxi/talent/profession/spell grants", OrganicClassification::FixtureOnly,
-              nullptr, false, true, "0002A A.2 Phase 0 source-audit row; 0006 AddClass pools are fixture-profile only" },
+              "PlayerbotHolder::CreateBot addclass-style command: an INDIVISIBLE create-plus-grants compound (creates, then grants level/XP/stats/taxi/talents/professions/spells before the first save), so it can never satisfy the create -> commit FIXTURE root -> provision identity boundary", OrganicClassification::Deny,
+              nullptr, false, false, "0002A A.2 Phase 0 source-audit row; superseded by FIXTURE_CHARACTER_CREATE + FIXTURE_PROVISION through a future dedicated wrapper" },
 
             { OrganicActionKind::RANDOMIZE_INSTANT, "RANDOMIZE_INSTANT", OrganicActionCategory::Randomization,
               "AiPlayerbot.InstantRandomize / RandomPlayerbotMgr::RandomizeFirst", OrganicClassification::Deny,
