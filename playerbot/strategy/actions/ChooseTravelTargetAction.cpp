@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/LootObjectStack.h"
 #include "ChooseTravelTargetAction.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/strategy/values/TravelValues.h"
 #include "playerbot/strategy/values/SharedValueContext.h"
@@ -14,8 +15,11 @@ using namespace ai;
 
 inline std::string GetTravelPurposeName(std::string purpose)
 {
-    if (Qualified::isValidNumberString(purpose) && TravelDestinationPurposeName.find(TravelDestinationPurpose(stoi(purpose))) != TravelDestinationPurposeName.end())
-        return TravelDestinationPurposeName.at(TravelDestinationPurpose(stoi(purpose)));
+    // Same chat-supplied trust boundary as below: isValidNumberString accepts a
+    // lone sign and stoi throws on overflow.
+    uint32 purposeValue = 0;
+    if (living::TryParseUInt32(purpose, purposeValue) && TravelDestinationPurposeName.find(TravelDestinationPurpose(purposeValue)) != TravelDestinationPurposeName.end())
+        return TravelDestinationPurposeName.at(TravelDestinationPurpose(purposeValue));
 
     if (purpose.empty())
         return "quest";
@@ -1480,15 +1484,20 @@ bool FocusTravelTargetAction::Execute(Event& event)
 
     if (questIds.empty() && !text.empty())
     {
-        if (Qualified::isValidNumberString(text))
-            questIds.insert(stoi(text));
+        // Chat-supplied numbers: the old isValidNumberString + stoi pair accepted a
+        // lone sign and threw on overflow, and the comma branch parsed the WHOLE
+        // original text instead of each qualifier, so "1,2,3" focused quest... stoi
+        // stopped at the first comma and inserted 1 three times.
+        uint32 parsedQuestId = 0;
+        if (living::TryParseUInt32(text, parsedQuestId))
+            questIds.insert(parsedQuestId);
         else
         {
             std::vector<std::string> qualifiers = Qualified::getMultiQualifiers(text, ",");
 
             for (auto& qualifier : qualifiers)
-                if (Qualified::isValidNumberString(qualifier))
-                    questIds.insert(stoi(text));
+                if (living::TryParseUInt32(qualifier, parsedQuestId))
+                    questIds.insert(parsedQuestId);
         }
     }
 

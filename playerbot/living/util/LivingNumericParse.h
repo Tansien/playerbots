@@ -22,6 +22,9 @@ namespace living
     // in uint32. Returns false and leaves `out` untouched otherwise.
     bool TryParseUInt32(std::string const& text, uint32_t& out);
 
+    // Same contract for uint64; used for chat/console-supplied GUID values.
+    bool TryParseUInt64(std::string const& text, uint64_t& out);
+
     // True when text is exactly a uint32 by the rule above. Use instead of an
     // isNumeric()-style check when the value will be parsed afterwards.
     bool IsExactUInt32(std::string const& text);
