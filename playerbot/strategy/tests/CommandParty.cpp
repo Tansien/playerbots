@@ -16,17 +16,15 @@ TestResult CommandPartySpawnBot::Execute(const std::string& params, Player* bot,
         message = "Failed to spawn bot with params: " + params;
         return TestResult::IMPOSSIBLE;
     }
-    std::list<std::string> messages;
-    ObjectGuid guid;
-    ai->GetHolder()->CreateBot(bot, params + " temporary=true", messages, guid);
+    BotCreationResult result = ai->GetHolder()->CreateBot(bot, params + " temporary=true");
 
-    if (!guid)
+    if (result.status != living::BotCreateStatus::Created || !result.guid)
     {
         message = "Failed to spawn bot with params: " + params;
         return TestResult::IMPOSSIBLE;
     }
 
-    ctx.spawnedBots.push_back(guid);
+    ctx.spawnedBots.push_back(result.guid);
 
     return TestResult::PASS;
 }

@@ -46,5 +46,12 @@ namespace ai
         void DropQuestType(Player* requester, uint8& numQuest, uint8 wantNum = 100, bool isGreen = false, bool hasProgress = false, bool isComplete = false);
 
         static bool HasProgress(Player* bot, Quest const* quest);
+
+    private:
+        // Fingerprint of the orphan set last logged for this bot. Cleanup runs
+        // from a recurring trigger; the quarantine is logged only when the orphan
+        // set changes instead of once per orphan per attempt. Action instances are
+        // per-bot and live with the AI, so this state is bounded and transient.
+        uint64 loggedOrphanFingerprint = 0;
     };
 }

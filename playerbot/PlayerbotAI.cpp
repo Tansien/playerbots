@@ -2845,9 +2845,15 @@ const Quest* PlayerbotAI::GetCurrentIncompleteQuestWithId(uint32 pQuestId)
         if (!questId)
             continue;
 
+        // The status test binds UNDER the ID equality: the old unparenthesized
+        // `a == b && c || d` matched any unrelated QUEST_STATUS_NONE slot. The API
+        // promises a real quest, so a quarantined template-less slot never counts.
         QuestStatus status = bot->GetQuestStatus(questId);
-        if (pQuestId == questId && status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_NONE)
-            return sObjectMgr.GetQuestTemplate(questId);
+        if (pQuestId == questId && (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_NONE))
+        {
+            if (const Quest* quest = sObjectMgr.GetQuestTemplate(questId))
+                return quest;
+        }
     }
 
     return nullptr;
@@ -2855,18 +2861,8 @@ const Quest* PlayerbotAI::GetCurrentIncompleteQuestWithId(uint32 pQuestId)
 
 bool PlayerbotAI::HasCurrentIncompleteQuestWithId(uint32 pQuestId)
 {
-    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
-    {
-        uint32 questId = bot->GetQuestSlotQuestId(slot);
-        if (!questId)
-            continue;
-
-        QuestStatus status = bot->GetQuestStatus(questId);
-        if (pQuestId == questId && status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_NONE)
-            return true;
-    }
-
-    return false;
+    // Same contract as GetCurrentIncompleteQuestWithId: only a live quest counts.
+    return GetCurrentIncompleteQuestWithId(pQuestId) != nullptr;
 }
 
 /*

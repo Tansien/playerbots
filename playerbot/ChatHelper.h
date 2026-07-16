@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 #include "Tools/Language.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 
 typedef std::set<uint32> ItemIds;
 typedef std::set<uint32> SpellIds;
@@ -31,7 +32,12 @@ namespace ai
 
     public:
         static std::string formatMoney(uint32 copper);
-        static uint32 parseMoney(const std::string& text);
+        // Parses the leading token of `text` as an NgNsNc money amount, checked
+        // against the core money cap. Callers MUST branch on the status: Invalid
+        // means money-like but malformed/out-of-range input that must not execute
+        // as a (zero or wrapped) transaction; NoMoney means the text is not a
+        // money amount at all. `copper` is written only on Ok.
+        static living::MoneyParseStatus parseMoney(const std::string& text, uint32& copper);
 
         static std::set<uint32> ExtractAllQuestIds(const std::string& text);
         static std::set<uint32> ExtractAllItemIds(const std::string& text);

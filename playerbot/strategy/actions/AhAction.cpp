@@ -111,7 +111,14 @@ bool AhAction::ExecuteCommand(Player* requester, std::string text, Unit* auction
     if (pos == std::string::npos) return false;
 
     std::string priceStr = text.substr(0, pos);
-    uint32 price = ChatHelper::parseMoney(priceStr);
+    uint32 price = 0;
+    if (ChatHelper::parseMoney(priceStr, price) != living::MoneyParseStatus::Ok)
+    {
+        // A malformed or out-of-range price must not post the auction at a zero
+        // or wrapped buyout.
+        ai->TellError(requester, "Invalid price: " + priceStr);
+        return false;
+    }
 
     std::list<Item*> found = ai->InventoryParseItems(text, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
     if (found.empty())
@@ -347,7 +354,14 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     if (pos == std::string::npos) return false;
 
     std::string priceStr = text.substr(0, pos);
-    uint32 price = ChatHelper::parseMoney(priceStr);
+    uint32 price = 0;
+    living::MoneyParseStatus priceStatus = ChatHelper::parseMoney(priceStr, price);
+    if (priceStatus == living::MoneyParseStatus::Invalid)
+    {
+        // A malformed price cap must not silently turn into "bid with no cap".
+        ai->TellError(requester, "Invalid price: " + priceStr);
+        return false;
+    }
 
     for (auto curAuction : map)
     {

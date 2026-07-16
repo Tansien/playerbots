@@ -904,7 +904,11 @@ bool ChatReplyAction::HandleLFGQuestsReply(Player* bot, ChatChannelSource chatCh
     std::set<uint32> matchingQuestIds;
     for (auto botQuestId : botQuestIds)
     {
-        if (messageQuestIds.count(botQuestId) != 0)
+        // GetAllCurrentQuestIds intentionally includes quarantined template-less
+        // slots (they occupy log capacity), but only a live quest may match here:
+        // an orphan used to select the bot and emit a reply with empty
+        // %quest_links.
+        if (messageQuestIds.count(botQuestId) != 0 && sObjectMgr.GetQuestTemplate(botQuestId))
         {
             matchingQuestIds.insert(botQuestId);
         }
@@ -925,7 +929,7 @@ bool ChatReplyAction::HandleLFGQuestsReply(Player* bot, ChatChannelSource chatCh
         placeholders["%quest_links"] = "";
         for (auto matchingQuestId : matchingQuestIds)
         {
-            // A quarantined orphan matches by ID but has no template to format.
+            // Matching already required a live template; this lookup only formats.
             if (Quest const* quest = sObjectMgr.GetQuestTemplate(matchingQuestId))
                 placeholders["%quest_links"] += bot->GetPlayerbotAI()->GetChatHelper()->formatQuest(quest);
         }
