@@ -123,6 +123,16 @@ int ListQuestsAction::ListQuests(Player* requester, bool completed, bool silent,
         std::ostringstream out;
 
         Quest const* pQuest = sObjectMgr.GetQuestTemplate(questId);
+        // An orphaned slot (quest ID present, template gone) is quarantined, not
+        // repaired, so it can sit in the log indefinitely; formatting it would
+        // dereference null.
+        if (!pQuest)
+        {
+            out << "quest " << questId << " (no template)";
+            ai->TellPlayer(requester, out);
+            continue;
+        }
+
         out << chat->formatQuest(pQuest);
 
         if (travelDetail == QUEST_TRAVEL_DETAIL_NONE)

@@ -714,7 +714,10 @@ bool ChatReplyAction::HandleToxicLinksReply(Player* bot, ChatChannelSource chatC
             continue;
 
         QuestStatus status = bot->GetQuestStatus(questId);
-        if (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_NONE)
+        // Skip quarantined orphans (no template): the pick below formats the
+        // template and would dereference null.
+        if ((status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_NONE)
+            && sObjectMgr.GetQuestTemplate(questId))
             incompleteQuests.push_back(questId);
     }
 
@@ -922,8 +925,9 @@ bool ChatReplyAction::HandleLFGQuestsReply(Player* bot, ChatChannelSource chatCh
         placeholders["%quest_links"] = "";
         for (auto matchingQuestId : matchingQuestIds)
         {
-            Quest const* quest = sObjectMgr.GetQuestTemplate(matchingQuestId);
-            placeholders["%quest_links"] += bot->GetPlayerbotAI()->GetChatHelper()->formatQuest(quest);
+            // A quarantined orphan matches by ID but has no template to format.
+            if (Quest const* quest = sObjectMgr.GetQuestTemplate(matchingQuestId))
+                placeholders["%quest_links"] += bot->GetPlayerbotAI()->GetChatHelper()->formatQuest(quest);
         }
 
         switch (chatChannelSource)
