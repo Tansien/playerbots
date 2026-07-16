@@ -1038,11 +1038,13 @@ uint32 ChatHelper::parseGender(const std::string& text)
         return GENDER_MALE;
     else if (boost::iequals(text, "female"))
         return GENDER_FEMALE;
-    else if (Qualified::isValidNumberString(text))
+    else
     {
-        uint8 gender = static_cast<uint32>(stoi(text));
-        if (gender == GENDER_MALE || gender == GENDER_FEMALE)
-            return gender;
+        // Chat-supplied token: the old isValidNumberString + stoi pair accepted a
+        // lone sign and threw on overflow.
+        uint32 gender = 0;
+        if (living::TryParseUInt32(text, gender) && (gender == GENDER_MALE || gender == GENDER_FEMALE))
+            return static_cast<uint8>(gender);
     }
 
     return GENDER_NONE;
@@ -1064,10 +1066,11 @@ Team ChatHelper::parseTeam(const std::string& text)
         return ALLIANCE;
     else if (boost::iequals(text, "horde"))
         return HORDE;
-    else if (Qualified::isValidNumberString(text))
+    else
     {
-        uint8 team = static_cast<uint32>(stoi(text));
-        if (team == ALLIANCE || team == HORDE)
+        // Same chat-supplied trust boundary as parseGender.
+        uint32 team = 0;
+        if (living::TryParseUInt32(text, team) && (team == ALLIANCE || team == HORDE))
             return (Team)team;
     }
 
@@ -1092,12 +1095,10 @@ uint32 ChatHelper::parseClass(const std::string& text)
         if (NormalizeChatToken(className) == normalized)
             return classId;
 
-    if (Qualified::isValidNumberString(normalized))
-    {
-        uint32 id = static_cast<uint32>(stoi(normalized));
-        if (classes.count(id))
-            return id;
-    }
+    // Same chat-supplied trust boundary as parseGender.
+    uint32 id = 0;
+    if (living::TryParseUInt32(normalized, id) && classes.count(id))
+        return id;
 
     return 0;
 }
@@ -1115,12 +1116,10 @@ uint32 ChatHelper::parseRace(const std::string& text)
         if (NormalizeChatToken(raceName) == normalized)
             return raceId;
 
-    if (Qualified::isValidNumberString(normalized))
-    {
-        uint32 id = static_cast<uint32>(stoi(normalized));
-        if (races.count(id))
-            return id;
-    }
+    // Same chat-supplied trust boundary as parseGender.
+    uint32 id = 0;
+    if (living::TryParseUInt32(normalized, id) && races.count(id))
+        return id;
 
     return 0;
 }

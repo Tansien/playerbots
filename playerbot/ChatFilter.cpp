@@ -1,5 +1,6 @@
 #include "playerbot.h"
 #include "ChatFilter.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "strategy/values/RtiTargetValue.h"
 #include "strategy/values/ItemUsageValue.h"
 #include "ChatHelper.h"
@@ -1186,15 +1187,21 @@ public:
 
             std::set<uint32> questIds = ChatHelper::ExtractAllQuestIds(questString);
 
-            if (questIds.empty() && Qualified::isValidNumberString(questString))
-                questIds.insert(stoi(questString));
+            // Inbound chat has no exception boundary: the old isValidNumberString +
+            // stoi pair accepted a lone "+" and threw on overflow ("@quest=9999999999"),
+            // and a valid-uint32 ID with no template reached formatQuest(nullptr).
+            uint32 bareQuestId = 0;
+            if (questIds.empty() && living::TryParseUInt32(questString, bareQuestId))
+                questIds.insert(bareQuestId);
             else
             {
                 for (auto& questId : questIds)
                 {
                     Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
-                    if (questTemplate)
-                        replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
+                    if (!questTemplate)
+                        continue;
+
+                    replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
                     replaceCaseInsensitive(message, ChatHelper::formatQuest(questTemplate), "");
                 }
             }

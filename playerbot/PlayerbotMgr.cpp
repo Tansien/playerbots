@@ -1,4 +1,5 @@
 #include "playerbot/playerbot.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "PlayerbotDbStore.h"
 #include "playerbot/PlayerbotFactory.h"
@@ -1238,7 +1239,13 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
         return "Self-bot is disabled";
     }
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    // Chat-supplied token: this stoull had no guard at all, so any non-numeric
+    // or overflowing param threw out of the command handler.
+    uint64 guidRaw = 0;
+    if (!living::TryParseUInt64(param, guidRaw))
+        return "Always: Error parsing " + param;
+
+    ObjectGuid guid = ObjectGuid(guidRaw);
     uint32 accountId = sObjectMgr.GetPlayerAccountIdByGUID(guid);
     std::string alwaysName;    
 
@@ -1809,10 +1816,13 @@ std::string PlayerbotHolder::HandleBotAddLogin(Player* bot, Player* master, cons
     if (bot)
         return "Player already logged in";
 
-    if (!Qualified::isValidNumberString(param))
+    // Chat-supplied token: the old isValidNumberString + stoull pair accepted a
+    // lone sign and threw on overflow.
+    uint64 guidRaw = 0;
+    if (!living::TryParseUInt64(param, guidRaw))
         return "Add: Error parsing " + param;
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    ObjectGuid guid = ObjectGuid(guidRaw);
 
     uint32 guildId = Player::GetGuildIdFromDB(guid);
     uint32 masterAccountId = master ? master->GetSession()->GetAccountId() : 0;
@@ -2103,8 +2113,9 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         std::string key = arg.substr(0, eqPos);
         std::string value = arg.substr(eqPos + 1);
 
-        if (key == "size" && Qualified::isValidNumberString(value))
-            groupSize = stoi(value);
+        uint32 sizeValue = 0;
+        if (key == "size" && living::TryParseUInt32(value, sizeValue))
+            groupSize = sizeValue;
         else
             passThroughParam += key + "=" + value + " ";
     }
@@ -2466,10 +2477,11 @@ std::string PlayerbotHolder::HandleBotDelete(Player* bot, Player* master, const 
     ObjectGuid guid;
     if (!bot)
     {
-        if (!Qualified::isValidNumberString(param))
+        uint64 guidRaw = 0;
+        if (!living::TryParseUInt64(param, guidRaw))
             return "Add: Error parsing " + param;
 
-        guid = ObjectGuid(uint64(std::stoull(param)));
+        guid = ObjectGuid(guidRaw);
     }
     else
     {

@@ -107,3 +107,19 @@ LIVING_TEST(numeric_chat_link_ids_reject_overflow_without_throwing)
     LIVING_CHECK(!living::TryParseUInt32("12abc", value));
     LIVING_CHECK(!living::TryParseUInt32("", value));
 }
+
+LIVING_TEST(numeric_uint64_guid_parse_shares_the_contract)
+{
+    // Chat/console GUID values: same rules as TryParseUInt32, 64-bit range.
+    uint64_t value = 0;
+    LIVING_CHECK(living::TryParseUInt64("18446744073709551615", value)); // UINT64_MAX
+    LIVING_CHECK(value == 18446744073709551615ull);
+    LIVING_CHECK(living::TryParseUInt64("4294967296", value)); // above uint32
+    LIVING_CHECK(value == 4294967296ull);
+
+    LIVING_CHECK(!living::TryParseUInt64("18446744073709551616", value)); // UINT64_MAX + 1
+    LIVING_CHECK(!living::TryParseUInt64("+", value));
+    LIVING_CHECK(!living::TryParseUInt64("-1", value));
+    LIVING_CHECK(!living::TryParseUInt64("", value));
+    LIVING_CHECK(!living::TryParseUInt64(std::string(4096, '9'), value));
+}
