@@ -65,7 +65,7 @@ LIVING_TEST(quest_slots_occupancy_counts_every_nonzero_slot)
     LIVING_CHECK(!IsQuestSlotOccupied(0)); // an empty slot is the only free slot
 }
 
-LIVING_TEST(quest_slots_all_orphan_log_is_full_and_repairable)
+LIVING_TEST(quest_slots_all_orphan_log_is_full_and_quarantined)
 {
     // A log made entirely of orphans is FULL, not empty: the old rule reported it
     // as completely free, so acceptance wedged against a core that refused to add.
@@ -77,16 +77,51 @@ LIVING_TEST(quest_slots_all_orphan_log_is_full_and_repairable)
     LIVING_CHECK(FreeSlots(allOrphans) == 0);
     LIVING_CHECK(CountOccupiedByTemplate(allOrphans) == 0); // the old, wrong answer
 
-    // Every one of them is identified as repairable, so cleanup can free the log
-    // instead of being unable to remove anything.
+    // Every orphan is identified and the whole log is quarantined: automated
+    // cleanup is denied outright. Clearing slots is NOT a repair - it leaves quest
+    // status, source items, and timers behind.
+    QuestLogPreflight preflight;
     for (Slot const& slot : allOrphans)
-        LIVING_CHECK(IsOrphanedQuestSlot(slot.questId, slot.hasTemplate));
+        LIVING_CHECK(preflight.Observe(slot.questId, slot.hasTemplate)); // each one logged
+    LIVING_CHECK(preflight.occupied == MAX_SLOTS);
+    LIVING_CHECK(preflight.orphans == MAX_SLOTS);
+    LIVING_CHECK(!preflight.CleanupPermitted());
+}
 
-    // Clearing them (SetQuestSlot(slot, 0) in the action) frees real capacity.
-    std::vector<Slot> repaired;
-    for (Slot const& slot : allOrphans)
-        repaired.push_back(IsOrphanedQuestSlot(slot.questId, slot.hasTemplate) ? Slot{ 0, false } : slot);
-    LIVING_CHECK(FreeSlots(repaired) == MAX_SLOTS);
+LIVING_TEST(quest_slots_cleanup_preflight_quarantines_before_any_pruning)
+{
+    // The exact production decision CleanQuestLogAction runs before its first
+    // pruning pass. The critical case: a full log of 24 orphans plus ONE valid
+    // quest. Pruning "around" the orphans would drop the only valid quest to gain
+    // capacity the orphans still hold, so the preflight must deny cleanup entirely
+    // - zero drops, zero slot mutations.
+    QuestLogPreflight mixedFull;
+    for (uint8_t i = 0; i < 24; ++i)
+        mixedFull.Observe(uint32_t(6000 + i), false); // orphans
+    mixedFull.Observe(777, true);                     // the one valid quest
+
+    LIVING_CHECK(mixedFull.occupied == 25);
+    LIVING_CHECK(mixedFull.orphans == 24);
+    LIVING_CHECK(!mixedFull.CleanupPermitted()); // nothing may be dropped
+
+    // ONE orphan anywhere is enough to quarantine the whole log.
+    QuestLogPreflight oneOrphan;
+    oneOrphan.Observe(100, true);
+    oneOrphan.Observe(4242, false);
+    oneOrphan.Observe(101, true);
+    LIVING_CHECK(!oneOrphan.CleanupPermitted());
+
+    // A healthy log (any mix of valid quests and empty slots) permits cleanup.
+    QuestLogPreflight healthy;
+    healthy.Observe(100, true);
+    healthy.Observe(0, false); // empty slot, ignored
+    healthy.Observe(101, true);
+    LIVING_CHECK(healthy.occupied == 2);
+    LIVING_CHECK(healthy.orphans == 0);
+    LIVING_CHECK(healthy.CleanupPermitted());
+
+    // An empty log trivially permits cleanup (there is nothing to protect).
+    LIVING_CHECK(QuestLogPreflight{}.CleanupPermitted());
 }
 
 LIVING_TEST(quest_slots_orphan_rule_never_targets_valid_quests)
@@ -99,21 +134,22 @@ LIVING_TEST(quest_slots_orphan_rule_never_targets_valid_quests)
     LIVING_CHECK(!IsOrphanedQuestSlot(0, false));   // empty slot is not an orphan
     LIVING_CHECK(!IsOrphanedQuestSlot(0, true));
 
-    // In a mixed log, exactly the orphans are repaired and the valid quests survive.
+    // In a mixed log, exactly the orphans are detected; valid quests are never
+    // classified as orphans, and detection is observation only - no repair exists.
     std::vector<Slot> const mixed = {
         { 100, true }, { 4242, false }, { 101, true }, { 9999, false }
     };
 
-    uint8_t repairs = 0;
+    uint8_t orphans = 0;
     uint8_t survivors = 0;
     for (Slot const& slot : mixed)
     {
         if (IsOrphanedQuestSlot(slot.questId, slot.hasTemplate))
-            ++repairs;
+            ++orphans;
         else if (IsQuestSlotOccupied(slot.questId))
             ++survivors;
     }
 
-    LIVING_CHECK(repairs == 2);
+    LIVING_CHECK(orphans == 2);
     LIVING_CHECK(survivors == 2);
 }

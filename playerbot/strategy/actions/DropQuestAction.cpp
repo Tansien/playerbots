@@ -55,6 +55,26 @@ bool CleanQuestLogAction::Execute(Event& event)
     if (ai->HasActivePlayerMaster())
         return false;
 
+    // Complete non-mutating preflight BEFORE any pruning pass: one orphaned slot
+    // quarantines the whole log from automated cleanup. The pruning passes below
+    // drop VALID quests toward a capacity target, so pruning "around" an orphan
+    // sacrifices real quests for capacity the orphan still holds (24 orphans plus
+    // one valid quest used to drop the only valid quest and keep all 24 orphans).
+    // Orphans stay counted, logged, and untouched; cleanup fails instead.
+    living::QuestLogPreflight preflight;
+    for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+    {
+        uint32 questId = bot->GetQuestSlotQuestId(slot);
+        bool const hasTemplate = questId != 0 && sObjectMgr.GetQuestTemplate(questId) != nullptr;
+        if (preflight.Observe(questId, hasTemplate))
+            sLog.outError("Bot %s: quarantined orphaned quest-log slot %u (quest %u has no template); "
+                "automated quest-log cleanup is disabled for this character until a core-backed atomic repair exists",
+                bot->GetName(), uint32(slot), questId);
+    }
+
+    if (!preflight.CleanupPermitted())
+        return false;
+
     uint8 totalQuests = 0;
 
     DropQuestType(requester, totalQuests); //Count the total quests
@@ -125,20 +145,10 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
             continue;
         }
 
+        // The preflight in Execute quarantines any log containing an orphan before
+        // this runs, so a missing template here is only a race backstop: skip, never
+        // drop or clear.
         Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
-        if (living::IsOrphanedQuestSlot(questId, quest != nullptr))
-        {
-            // Quarantine, do not repair. Clearing just the slot left the quest status
-            // map/DB, source items, and timers behind, so a restored template would
-            // leave an invisible status the character could never re-accept. The
-            // orphan stays counted as occupied (capacity stays honest) and untouched;
-            // automated cleanup fails below rather than discarding valid quests.
-            sLog.outError("Bot %s: quarantined orphaned quest-log slot %u (quest %u has no template); "
-                "automated cleanup cannot free this slot until a core-backed atomic repair exists",
-                bot->GetName(), uint32(slot), questId);
-            continue;
-        }
-
         if (!quest)
             continue;
 
