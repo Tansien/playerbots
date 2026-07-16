@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 
 namespace living
 {
@@ -21,23 +22,42 @@ namespace living
     };
 
     // Per-run accounting for group creation. Counts only actually created bots
-    // and tells the caller when to stop, so counters, class tallies and role
-    // quotas can never drift from persisted reality.
+    // - tallied by the class the creation ACTUALLY persisted, never by the
+    // preselected assumption - and tells the caller when to stop, so counters,
+    // class tallies and role quotas can never drift from persisted reality.
     struct GroupCreationLedger
     {
         uint32_t created = 0;
+        std::map<uint8_t, uint32_t> createdByClass;
 
-        // Records one attempt. Returns true when the run must stop (terminal
-        // failure); quota/counter updates belong on Counted() outcomes only.
-        bool Record(BotCreateStatus status)
+        // Records one attempt with the persisted class (ignored unless the
+        // attempt actually created a bot). Returns true when the run must stop
+        // (terminal failure); quota/counter updates belong on Counted() outcomes
+        // only.
+        bool Record(BotCreateStatus status, uint8_t actualClass = 0)
         {
             if (status == BotCreateStatus::Created)
+            {
                 ++created;
+                ++createdByClass[actualClass];
+            }
             return status == BotCreateStatus::TerminalFailure;
         }
 
         static bool Counted(BotCreateStatus status) { return status == BotCreateStatus::Created; }
     };
+
+    // Consumes one unit of a role/class quota, refusing to wrap: decrementing a
+    // zero quota corrupted the remaining allowance for the whole run. Returns
+    // whether a unit was actually consumed.
+    inline bool TryConsumeQuota(uint32_t& counter)
+    {
+        if (counter == 0)
+            return false;
+
+        --counter;
+        return true;
+    }
 
     // Streamed minimum selection with an explicit "nothing selected yet" state.
     // Replaces the -1.0f sentinel idiom where every nonnegative distance compared

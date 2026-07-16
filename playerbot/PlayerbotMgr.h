@@ -20,12 +20,43 @@ typedef std::map<std::string, std::set<std::string> > PlayerBotErrorMap;
 
 // Typed outcome of PlayerbotHolder::CreateBot. Callers must branch on `status`
 // (and use `guid` for the created character); `messages` is display text only
-// and must never be parsed to infer success.
+// and must never be parsed to infer success. `createdClass`/`createdRole` are
+// the values the creation ACTUALLY persisted - group accounting must use these,
+// never its preselected assumptions.
 struct BotCreationResult
 {
     living::BotCreateStatus status = living::BotCreateStatus::TerminalFailure;
     ObjectGuid guid;
+    uint8 createdClass = 0;
+    uint8 createdRole = 0; // ai::BotRoles derived from the created character
     std::list<std::string> messages;
+};
+
+// Typed, fully validated CreateBot arguments. The chat-command entry point
+// builds this via Parse (which rejects unknown keys, bare tokens, duplicates,
+// empty explicit values and malformed booleans BEFORE any mutation); internal
+// callers such as HandleGroup construct it directly instead of assembling and
+// reparsing an argument string.
+struct CreateBotOptions
+{
+    std::string name;                  // empty = generate a random name; an explicit empty "name=" is rejected by Parse
+    std::string testName;
+    uint8 race = 0;                    // 0 = absent -> random
+    uint8 cls = 0;                     // 0 = absent -> random
+    uint32 level = 0;                  // 0 = absent -> level 1
+    uint8 gender = GENDER_NONE;        // absent -> random
+    Team team = TEAM_BOTH_ALLOWED;     // absent -> master's team
+    uint8 role = 0;                    // ai::BotRoles; BOT_ROLE_NONE = auto talents
+    bool autoAdd = false;
+    bool temporary = false;
+    std::string groupWith;
+    std::string gear = "default";
+
+    // Parses and validates a chat-supplied argument string. Explicit names are
+    // normalized and checked with the same rules the cores' character-creation
+    // handler uses (syntax, length, language, reserved names). Returns false
+    // with `error` set and no partial state the caller may act on.
+    bool Parse(Player* master, std::string const& param, std::string& error);
 };
 
 class PlayerbotHolder : public PlayerbotAIBase
@@ -61,7 +92,13 @@ public:
     static std::string GetCommandTexts(const std::string& command);
     static std::unordered_map<std::string, std::string> GetCommandTexts();
 
+    // String entry point: parses/validates into CreateBotOptions, then defers
+    // to the typed entry point below.
     BotCreationResult CreateBot(Player* master, const std::string param);
+    // Typed entry point: options are assumed validated (Parse or an internal
+    // constructor like HandleGroup). Performs the name-collision lookup and all
+    // account/character mutation.
+    BotCreationResult CreateBot(Player* master, CreateBotOptions const& options);
     bool DeleteBot(ObjectGuid guid, bool allowInstant = true);
 #ifdef GenerateBotTests
     void DepositTestResult(const std::string& testName, const std::string& result);

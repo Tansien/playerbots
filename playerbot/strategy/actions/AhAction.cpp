@@ -1,6 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "AhAction.h"
+#include "playerbot/living/util/LivingAuction.h"
 #include "playerbot/strategy/values/ItemCountValue.h"
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/BudgetValues.h"
@@ -138,6 +139,16 @@ bool AhAction::PostItem(Player* requester, Item* item, uint32 price, Unit* aucti
 
     uint32 cnt = item->GetCount();
 
+    // Checked 95% opening bid: `price * 95` in uint32 wrapped for any valid
+    // buyout above ~45,193g, turning a cap-adjacent buyout into a tiny opening
+    // bid on a real posted auction.
+    uint32 openingBid = 0;
+    if (!living::TryComputeOpeningBid(price, MAX_MONEY_AMOUNT, openingBid))
+    {
+        ai->TellError(requester, "Invalid price: " + ChatHelper::formatMoney(price));
+        return false;
+    }
+
     WorldPacket packet;
     packet << auctioneer->GetObjectGuid();
 #ifdef MANGOSBOT_TWO
@@ -147,8 +158,8 @@ bool AhAction::PostItem(Player* requester, Item* item, uint32 price, Unit* aucti
 #ifdef MANGOSBOT_TWO
     packet << cnt;
 #endif
-    packet << price * 95 / 100; //bid price?
-    packet << price; //buyout price?
+    packet << openingBid; //bid price
+    packet << price; //buyout price
     packet << time;
 
     bot->GetSession()->HandleAuctionSellItem(packet);
@@ -350,59 +361,90 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
         return bidItems;
     }
 
-    int pos = text.find(" ");
-    if (pos == std::string::npos) return false;
-
-    std::string priceStr = text.substr(0, pos);
-    uint32 price = 0;
-    living::MoneyParseStatus priceStatus = ChatHelper::parseMoney(priceStr, price);
-    if (priceStatus == living::MoneyParseStatus::Invalid)
+    // Documented syntax: ah bid <item link or item name> <budget>. The budget is
+    // the trailing money token; everything before it is the item query. The old
+    // parse read the FIRST token as money and matched names against the whole
+    // text (budget included), so the documented forms could not match, an exact
+    // item name with no budget matched with price 0, and a normal no-buyout
+    // auction produced cost = min(0, ...) = 0 and divided by it.
+    size_t const lastSpace = text.rfind(' ');
+    if (lastSpace == std::string::npos)
     {
-        // A malformed price cap must not silently turn into "bid with no cap".
-        ai->TellError(requester, "Invalid price: " + priceStr);
+        ai->TellError(requester, "Usage: ah bid <item link or name> <budget>");
         return false;
     }
+
+    std::string const budgetStr = text.substr(lastSpace + 1);
+    std::string itemQuery = text.substr(0, lastSpace);
+    while (!itemQuery.empty() && itemQuery.back() == ' ')
+        itemQuery.pop_back();
+
+    // A valid nonzero budget is required: NoMoney is not an unlimited bid.
+    uint32 budget = 0;
+    if (ChatHelper::parseMoney(budgetStr, budget) != living::MoneyParseStatus::Ok || budget == 0 || itemQuery.empty())
+    {
+        ai->TellError(requester, "Usage: ah bid <item link or name> <budget> (a nonzero amount like 5g)");
+        return false;
+    }
+
+    // Links match by item template ID; plain text matches item names
+    // case-insensitively.
+    std::set<uint32> const queryItemIds = ChatHelper::ExtractAllItemIds(itemQuery);
+
+    struct BidCandidate
+    {
+        AuctionEntry* auction;
+        uint32 cost;
+        uint32 power;
+    };
+    std::vector<BidCandidate> candidates;
 
     for (auto curAuction : map)
     {
         auction = curAuction.second;
 
-        if (auction->owner == bot->GetGUIDLow())
+        if (!auction || auction->owner == bot->GetGUIDLow())
             continue;
 
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
 
-        if (!proto)
+        if (!proto || !proto->Name1)
             continue;
 
-        if(!proto->Name1)
+        if (!queryItemIds.empty())
+        {
+            if (queryItemIds.find(auction->itemTemplate) == queryItemIds.end())
+                continue;
+        }
+        else if (!strstri(proto->Name1, itemQuery.c_str()))
             continue;
 
-        if (!strstri(proto->Name1, text.c_str()))
+        // ONE exact bid cost per candidate, mirroring the core handler's
+        // minimum-bid/outbid rules (start bid, current bid + core outbid
+        // increment, buyout). The same value is stored with the candidate and
+        // later sent in the packet - never recomputed.
+        uint32 cost = 0;
+        if (!living::TryComputeAuctionBidCost(auction->startbid, auction->bid, auction->GetAuctionOutBid(),
+                auction->buyout, MAX_MONEY_AMOUNT, cost))
             continue;
 
-        if (price && auction->bid + 5 > price)
+        if (cost > budget || cost > bot->GetMoney())
             continue;
 
-        uint32 cost = std::min(auction->buyout, uint32(std::max(auction->bid, auction->startbid) * frand(1.05f, 1.25f)));
+        uint32 const power = auction->itemCount * 1000 / cost; // cost >= 1 by contract
 
-        uint32 power = auction->itemCount;
-        power *= 1000;
-        power /= cost;
-
-        auctionPowers.push_back(std::make_pair(auction, power));
+        candidates.push_back({ auction, cost, power });
     }
 
-    if (auctionPowers.empty())
+    if (candidates.empty())
         return false;
 
-    std::sort(auctionPowers.begin(), auctionPowers.end(), [](std::pair<AuctionEntry*, uint32> i, std::pair<AuctionEntry*, uint32> j) {return i > j; });
+    std::sort(candidates.begin(), candidates.end(),
+        [](BidCandidate const& a, BidCandidate const& b) { return a.power > b.power; });
 
-    auction = auctionPowers.begin()->first;
-
-    uint32 cost = std::min(auction->buyout, uint32(std::max(auction->bid, auction->startbid) * frand(1.05f, 1.25f)));
-
-    return BidItem(requester, auction, cost, auctioneer, cost == auction->buyout);
+    BidCandidate const& best = candidates.front();
+    return BidItem(requester, best.auction, best.cost, auctioneer,
+        best.auction->buyout > 0 && best.cost == best.auction->buyout);
 }
 
 bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price, Unit* auctioneer, bool isBuyout, std::string reason)

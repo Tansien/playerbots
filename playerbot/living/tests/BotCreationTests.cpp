@@ -44,6 +44,36 @@ LIVING_TEST(bot_creation_ledger_terminal_failure_stops_the_run)
     LIVING_CHECK(!GroupCreationLedger::Counted(BotCreateStatus::TerminalFailure));
 }
 
+LIVING_TEST(bot_creation_ledger_tallies_the_persisted_class_not_the_assumption)
+{
+    // HandleGroup preselects a class per attempt but the ledger records what the
+    // creation ACTUALLY persisted; the debug summary and quota accounting read
+    // these values. Mixed success/failure: failures never tally a class.
+    GroupCreationLedger ledger;
+    ledger.Record(BotCreateStatus::Created, 1 /*warrior*/);
+    ledger.Record(BotCreateStatus::RetryableFailure, 8 /*mage - ignored*/);
+    ledger.Record(BotCreateStatus::Created, 5 /*priest*/);
+    ledger.Record(BotCreateStatus::Created, 1 /*warrior*/);
+
+    LIVING_CHECK(ledger.created == 3);
+    LIVING_CHECK(ledger.createdByClass.size() == 2);
+    LIVING_CHECK(ledger.createdByClass[1] == 2);
+    LIVING_CHECK(ledger.createdByClass[5] == 1);
+    LIVING_CHECK(ledger.createdByClass.find(8) == ledger.createdByClass.end());
+}
+
+LIVING_TEST(bot_creation_quota_consumption_never_wraps)
+{
+    // Role/class quotas are charged to the ACTUAL persisted role. When spec
+    // selection lands on a role whose quota is already 0, the decrement must not
+    // wrap the uint32 into a huge allowance.
+    uint32_t quota = 2;
+    LIVING_CHECK(TryConsumeQuota(quota) && quota == 1);
+    LIVING_CHECK(TryConsumeQuota(quota) && quota == 0);
+    LIVING_CHECK(!TryConsumeQuota(quota));
+    LIVING_CHECK(quota == 0); // exhausted stays exhausted, no 0xFFFFFFFF
+}
+
 // MinimumTracker is the closest-inn selection RandomTeleportForLevel streams
 // squared distances through. The old -1.0f sentinel compared every nonnegative
 // distance as "not closer", so no inn was ever selected.

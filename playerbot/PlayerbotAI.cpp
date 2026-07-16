@@ -1242,6 +1242,14 @@ void PlayerbotAI::HandleTeleportAck()
     if (IsRealPlayer())
         bot->SendHeartBeat();
 
+    // If a manager-driven random relocation was pending on this bot and the
+    // acknowledgement above landed it on the accepted destination, finalize it
+    // now (Refresh, homebind, inn binding, revive markers, scheduling).
+    // FinalizeRelocation runs Refresh, which resets the AI - skip the plain
+    // Reset in that case so the acknowledgement resets exactly once.
+    if (sRandomPlayerbotMgr.FinalizeRelocation(bot))
+        return;
+
     Reset();
 }
 

@@ -1,5 +1,6 @@
 #include "playerbot.h"
 #include "ChatFilter.h"
+#include "playerbot/living/util/LivingChatSelector.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "strategy/values/RtiTargetValue.h"
 #include "strategy/values/ItemUsageValue.h"
@@ -1108,46 +1109,36 @@ public:
 
     virtual std::string Filter(std::string message) override
     {
-        // Inbound chat has no exception boundary before authorization: the old
-        // stoul on the raw selector threw on "@random=+ hello" or an oversized
-        // integer. Parse ONLY the selector token, require full consumption and
-        // 0..100, and reject a malformed selector without dispatching the trailing
-        // command; the remaining command is preserved by the base Filter strip.
-        for (auto const& prefix : { std::string("@random="), std::string("@fixedrandom=") })
+        // The complete selector decision lives in living::ParseRandomChatSelector
+        // (nonthrowing exact parse, all four documented forms). The decision here
+        // is made EXACTLY ONCE per message: CompositeChatFilter re-runs every
+        // filter filters.size() times, so a rejected draw that returned the
+        // untouched selector was re-drawn up to 16 times ("@random=25" dispatched
+        // ~99%). A rejected decision returns the terminal empty result instead.
+        living::RandomChatSelector selector;
+        switch (living::ParseRandomChatSelector(message, selector))
         {
-            if (message.find(prefix) != 0)
-                continue;
-
-            size_t const spacePos = message.find(' ');
-            size_t const valueLen = (spacePos == std::string::npos ? message.size() : spacePos) - prefix.size();
-            std::string const value = message.substr(prefix.size(), valueLen);
-
-            uint32 chance = 0;
-            if (!living::TryParseUInt32InRange(value, 0, 100, chance))
-                return "";
-
-            bool const selected = prefix == "@random="
-                ? urand(0, 100) < chance
-                : ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER) < chance;
-            if (!selected)
+            case living::ChatSelectorParse::NotSelector:
                 return message;
-
-            // Selector matched: strip it, keeping the remaining command. With no
-            // command after the selector there is nothing to dispatch.
-            return spacePos == std::string::npos ? "" : ChatFilter::Filter(message);
-        }
-        if (message.find("@random") == 0)
-        {
-            if (urand(0, 100) < 50)
-                return ChatFilter::Filter(message);
-        }
-        if (message.find("@fixedrandom") == 0)
-        {
-            if (ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER) < 50)
-                return ChatFilter::Filter(message);
+            case living::ChatSelectorParse::Malformed:
+                return ""; // never dispatch the trailing command
+            case living::ChatSelectorParse::Parsed:
+                break;
         }
 
-        return message;
+        // One draw from 0..99 against a 0..100 chance: 0% never selects, 100%
+        // always selects. The fixed draw shares the exact same domain (the
+        // default GetFixedBotNumber maxNum of 100 is inclusive, i.e. 101 values).
+        uint32 const draw = selector.fixed
+            ? ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER, living::RANDOM_CHAT_DRAW_MAX)
+            : urand(0, living::RANDOM_CHAT_DRAW_MAX);
+
+        if (!living::RandomChatSelected(selector.chance, draw))
+            return ""; // terminal: the composite loop must not retry the draw
+
+        // Selected: the selector is stripped exactly once; with no trailing
+        // command there is nothing to dispatch.
+        return selector.remainder;
     }
 };
 
@@ -1220,16 +1211,18 @@ public:
                     bareRemainder = questString.substr(spacePos + 1);
             }
 
-            // Match only quests that still have a live template: a quarantined
-            // orphan slot occupies the log for capacity but is not a live quest and
-            // must not select this bot.
+            // The help text promises bots that "have the quest and have yet
+            // finished it": match through the repaired incomplete-quest API, which
+            // requires the ID to be in the log, an INCOMPLETE/NONE status (a
+            // completed quest no longer selects), and a live template (a
+            // quarantined orphan slot occupies the log for capacity but is not a
+            // live quest and must not select this bot).
             Player* bot = ai->GetBot();
-            auto botQuestIds = bot->GetPlayerbotAI()->GetAllCurrentQuestIds();
 
             bool matched = false;
             for (auto questId : questIds)
             {
-                if (botQuestIds.count(questId) != 0 && sObjectMgr.GetQuestTemplate(questId))
+                if (bot->GetPlayerbotAI()->HasCurrentIncompleteQuestWithId(questId))
                 {
                     matched = true;
                     break;
