@@ -5,6 +5,7 @@
 #include "PlayerbotAIBase.h"
 #include "PlayerbotMgr.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/living/util/LivingRelocation.h"
 #include "WorldPosition.h"
 #include <map>
 #include <list>
@@ -107,16 +108,27 @@ public:
         void SetTradeDiscount(Player* bot, Player* master, uint32 value);
         uint32 GetTradeDiscount(Player* bot, Player* master);
         void Refresh(Player* bot);
-        // All relocation/recovery entry points return true only when the bot was
-        // actually relocated (and, for Revive, recovered), so callers never report
-        // success or clear bookkeeping after a refused/failed attempt.
-        bool RandomTeleportForLevel(Player* bot, bool activeOnly);
-        bool RandomTeleportForLevel(Player* bot) { return RandomTeleportForLevel(bot, true); }
-        bool RandomTeleportForRpg(Player* bot, bool activeOnly);
-        bool RandomTeleportForRpg(Player* bot) { return RandomTeleportForRpg(bot, true); }
+        // Relocation/recovery entry points return a typed outcome. In the pinned
+        // cores TeleportTo QUEUES a near/far transfer, so acceptance is Pending -
+        // Refresh, homebind, inn binding, revive-marker clearing and scheduling
+        // are all deferred to FinalizeRelocation, which runs from the teleport
+        // acknowledgement. Rejected means nothing was mutated.
+        living::RelocationOutcome RandomTeleportForLevel(Player* bot, bool activeOnly, bool scheduleNextOnCompletion = false, bool reviveRecovery = false);
+        living::RelocationOutcome RandomTeleportForLevel(Player* bot) { return RandomTeleportForLevel(bot, true); }
+        living::RelocationOutcome RandomTeleportForRpg(Player* bot, bool activeOnly, bool scheduleNextOnCompletion = false);
+        living::RelocationOutcome RandomTeleportForRpg(Player* bot) { return RandomTeleportForRpg(bot, true); }
         int GetMaxAllowedBotCount();
         bool ProcessBot(Player* player);
-        bool Revive(Player* player);
+        living::RelocationOutcome Revive(Player* player);
+        // Finalizes the bot's pending relocation after its teleport
+        // acknowledgement: verifies the bot is in-world, no longer teleporting,
+        // and standing on the exact accepted destination, then (exactly once)
+        // runs Refresh, homebind/inn binding, revive-marker clearing and event
+        // scheduling. Returns true when a pending relocation was finalized.
+        bool FinalizeRelocation(Player* bot);
+        // Drops a pending relocation without finalizing it (logout/removal/
+        // relogin). Retry markers are untouched.
+        void CancelPendingRelocation(uint32 botGuid);
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
@@ -191,8 +203,9 @@ public:
         uint32 AddRandomBots();
         bool ProcessBot(uint32 bot);
         void ScheduleRandomize(uint32 bot, uint32 time);
-        bool RandomTeleport(Player* bot);
-        bool RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, bool hearth = false, bool activeOnly = false);
+        living::RelocationOutcome RandomTeleport(Player* bot, bool reviveRecovery = false);
+        living::RelocationOutcome RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, living::PendingRelocation flags, bool activeOnly = false);
+        living::RelocationTracker relocations;
         uint32 GetZoneLevel(uint16 mapId, float teleX, float teleY, float teleZ);
         void PrepareTeleportCache();
         typedef std::list<std::string> (RandomPlayerbotMgr::*ConsoleCommandHandler) (std::string param);

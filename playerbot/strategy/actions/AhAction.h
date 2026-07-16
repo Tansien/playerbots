@@ -38,9 +38,11 @@ namespace ai
         {
             return "This command will make bots bid on a specific item with a specific budget on a nearby auctionhouse.\n"
                 "The highest item/gold auction will be used that falls below the given budget.\n"
-                "Usage: ah bid [itemlink] <money>\n"
+                "Usage: ah bid <itemlink or item name> <money>\n"
+                "The trailing money amount is a required nonzero budget; the bid uses the auction's exact minimum acceptable cost within it.\n"
                 "Example: ah bid vendor (bid on items based on item use)\n"
-                "Example: ah bid [itemlink] 5g\n";
+                "Example: ah bid [itemlink] 5g\n"
+                "Example: ah bid copper ore 20s\n";
         }
         virtual std::vector<std::string> GetUsedActions() { return {}; }
         virtual std::vector<std::string> GetUsedValues() { return { "nearest npcs", "item usage", "free money for" }; }

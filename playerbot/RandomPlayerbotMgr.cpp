@@ -2,6 +2,7 @@
 
 #include "playerbot/playerbot.h"
 #include "playerbot/living/util/LivingBotCreation.h"
+#include "playerbot/living/util/LivingCommandSplit.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "Maps/MapManager.h"
@@ -2358,12 +2359,11 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
             if (sPlayerbotAIConfig.enableRandomTeleports)
             {
                 sLog.outDetail("Bot #%d %s:%d <%s>: sent to grind", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
-                // Schedule the next teleport only when this one happened: marking a
-                // failed attempt as done converted it into completed work for the
-                // whole (long, random) teleport interval. On failure the event value
-                // stays 0 and the next update cycle retries.
-                if (RandomTeleportForLevel(player, true))
-                    ScheduleTeleport(bot);
+                // The next teleport is scheduled in FinalizeRelocation, only once
+                // this one actually completed: accepted asynchronous work is not
+                // completed work. On rejection (or an acknowledgement that never
+                // arrives) the event value stays 0 and the next cycle retries.
+                RandomTeleportForLevel(player, true, /*scheduleNextOnCompletion*/ true);
             }
             else
             {
@@ -2376,34 +2376,118 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
     return false;
 }
 
-bool RandomPlayerbotMgr::Revive(Player* player)
+living::RelocationOutcome RandomPlayerbotMgr::Revive(Player* player)
 {
-    uint32 bot = player->GetGUIDLow();
-
-    // Attempt the recovery FIRST: the dead/revive markers used to be cleared up
-    // front, so a refused relocation (e.g. a grouped bot) left the bot dead with
-    // its bookkeeping gone and the command still reporting success.
-    bool recovered;
+    // Recovery is acknowledgement-driven: the dead/revive markers are cleared in
+    // FinalizeRelocation, and only once the bot has actually been resurrected
+    // there. The markers used to be cleared up front (later, on acceptance), so
+    // a refused - or accepted-but-never-completed - relocation left the bot dead
+    // with its retry bookkeeping gone and the command still reporting success.
     if (sServerFacade.GetDeathState(player) == CORPSE)
-    {
-        recovered = RandomTeleport(player);
-    }
-    else
-    {
-        recovered = RandomTeleportForLevel(player, false);
-    }
+        return RandomTeleport(player, /*reviveRecovery*/ true);
 
-    if (!recovered)
+    return RandomTeleportForLevel(player, false, false, /*reviveRecovery*/ true);
+}
+
+bool RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
+{
+    // The acknowledgement is complete only when the bot is back in-world and no
+    // longer teleporting; until then the record stays pending.
+    if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported())
         return false;
 
-    //sLog.outString("Bot %d revived", bot);
-    SetEventValue(bot, "dead", 0, 0);
-    SetEventValue(bot, "revive", 0, 0);
+    // Complete() also verifies the bot is standing on the EXACT destination the
+    // accepted TeleportTo was given; a stale or foreign acknowledgement does not
+    // match and finalizes nothing. The record is erased on success, so
+    // completion runs exactly once.
+    living::PendingRelocation record;
+    if (!relocations.Complete(bot->GetGUIDLow(), bot->GetMapId(),
+            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), record))
+        return false;
+
+    uint32 const botGuid = bot->GetGUIDLow();
+
+    // The homebind reuses the exact accepted destination (and its area, resolved
+    // when the candidate was validated), never a cached pre-adjustment location.
+    if (record.setHomebind)
+        bot->SetHomebindToLocation(WorldLocation(record.mapId, record.x, record.y, record.z, record.orientation), record.homebindAreaId);
+
+    // Refresh resurrects/repairs/refills and resets the AI - exactly once, and
+    // only now that the bot demonstrably arrived (it exits early during a far
+    // transfer, which is why running it on acceptance silently did nothing).
+    Refresh(bot);
+
+    if (record.reviveRecovery)
+    {
+        // Clear the retry markers only after ACTUAL recovery. If the bot is
+        // somehow still dead (Refresh is guarded against battlegrounds), the
+        // markers stay and the next update cycle retries the revive.
+        if (!sServerFacade.UnitIsDead(bot))
+        {
+            SetEventValue(botGuid, "dead", 0, 0);
+            SetEventValue(botGuid, "revive", 0, 0);
+        }
+        else
+        {
+            sLog.outDetail("Relocation of bot %s completed but the bot is still dead; revive markers kept", bot->GetName());
+        }
+    }
+
+    // Closest-inn selection runs from the post-acknowledgement position - the
+    // pre-ack origin used to be measured instead. The old -1.0f sentinel also
+    // made every nonnegative squared distance compare as "not closer", so no inn
+    // was ever selected and the bind packet never sent.
+    if (record.bindInn)
+    {
+        WorldPosition botPos(bot);
+
+        ObjectGuid closestInn;
+        living::MinimumTracker closest;
+        for (auto& [innGuid, innPosition] : innCacheLevel[bot->getRace()][bot->GetLevel()])
+        {
+            if (closest.Consider(botPos.sqDistance(innPosition)))
+                closestInn = innGuid;
+        }
+
+        if (closestInn)
+        {
+            WorldPacket data(SMSG_TRAINER_BUY_SUCCEEDED, (8 + 4));
+            data << closestInn;
+            data << uint32(3286);                               // Bind
+            bot->GetSession()->SendPacket(data);
+        }
+    }
+
+    //Travel cooldown for 10 minutes.
+    if (record.rpgTravelCooldown && bot->GetPlayerbotAI())
+    {
+        AiObjectContext* context = bot->GetPlayerbotAI()->GetAiObjectContext();
+        TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target");
+
+        sTravelMgr.SetNullTravelTarget(travelTarget);
+        travelTarget->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
+        travelTarget->SetExpireIn(10 * MINUTE * IN_MILLISECONDS);
+    }
+
+    // Follow-up scheduling records completed work only now that the work is
+    // actually complete.
+    if (record.scheduleNextTeleport)
+        ScheduleTeleport(botGuid);
+
+    sLog.outDetail("Relocation of bot %s to map %u completed (token " UI64FMTD ")",
+        bot->GetName(), record.mapId, record.token);
     return true;
 }
 
-// Returns true only when the bot was actually relocated, so callers do not
-// Refresh() (free revive/repair/resource refill/money) after a failed relocation.
+void RandomPlayerbotMgr::CancelPendingRelocation(uint32 botGuid)
+{
+    relocations.Cancel(botGuid);
+}
+
+// Returns Rejected when no candidate was accepted (nothing mutated) and Pending
+// when TeleportTo QUEUED a transfer - completion work (Refresh, homebind, inn
+// binding, marker clearing, scheduling) runs only in FinalizeRelocation once the
+// bot's teleport acknowledgement lands on the accepted destination.
 namespace
 {
     // A random teleport may only move free synthetic random bots. A connected real
@@ -2431,7 +2515,7 @@ namespace
 
 }
 
-bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, bool hearth, bool activeOnly)
+living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, living::PendingRelocation flags, bool activeOnly)
 {
     // Complete preflight BEFORE any mutation (taxi, homebind, motion, position,
     // heartbeat, AI reset).
@@ -2439,7 +2523,7 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
     {
         sLog.outDetail("Random teleport skipped for bot %s: not a free synthetic random bot",
             bot ? bot->GetName() : "<null>");
-        return false;
+        return living::RelocationOutcome::Rejected;
     }
 
     // A grouped bot is never randomly relocated (standalone legacy safety fix).
@@ -2451,20 +2535,20 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
     if (bot->GetGroup())
     {
         sLog.outDetail("Random teleport skipped for bot %s: bot is in a group", bot->GetName());
-        return false;
+        return living::RelocationOutcome::Rejected;
     }
 
     if (bot->IsBeingTeleported())
-        return false;
+        return living::RelocationOutcome::Rejected;
 
     if (bot->InBattleGround())
-        return false;
+        return living::RelocationOutcome::Rejected;
 
     if (bot->InBattleGroundQueue())
-        return false;
+        return living::RelocationOutcome::Rejected;
 
 	if (bot->GetLevel() < 5)
-        return false;
+        return living::RelocationOutcome::Rejected;
 
     // The remaining core TeleportTo rejection paths (verified against all three
     // pinned cores) are preflighted here so a rejection can never happen after
@@ -2477,19 +2561,19 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
     if (bot->HasCharmer())
     {
         sLog.outDetail("Random teleport skipped for bot %s: bot is charmed", bot->GetName());
-        return false;
+        return living::RelocationOutcome::Rejected;
     }
 
     if (bot->IsTaxiFlying())
     {
         sLog.outDetail("Random teleport skipped for bot %s: bot is taxi flying", bot->GetName());
-        return false;
+        return living::RelocationOutcome::Rejected;
     }
 
     if (locs.empty())
     {
         sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
-        return false;
+        return living::RelocationOutcome::Rejected;
     }
 
     std::vector<WorldPosition> tlocs;
@@ -2654,11 +2738,11 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
     {
         // The activeOnly fallback (retry without the active-zone restriction)
         // lives in the public helpers now, so this helper reports plain
-        // success/failure and never hides a fallback's own Refresh/result.
+        // outcomes and never hides a fallback's own result.
         if (!activeOnly)
             sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
 
-        return false;
+        return living::RelocationOutcome::Rejected;
     }
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleportByLocations");
@@ -2721,11 +2805,7 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
 
             // NO state is mutated before TeleportTo: taxi-flying bots were already
             // refused in the preflight (their taxi path cannot be restored on
-            // failure), and motion is cleared only after the move succeeded.
-            // Everything persistent (homebind) or observable (heartbeat, AI reset)
-            // also happens only AFTER a successful teleport - the result used to be
-            // ignored, so a failed teleport still rewrote the homebind, cleared the
-            // motion stack and reset the AI.
+            // failure). A rejected call moves on with everything untouched.
             if (!bot->TeleportTo(loc.mapid, x, y, z, 0))
             {
                 sLog.outDetail("Random teleport of bot %s to map %u failed; trying next location",
@@ -2733,19 +2813,35 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                 continue;
             }
 
+            // Acceptance means the core QUEUED a near/far transfer - it is NOT
+            // completion. Record the one exact final destination (reused verbatim
+            // for the homebind so the bind can never diverge from the landing
+            // spot) plus the work owed, and defer everything observable - Refresh,
+            // homebind, inn binding, marker clearing, scheduling, heartbeat, AI
+            // reset - to FinalizeRelocation on the teleport acknowledgement.
+            // Clearing the motion stack is the one transient exception: the old
+            // generator must not keep steering a bot whose transfer is queued.
             bot->GetMotionMaster()->Clear();
 
-            if (hearth)
-                bot->SetHomebindToLocation(loc, area->ID);
+            flags.mapId = loc.mapid;
+            flags.x = x;
+            flags.y = y;
+            flags.z = z;
+            flags.orientation = 0.0f;
+            flags.homebindAreaId = area->ID;
+            relocations.Begin(bot->GetGUIDLow(), flags);
 
-            bot->SendHeartBeat();
-            bot->GetPlayerbotAI()->Reset(true);
-            return true;
+            // Some core paths complete a same-map transfer synchronously; if no
+            // acknowledgement is owed, finalize right here.
+            if (!bot->IsBeingTeleported() && FinalizeRelocation(bot))
+                return living::RelocationOutcome::Completed;
+
+            return living::RelocationOutcome::Pending;
         }
     }
 
     sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
-    return false;
+    return living::RelocationOutcome::Rejected;
 }
 
 std::vector<std::pair<uint32, uint32>> RandomPlayerbotMgr::RpgLocationsNear(WorldLocation pos, const std::map<uint32, std::map<uint32, std::vector<std::string>>>& areaNames, uint32 radius)
@@ -3020,50 +3116,34 @@ void RandomPlayerbotMgr::PrintTeleportCache()
     }
 }
 
-bool RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
+living::RelocationOutcome RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly, bool scheduleNextOnCompletion, bool reviveRecovery)
 {
     if (bot->InBattleGround())
-        return false;
+        return living::RelocationOutcome::Rejected;
+
+    living::PendingRelocation flags;
+    flags.bindInn = true;
+    flags.reviveRecovery = reviveRecovery;
+    flags.scheduleNextTeleport = scheduleNextOnCompletion;
 
     sLog.outDetail("Preparing location to random teleporting bot %s for level %u", bot->GetName(), bot->GetLevel());
-    if (!RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], false, activeOnly))
+    living::RelocationOutcome outcome = RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], flags, activeOnly);
+    if (outcome == living::RelocationOutcome::Rejected && activeOnly)
     {
         // Legacy fallback: when the active-zone restriction leaves nothing, retry
-        // without it. The fallback used to hide inside the locs helper, where its
-        // success could not be reported without double-Refreshing.
-        if (!activeOnly || !RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], false, false))
-            return false; // no relocation happened: do not Refresh (free revive/repair/money)
+        // without it.
+        outcome = RandomTeleport(bot, locsPerLevelCache[bot->GetLevel()], flags, false);
     }
 
-    Refresh(bot);
-
-    WorldPosition botPos(bot);
-
-    // The old -1.0f sentinel made every nonnegative squared distance compare as
-    // "not closer", so no inn was ever selected and the bind packet never sent.
-    ObjectGuid closestInn;
-    living::MinimumTracker closest;
-    for (auto& [innGuid, innPosition] : innCacheLevel[bot->getRace()][bot->GetLevel()])
-    {
-        if (closest.Consider(botPos.sqDistance(innPosition)))
-            closestInn = innGuid;
-    }
-
-    if (closestInn)
-    {
-        WorldPacket data(SMSG_TRAINER_BUY_SUCCEEDED, (8 + 4));
-        data << closestInn;
-        data << uint32(3286);                                   // Bind
-        bot->GetSession()->SendPacket(data);
-    }
-
-    return true;
+    // Refresh and closest-inn binding are owed on COMPLETION and run in
+    // FinalizeRelocation from the post-acknowledgement position.
+    return outcome;
 }
 
-bool RandomPlayerbotMgr::RandomTeleport(Player* bot)
+living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, bool reviveRecovery)
 {
     if (bot->InBattleGround())
-        return false;
+        return living::RelocationOutcome::Rejected;
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleport");
     std::vector<WorldLocation> locs;
@@ -3096,11 +3176,16 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot)
         pmo.reset();
 
         // Actually consume the candidates: they were computed and then dropped, so
-        // this path never relocated the bot at all.
-        if (!locs.empty() && RandomTeleport(bot, locs, false, true))
+        // this path never relocated the bot at all. Refresh is owed on completion
+        // (FinalizeRelocation), not on acceptance.
+        if (!locs.empty())
         {
-            Refresh(bot);
-            return true;
+            living::PendingRelocation flags;
+            flags.reviveRecovery = reviveRecovery;
+
+            living::RelocationOutcome outcome = RandomTeleport(bot, locs, flags, true);
+            if (outcome != living::RelocationOutcome::Rejected)
+                return outcome;
         }
 
         // Fall through to the level-based relocation when no flee spot worked.
@@ -3108,10 +3193,7 @@ bool RandomPlayerbotMgr::RandomTeleport(Player* bot)
 
     pmo.reset();
 
-    // RandomTeleportForLevel already calls Refresh() after relocating; calling it
-    // again here refreshed a second time (and refreshed even when relocation
-    // failed).
-    return RandomTeleportForLevel(bot, true);
+    return RandomTeleportForLevel(bot, true, false, reviveRecovery);
 }
 
 void RandomPlayerbotMgr::InstaRandomize(Player* bot)
@@ -3526,11 +3608,12 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
 
     for (auto& [prefix, consoleHandler] : handlers)
     {
-        if (cmd.find(prefix) != 0)
+        // Exact dispatch: "reset" or "reset ...", never "resetX"/"pidX1 2 3".
+        // Prefix-only matching plus a blind one-character strip used to let a
+        // typo invoke destructive handlers (reset deletes every random-bot row).
+        std::string param;
+        if (!living::MatchExactCommand(cmd, prefix, param))
             continue;
-
-        size_t prefixLen = prefix.size();
-        std::string param = cmd.size() > prefixLen + 1 ? cmd.substr(prefixLen + 1) : "";
 
         if (prefix == "stats")
             param = handler->GetSession() ? std::to_string(handler->GetSession()->GetPlayer()->GetObjectGuid()) : "";
@@ -3560,11 +3643,11 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
 
     for (auto& [prefix, playerHandler] : playerHandlers)
     {
-        if (cmd.find(prefix) != 0)
+        // Exact dispatch, same rule as above: "removeBob"/"reviveX" must not
+        // resolve to remove/revive.
+        std::string nameAndParams;
+        if (!living::MatchExactCommand(cmd, prefix, nameAndParams))
             continue;
-
-        size_t prefixLen = prefix.size();
-        std::string nameAndParams = cmd.size() > prefixLen + 1 ? cmd.substr(prefixLen + 1) : "";
 
         std::string name = "%";
         std::string params = "";
@@ -3698,6 +3781,11 @@ void RandomPlayerbotMgr::OnPlayerLogout(Player* player)
 
 void RandomPlayerbotMgr::OnBotLoginInternal(Player * const bot)
 {
+    // A fresh login invalidates any relocation left pending across a logout or
+    // a mid-teleport disconnect; it is dropped without claiming completion, and
+    // the untouched retry markers drive a new attempt.
+    CancelPendingRelocation(bot->GetGUIDLow());
+
     sLog.outDetail("%u/%d Bot %s logged in", GetPlayerbotsAmount(), sRandomPlayerbotMgr.GetMaxAllowedBotCount(), bot->GetName());
 	//if (loginProgressBar && playerBots.size() < sRandomPlayerbotMgr.GetMaxAllowedBotCount()) { loginProgressBar->step(); }
 	//if (loginProgressBar && playerBots.size() >= sRandomPlayerbotMgr.GetMaxAllowedBotCount() - 1) {
@@ -4106,51 +4194,46 @@ void RandomPlayerbotMgr::ChangeStrategy(Player* player)
     {
         sLog.outDetail("Bot #%d %s:%d <%s>: sent to grind spot", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
         // teleport in different places only if players are online.
-        // A failed relocation is not scheduled as completed work; the next update
-        // cycle retries it.
-        if (RandomTeleportForLevel(player, players.size()))
-            ScheduleTeleport(bot);
+        // The next teleport is scheduled in FinalizeRelocation once this one
+        // actually completed; a rejected or never-acknowledged relocation is not
+        // recorded as completed work and the next update cycle retries it.
+        RandomTeleportForLevel(player, !players.empty(), /*scheduleNextOnCompletion*/ true);
     }
     else
     {
         sLog.outDetail("Bot #%d %s:%d <%s>: sent to inn", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
-        if (RandomTeleportForRpg(player, players.size()))
-            ScheduleTeleport(bot);
+        RandomTeleportForRpg(player, !players.empty(), /*scheduleNextOnCompletion*/ true);
     }
 }
 
-bool RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly)
+living::RelocationOutcome RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly, bool scheduleNextOnCompletion)
 {
     uint32 race = bot->getRace();
     uint32 level = bot->GetLevel();
+
+    living::PendingRelocation flags;
+    flags.setHomebind = true;         // RPG camps hearth the bot to the landing spot
+    flags.rpgTravelCooldown = true;
+    flags.scheduleNextTeleport = scheduleNextOnCompletion;
+
     sLog.outDetail("Random teleporting bot %s for RPG (%zu locations available)", bot->GetName(), rpgLocsCacheLevel[race][level].size());
-    if (!RandomTeleport(bot, rpgLocsCacheLevel[race][level], true, activeOnly))
+    living::RelocationOutcome outcome = RandomTeleport(bot, rpgLocsCacheLevel[race][level], flags, activeOnly);
+    if (outcome == living::RelocationOutcome::Rejected && activeOnly)
     {
         // Legacy fallback: when the active-zone restriction leaves nothing, retry
         // without it (see RandomTeleportForLevel).
-        if (!activeOnly || !RandomTeleport(bot, rpgLocsCacheLevel[race][level], true, false))
-            return false; // no relocation happened: do not Refresh (free revive/repair/money)
+        outcome = RandomTeleport(bot, rpgLocsCacheLevel[race][level], flags, false);
     }
 
-    Refresh(bot);
-
-    //Travel cooldown for 10 minutes.
-    if (bot->GetPlayerbotAI())
-    {
-        AiObjectContext* context = bot->GetPlayerbotAI()->GetAiObjectContext();
-        TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target");
-
-        sTravelMgr.SetNullTravelTarget(travelTarget);
-        travelTarget->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
-        travelTarget->SetExpireIn(10 * MINUTE * IN_MILLISECONDS);
-    }
-
-    return true;
+    // Refresh, the homebind, and the travel cooldown are owed on COMPLETION and
+    // run in FinalizeRelocation.
+    return outcome;
 }
 
 void RandomPlayerbotMgr::Remove(Player* bot)
 {
     uint32 owner = bot->GetGUIDLow();
+    CancelPendingRelocation(owner);
     CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%d'", owner);
     eventCache[owner].clear();
 
@@ -4485,10 +4568,20 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleportForLevel(Player* 
         messages.push_back("Bot not found");
         return messages;
     }
-    if (RandomTeleportForLevel(bot))
-        messages.push_back("teleport applied to " + std::string(bot->GetName()));
-    else
-        messages.push_back("teleport failed for " + std::string(bot->GetName()));
+    // Pending means TeleportTo accepted the transfer; completion happens on the
+    // teleport acknowledgement (never report accepted work as applied).
+    switch (RandomTeleportForLevel(bot))
+    {
+        case living::RelocationOutcome::Completed:
+            messages.push_back("teleport applied to " + std::string(bot->GetName()));
+            break;
+        case living::RelocationOutcome::Pending:
+            messages.push_back("teleport accepted for " + std::string(bot->GetName()) + " (completes on teleport ack)");
+            break;
+        case living::RelocationOutcome::Rejected:
+            messages.push_back("teleport failed for " + std::string(bot->GetName()));
+            break;
+    }
     return messages;
 }
 
@@ -4500,10 +4593,18 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleportForRpg(Player* bo
         messages.push_back("Bot not found");
         return messages;
     }
-    if (RandomTeleportForRpg(bot))
-        messages.push_back("rpg applied to " + std::string(bot->GetName()));
-    else
-        messages.push_back("rpg failed for " + std::string(bot->GetName()));
+    switch (RandomTeleportForRpg(bot))
+    {
+        case living::RelocationOutcome::Completed:
+            messages.push_back("rpg applied to " + std::string(bot->GetName()));
+            break;
+        case living::RelocationOutcome::Pending:
+            messages.push_back("rpg accepted for " + std::string(bot->GetName()) + " (completes on teleport ack)");
+            break;
+        case living::RelocationOutcome::Rejected:
+            messages.push_back("rpg failed for " + std::string(bot->GetName()));
+            break;
+    }
     return messages;
 }
 
@@ -4516,11 +4617,20 @@ std::list<std::string> RandomPlayerbotMgr::HandleRevive(Player* bot)
         return messages;
     }
     // A refused recovery (e.g. a grouped bot that cannot be safely relocated)
-    // keeps its dead/revive markers and must not report success.
-    if (Revive(bot))
-        messages.push_back("revive applied to " + std::string(bot->GetName()));
-    else
-        messages.push_back("revive failed for " + std::string(bot->GetName()));
+    // keeps its dead/revive markers and must not report success; an accepted one
+    // completes - and clears its markers - only on the teleport acknowledgement.
+    switch (Revive(bot))
+    {
+        case living::RelocationOutcome::Completed:
+            messages.push_back("revive applied to " + std::string(bot->GetName()));
+            break;
+        case living::RelocationOutcome::Pending:
+            messages.push_back("revive accepted for " + std::string(bot->GetName()) + " (completes on teleport ack)");
+            break;
+        case living::RelocationOutcome::Rejected:
+            messages.push_back("revive failed for " + std::string(bot->GetName()));
+            break;
+    }
     return messages;
 }
 
@@ -4532,10 +4642,18 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleport(Player* bot)
         messages.push_back("Bot not found");
         return messages;
     }
-    if (RandomTeleport(bot))
-        messages.push_back("grind applied to " + std::string(bot->GetName()));
-    else
-        messages.push_back("grind failed for " + std::string(bot->GetName()));
+    switch (RandomTeleport(bot))
+    {
+        case living::RelocationOutcome::Completed:
+            messages.push_back("grind applied to " + std::string(bot->GetName()));
+            break;
+        case living::RelocationOutcome::Pending:
+            messages.push_back("grind accepted for " + std::string(bot->GetName()) + " (completes on teleport ack)");
+            break;
+        case living::RelocationOutcome::Rejected:
+            messages.push_back("grind failed for " + std::string(bot->GetName()));
+            break;
+    }
     return messages;
 }
 
