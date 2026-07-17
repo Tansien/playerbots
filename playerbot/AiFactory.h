@@ -29,6 +29,9 @@ public:
 public:
     static int GetPlayerSpecTab(const Player* player);
     static std::map<uint32, int32> GetPlayerSpecTabs(const Player* player);
-    static BotRoles GetPlayerRoles(uint8 cls, uint8 specTab);
+    // Capability mask of one spec tab (planning/creation concept; may hold
+    // several role bits). Runtime classification uses GetPlayerRoles(Player*),
+    // which resolves exactly one concrete role from form/spec.
+    static BotRoles GetSpecRoleCapabilities(uint8 cls, uint8 specTab);
     static BotRoles GetPlayerRoles(const Player* player);
 };

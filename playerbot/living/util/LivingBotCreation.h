@@ -39,6 +39,11 @@ namespace living
     {
         // A character was created and persisted; a GUID is available.
         Created,
+        // The character transaction was QUEUED and passed every synchronous
+        // gate; durability is confirmed asynchronously by the creation
+        // finalizer. No GUID is exposed, nothing is counted as persisted, and
+        // required metadata is written only after the durable row is verified.
+        PendingPersistence,
         // This attempt failed for a reason another attempt may avoid
         // (e.g. a random name collision). The caller may try again.
         RetryableFailure,
@@ -47,19 +52,19 @@ namespace living
         TerminalFailure,
     };
 
-    // Per-run accounting for group creation. Counts only actually created bots
-    // - tallied by the class the creation ACTUALLY persisted, never by the
-    // preselected assumption - and tells the caller when to stop, so counters,
-    // class tallies and role quotas can never drift from persisted reality.
+    // Per-run accounting for group creation. Persisted members and pending
+    // members are DIFFERENT counts: a pending creation fills a composition
+    // slot for planning (its class/role were verified before the character
+    // transaction was queued) but is never reported as a persisted member -
+    // the finalizer confirms or discards it asynchronously.
     struct GroupCreationLedger
     {
         uint32_t created = 0;
+        uint32_t pendingPersistence = 0;
         std::map<uint8_t, uint32_t> createdByClass;
 
-        // Records one attempt with the persisted class (ignored unless the
-        // attempt actually created a bot). Returns true when the run must stop
-        // (terminal failure); quota/counter updates belong on Counted() outcomes
-        // only.
+        // Records one attempt with the planned/persisted class. Returns true
+        // when the run must stop (terminal failure).
         bool Record(BotCreateStatus status, uint8_t actualClass = 0)
         {
             if (status == BotCreateStatus::Created)
@@ -67,10 +72,21 @@ namespace living
                 ++created;
                 ++createdByClass[actualClass];
             }
+            else if (status == BotCreateStatus::PendingPersistence)
+            {
+                ++pendingPersistence;
+                ++createdByClass[actualClass];
+            }
+
             return status == BotCreateStatus::TerminalFailure;
         }
 
-        static bool Counted(BotCreateStatus status) { return status == BotCreateStatus::Created; }
+        // A slot is consumed for composition PLANNING by both confirmed and
+        // pending members; only `created` may ever be claimed as persisted.
+        static bool CountsTowardComposition(BotCreateStatus status)
+        {
+            return status == BotCreateStatus::Created || status == BotCreateStatus::PendingPersistence;
+        }
     };
 
     // Outcome planning for one requested-group join attempt at bot login. The

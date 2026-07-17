@@ -1168,7 +1168,7 @@ bool RandomPlayerbotMgr::GetNamedLocation(std::string const& name, WorldLocation
 
 uint32 RandomPlayerbotMgr::AddRandomBots()
 {
-    uint32 maxAllowedBotCount = GetEventValue(0, "bot_count");    
+    uint32 maxAllowedBotCount = GetEventValue(0, "bot_count");
     uint32 currentAllowedBotCount = maxAllowedBotCount;
 
     uint32 maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
@@ -1176,7 +1176,13 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
 
     if(sPlayerbotAIConfig.asyncBotLogin)
         return 0;
-  
+
+    // Reconcile the bot list from durable truth first if a prior batch left it
+    // dirty; a new batch must not build on an untrusted vector.
+    GetBots();
+    if (currentBotsDirty)
+        return currentBots.size();
+
     if (currentBots.size() < currentAllowedBotCount)
     {
         if (sPlayerbotAIConfig.syncLevelWithPlayers)
@@ -1313,15 +1319,44 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                         continue;
 
                     // Persist the add/logout pair BEFORE any cache/quota/counter
-                    // update. A bot whose pair cannot be fully persisted is
-                    // skipped - with the half-written marker compensated - so
-                    // runtime selection state never runs ahead of durable state.
+                    // update: the pair is ONE logical activation. A bot whose
+                    // pair cannot be fully persisted is skipped with the
+                    // half-written marker compensated; if even the compensation
+                    // fails, the durable pair is reconciled (the setter already
+                    // reloaded each event or marked it dirty) - an actually
+                    // active bot is counted, an unknown one dirties currentBots
+                    // and stops the batch.
                     if (!SetEventValue(guid, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
                         continue;
 
                     if (!SetEventValue(guid, "logout", 0, 0))
                     {
-                        SetEventValue(guid, "add", 0, 0); // compensate; on failure the setter reloads durable state
+                        if (!SetEventValue(guid, "add", 0, 0)) // compensate
+                        {
+                            if (IsEventDirty(guid, "add") || IsEventDirty(guid, "logout"))
+                            {
+                                // Durable activation state cannot be
+                                // established: the in-memory vector can no
+                                // longer be trusted, and continuing the batch
+                                // would compound the divergence.
+                                sLog.outError("AddRandomBots: durable activation state for bot %u unknown; marking bot list dirty and stopping the batch", guid);
+                                currentBotsDirty = true;
+                                return currentBots.size();
+                            }
+
+                            // Durable truth is known: count the bot if the pair
+                            // says it is actually active.
+                            if (GetEventValue(guid, "add") && !GetEventValue(guid, "logout"))
+                            {
+                                currentBots.push_back(guid);
+                                currentAllowedBotCount--;
+                                neededAddBots--;
+
+                                if (!currentAllowedBotCount)
+                                    break;
+                            }
+                        }
+
                         continue;
                     }
 
@@ -2611,13 +2646,23 @@ namespace
 
     // The ONE complete destination-eligibility validator. It runs both as the
     // candidate pre-filter AND - decisively - on the FINAL x/y/z produced by
-    // retry jitter and terrain-height adjustment: zone/area are recomputed from
-    // the final coordinates, expansion/faction/starter/capital/map rules all
-    // rerun, and the resolved final area is returned for the relocation record
-    // so the persisted homebind zone always matches the landing coordinates.
-    bool IsEligibleTeleportDestination(Player* bot, uint32 mapId, float x, float y, float z, AreaTableEntry const*& outArea)
+    // Dark Portal overrides, retry jitter and terrain-height adjustment:
+    // zone/area are recomputed from the final coordinates and EVERY policy a
+    // mutable coordinate can invalidate reruns here - configured map
+    // allowlist, expansion rules, faction/capital/starter zone policy,
+    // active-zone requirement and destination density (when activeOnly), and
+    // coordinate validity. The resolved final area is returned for the
+    // relocation record so the persisted homebind zone always matches the
+    // landing coordinates.
+    bool IsEligibleTeleportDestination(Player* bot, uint32 mapId, float x, float y, float z, bool activeOnly, AreaTableEntry const*& outArea)
     {
         outArea = nullptr;
+
+        // Configured map allowlist: also a FINAL check - the Dark Portal
+        // override can substitute a different map after candidate admission.
+        if (std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), mapId)
+            == sPlayerbotAIConfig.randomBotMaps.end())
+            return false;
 
         if (!MapManager::IsValidMapCoord(mapId, x, y, z, 0))
             return false;
@@ -2641,9 +2686,13 @@ namespace
             true;
 #endif
 
-        if (zoneId && zoneId != areaId)
+        if (zoneId)
         {
-            AreaTableEntry const* zone = GetAreaEntryByAreaID(zoneId);
+            // Top-level areas ARE their own zone (zoneId == areaId): zone
+            // policy runs on the area record itself in that case - skipping it
+            // let low-level bots into foreign starter zones and enemy capitals
+            // whenever the destination was a top-level tuple.
+            AreaTableEntry const* zone = zoneId == areaId ? area : GetAreaEntryByAreaID(zoneId);
             if (!zone)
                 return false;
 
@@ -2662,6 +2711,37 @@ namespace
 
         if (living::DestinationBlockedByEnemyArea(areaIsEnemy, bot->GetLevel()))
             return false;
+
+        // Active-zone requirement and destination density: mutable-coordinate
+        // policies too (jitter can cross into an inactive or over-populated
+        // zone), so they rerun on the final tuple exactly like the pre-filter.
+        if (activeOnly && sPlayerbotAIConfig.randomBotTeleportNearPlayer)
+        {
+            Map* tMap = sMapMgr.FindMap(mapId, 0);
+            if (!tMap || !tMap->IsContinent() || !tMap->HasActiveZones())
+                return false;
+
+            if (!tMap->HasActiveZone(zoneId ? zoneId : areaId))
+                return false;
+
+            if (sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount > 0 && sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius > 0.0f)
+            {
+                WorldPosition const destination(mapId, x, y, z);
+                uint32 botsNearTeleportPoint = 0;
+                sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* otherBot)
+                {
+                    // Only check the bots that are in the same zone
+                    if (otherBot && !otherBot->IsBeingTeleported() && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
+                    {
+                        if (destination.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
+                            botsNearTeleportPoint++;
+                    }
+                });
+
+                if (botsNearTeleportPoint >= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount)
+                    return false;
+            }
+        }
 
         outArea = area;
         return true;
@@ -2736,8 +2816,15 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
         tlocs.push_back(WorldPosition(loc));
     }
 
-    //Do not teleport to maps disabled in config
-    tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [](const WorldPosition& l) {std::vector<uint32>::iterator i = find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), l.getMapId()); return i == sPlayerbotAIConfig.randomBotMaps.end(); }), tlocs.end());
+    // Candidate pre-filter: the SAME complete eligibility validator that later
+    // decides the final tuple (map allowlist, expansion, zone/area policy,
+    // active-zone requirement and density when activeOnly), run here on the
+    // raw candidate to avoid burning attempts on hopeless locations.
+    tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [bot, activeOnly](const WorldPosition& l)
+    {
+        AreaTableEntry const* area = nullptr;
+        return !IsEligibleTeleportDestination(bot, l.getMapId(), l.coord_x, l.coord_y, l.coord_z, activeOnly, area);
+    }), tlocs.end());
 
     //Random shuffle based on distance. Closer distances are more likely (but not exclusively) to be at the begin of the list.
     tlocs = WorldPosition(bot).GetNextPoint(tlocs, 0);
@@ -2748,77 +2835,6 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
     //Continent is about 20.000 large
     //Bot will travel 0-5000 units + 75-150 units per level.
     //tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [bot](WorldLocation const& l) {return l.mapid == bot->GetMapId() && sServerFacade.GetDistance2d(bot, l.coord_x, l.coord_y) > urand(0, 5000) + bot->GetLevel() * 15 * urand(5, 10); }), tlocs.end());
-
-    // teleport to active areas only
-    if (sPlayerbotAIConfig.randomBotTeleportNearPlayer && activeOnly)
-    {
-        tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [this](const WorldPosition& l)
-        {
-            uint32 mapId = l.getMapId();
-            Map* tMap = sMapMgr.FindMap(mapId, 0);
-            if (tMap && tMap->IsContinent() && tMap->HasActiveZones())
-            {
-                uint32 zoneId = sTerrainMgr.GetZoneId(mapId, l.coord_x, l.coord_y, l.coord_z);
-                if (tMap->HasActiveZone(zoneId))
-                {
-                    if (sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount > 0 && sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius > 0.0f)
-                    {
-                        uint32 botsNearTeleportPoint = 0;
-                        ForEachPlayerbot([&](Player* otherBot)
-                        {
-                            // Only check the bots that are on the same zone
-                            if (otherBot && !otherBot->IsBeingTeleported() && zoneId == otherBot->GetZoneId())
-                            {
-                                if (l.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
-                                {
-                                    botsNearTeleportPoint++;
-                                }
-                            }
-                        });
-
-                        return botsNearTeleportPoint >= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount;
-                    }
-                    else
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            return true;
-        }),
-        tlocs.end());
-
-        /*if (!tlocs.empty())
-        {
-            tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [bot](const WorldPosition& l)
-            {
-                uint32 mapId = l.getMapId();
-                Map* tMap = sMapMgr.FindMap(mapId, 0);
-                if (!tMap || !tMap->IsContinent())
-                        return true;
-
-                if (!tMap->HasActiveAreas())
-                    return true;
-
-                AreaTableEntry const* area = l.getArea();
-                if (area)
-                {
-                    if (!tMap->HasActiveZone(area->zone ? area->zone : area->ID))
-                        return true;
-                }
-            }), tlocs.end());
-        }*/
-    }
-
-    // Candidate pre-filter: the SAME complete eligibility validator that later
-    // decides the final jittered/ground-adjusted tuple, run here on the raw
-    // candidate to avoid burning attempts on hopeless locations.
-    tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [bot](const WorldPosition& l)
-    {
-        AreaTableEntry const* area = nullptr;
-        return !IsEligibleTeleportDestination(bot, l.getMapId(), l.coord_x, l.coord_y, l.coord_z, area);
-    }), tlocs.end());
 
     if (tlocs.empty())
     {
@@ -2870,16 +2886,17 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
 
             z = 0.05f + ground;
 
-            // The FINAL tuple is now known (jitter applied, z replaced by the
-            // terrain height). Rerun the complete eligibility validation on
-            // exactly these coordinates: jitter or vertical area resolution may
-            // have crossed an expansion/faction/starter/capital boundary the
-            // raw candidate satisfied, and the area recorded for the homebind
-            // must be the area of the LANDING spot. This also preflights the
-            // core's own coordinate rejection so TeleportTo cannot fail for a
-            // reason known in advance.
+            // The FINAL tuple is now known (Dark Portal override and jitter
+            // applied, z replaced by the terrain height). Rerun the complete
+            // eligibility validation on exactly these coordinates: the
+            // override can substitute a disabled map, and jitter or vertical
+            // area resolution can cross expansion/faction/starter/capital,
+            // active-zone or density boundaries the raw candidate satisfied.
+            // The area recorded for the homebind is the area of the LANDING
+            // spot. This also preflights the core's own coordinate rejection
+            // so TeleportTo cannot fail for a reason known in advance.
             AreaTableEntry const* area = nullptr;
-            if (!IsEligibleTeleportDestination(bot, loc.mapid, x, y, z, area))
+            if (!IsEligibleTeleportDestination(bot, loc.mapid, x, y, z, activeOnly, area))
                 continue;
 
             sLog.outDetail("Random teleporting bot %s to %s %f,%f,%f (%u/%zu locations)",
@@ -3507,6 +3524,32 @@ bool RandomPlayerbotMgr::IsRandomBot(uint32 bot)
 
 std::list<uint32> RandomPlayerbotMgr::GetBots()
 {
+    // After an uncertain activation the nonempty in-memory vector is NOT
+    // trusted: reconcile from canonical durable state (both halves of the
+    // activation pair - `add` set and `logout` not set). A failed
+    // reconciliation query keeps the dirty flag and serves the last known
+    // vector rather than fabricating an empty one.
+    if (currentBotsDirty)
+    {
+        auto reconciled = CharacterDatabase.Query(
+            "SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'add' AND `value` > 0 "
+            "AND bot NOT IN (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'logout' AND `value` > 0)");
+        if (reconciled)
+        {
+            currentBots.clear();
+            do
+            {
+                currentBots.push_back(reconciled->Fetch()[0].GetUInt32());
+            } while (reconciled->NextRow());
+
+            currentBotsDirty = false;
+        }
+        else
+            sLog.outError("GetBots: reconciliation query failed; bot list stays dirty");
+
+        return currentBots;
+    }
+
     if (!currentBots.empty()) return currentBots;
 
     auto results = CharacterDatabase.Query(
@@ -3566,6 +3609,21 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
             } while (results->NextRow());
         }
     }
+
+    // Retry the reload of an individually dirty event even while sibling
+    // events keep the per-bot map nonempty (the whole-map-empty reload above
+    // can never reach it). Until a reload succeeds, the prior KNOWN value is
+    // served - a failed query is not absence.
+    if (auto botDirty = dirtyEvents.find(bot); botDirty != dirtyEvents.end() && botDirty->second.count(event))
+    {
+        if (ReloadEventRow(bot, event) != living::EventReloadOutcome::QueryFailed)
+        {
+            botDirty->second.erase(event);
+            if (botDirty->second.empty())
+                dirtyEvents.erase(botDirty);
+        }
+    }
+
     CachedEvent e = eventCache[bot][event];
 
     if ((time(0) - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink" && event != "init" && event != "current_time" && event != "always" && event != "selfbot")
@@ -3677,28 +3735,70 @@ bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 val
     if (outcome == living::EventPersistOutcome::ExecuteFailed)
     {
         // The statement failed after the probe: durable state is uncertain, so
-        // reload it instead of publishing the intended value optimistically.
-        // Last row wins, mirroring the bulk loader in GetEventValue.
+        // reload it instead of publishing the intended value optimistically. A
+        // failed reload NEVER becomes confirmed absence: the prior known value
+        // stays cached and the entry is marked dirty for a later retry.
         sLog.outError("SetEventValue failed to persist event '%s' for bot %u; reloading durable value", event.c_str(), bot);
-        if (auto reload = CharacterDatabase.PQuery(
-                "SELECT `value`, `time`, validIn, `data` FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
-                bot, escapedEvent.c_str()))
-        {
-            do
-            {
-                Field* fields = reload->Fetch();
-                eventCache[bot][event] = CachedEvent(fields[0].GetUInt32(), fields[1].GetUInt32(), fields[2].GetUInt32(), fields[3].GetString());
-            } while (reload->NextRow());
-        }
-        else
-            eventCache[bot].erase(event);
+        if (ReloadEventRow(bot, event) == living::EventReloadOutcome::QueryFailed)
+            dirtyEvents[bot].insert(event);
 
         return false;
     }
 
     CachedEvent e(value, now, validIn, data);
     eventCache[bot][event] = e;
+
+    // A confirmed write makes the cache authoritative again for this event.
+    if (auto botDirty = dirtyEvents.find(bot); botDirty != dirtyEvents.end())
+    {
+        botDirty->second.erase(event);
+        if (botDirty->second.empty())
+            dirtyEvents.erase(botDirty);
+    }
+
     return true;
+}
+
+living::EventReloadOutcome RandomPlayerbotMgr::ReloadEventRow(uint32 bot, std::string const& event)
+{
+    std::string escapedEvent = event;
+    CharacterDatabase.escape_string(escapedEvent);
+
+    // COUNT first: it always yields a row on success, so a null result is a
+    // FAILED query, never an empty one - the only way to tell "no row" apart
+    // from "could not ask".
+    auto countResult = CharacterDatabase.PQuery(
+        "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+        bot, escapedEvent.c_str());
+    if (!countResult)
+        return living::EventReloadOutcome::QueryFailed;
+
+    if (countResult->Fetch()[0].GetUInt32() == 0)
+    {
+        eventCache[bot].erase(event);
+        return living::EventReloadOutcome::ConfirmedAbsent;
+    }
+
+    auto rows = CharacterDatabase.PQuery(
+        "SELECT `value`, `time`, validIn, `data` FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+        bot, escapedEvent.c_str());
+    if (!rows)
+        return living::EventReloadOutcome::QueryFailed;
+
+    // Last row wins, mirroring the bulk loader in GetEventValue.
+    do
+    {
+        Field* fields = rows->Fetch();
+        eventCache[bot][event] = CachedEvent(fields[0].GetUInt32(), fields[1].GetUInt32(), fields[2].GetUInt32(), fields[3].GetString());
+    } while (rows->NextRow());
+
+    return living::EventReloadOutcome::Found;
+}
+
+bool RandomPlayerbotMgr::IsEventDirty(uint32 bot, std::string const& event) const
+{
+    auto botDirty = dirtyEvents.find(bot);
+    return botDirty != dirtyEvents.end() && botDirty->second.count(event) > 0;
 }
 
 uint32 RandomPlayerbotMgr::GetValue(uint32 bot, std::string type)

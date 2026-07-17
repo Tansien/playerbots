@@ -5,10 +5,12 @@
 #include "PlayerbotAIBase.h"
 #include "PlayerbotMgr.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/living/util/LivingEventSchema.h"
 #include "playerbot/living/util/LivingRelocation.h"
 #include "WorldPosition.h"
 #include <map>
 #include <list>
+#include <set>
 
 class WorldPacket;
 class Player;
@@ -204,6 +206,11 @@ public:
         uint32 GetEventValue(uint32 bot, std::string event);
         std::string GetEventData(uint32 bot, std::string event);
         bool SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data = "");
+        // Reloads ONE durable event row into the cache with a typed outcome:
+        // only a successful COUNT confirms absence; a failed query preserves
+        // the prior cached value (the caller marks the entry dirty).
+        living::EventReloadOutcome ReloadEventRow(uint32 bot, std::string const& event);
+        bool IsEventDirty(uint32 bot, std::string const& event) const;
         std::list<uint32> GetBots();
         std::list<uint32> GetBgBots(uint32 bracket);
         time_t BgCheckTimer;
@@ -261,6 +268,16 @@ public:
         std::map<uint32, std::map<uint32, std::vector<std::pair<ObjectGuid, WorldLocation>> > > innCacheLevel;
         std::map<Team, std::map<BattleGroundTypeId, std::list<uint32> > > BattleMastersCache;
         std::map<uint32, std::map<std::string, CachedEvent> > eventCache;
+        // Events whose durable state could not be re-established after a
+        // failed write (reload query also failed): the cache keeps the prior
+        // KNOWN value and GetEventValue retries the reload per event - the
+        // whole-map-empty reload alone cannot fix a single stale entry while
+        // sibling events stay cached.
+        std::map<uint32, std::set<std::string> > dirtyEvents;
+        // True after an activation pair (add/logout) whose durable state could
+        // not be established: GetBots must reconcile from durable truth before
+        // trusting the in-memory vector again.
+        bool currentBotsDirty = false;
         // Next-allowed group-join attempt per bot (bounded retry backoff for
         // the `create group` event; in-memory only - a restart simply retries
         // sooner).

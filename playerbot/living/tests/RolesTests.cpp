@@ -83,3 +83,33 @@ LIVING_TEST(roles_capability_masks_and_containment)
     LIVING_CHECK(!RolesSatisfy(ROLE_HEALER, ROLE_TANK | ROLE_DPS));
     LIVING_CHECK(!RolesSatisfy(0, ROLE_TANK));
 }
+
+LIVING_TEST(roles_concrete_runtime_role_is_one_role_never_a_mask)
+{
+    // Feral druid (11, tab 1): the TANK|DPS capability mask never leaks into
+    // runtime classification. Bear/dire-bear form -> tank; cat or no form ->
+    // DPS - a Feral DPS master must not be counted as a group's tank.
+    LIVING_CHECK(ConcreteRuntimeRole(11, 1, true) == ROLE_TANK);
+    LIVING_CHECK(ConcreteRuntimeRole(11, 1, false) == ROLE_DPS);
+
+    // Frost DK (6, tab 1) resolves the same way via Frost Presence.
+    LIVING_CHECK(ConcreteRuntimeRole(6, 1, true) == ROLE_TANK);
+    LIVING_CHECK(ConcreteRuntimeRole(6, 1, false) == ROLE_DPS);
+
+    // Single-role specs are unambiguous with or without a stance: prot
+    // warrior tanks, resto druid heals, balance druid damages.
+    LIVING_CHECK(ConcreteRuntimeRole(1, 2, false) == ROLE_TANK);
+    LIVING_CHECK(ConcreteRuntimeRole(1, 0, true) == ROLE_TANK); // defensive stance overrides
+    LIVING_CHECK(ConcreteRuntimeRole(11, 2, false) == ROLE_HEALER);
+    LIVING_CHECK(ConcreteRuntimeRole(11, 0, false) == ROLE_DPS);
+    LIVING_CHECK(ConcreteRuntimeRole(4, 1, false) == ROLE_DPS);
+
+    // Exactly one role bit in every case.
+    for (uint8_t cls : { 1, 2, 5, 6, 7, 11, 4 })
+        for (uint8_t tab = 0; tab < 3; ++tab)
+            for (bool form : { false, true })
+            {
+                uint8_t const role = ConcreteRuntimeRole(cls, tab, form);
+                LIVING_CHECK(role == ROLE_TANK || role == ROLE_HEALER || role == ROLE_DPS);
+            }
+}

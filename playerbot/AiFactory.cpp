@@ -129,11 +129,14 @@ std::map<uint32, int32> AiFactory::GetPlayerSpecTabs(const Player* bot)
     return tabs;
 }
 
-BotRoles AiFactory::GetPlayerRoles(uint8 cls, uint8 tab)
+BotRoles AiFactory::GetSpecRoleCapabilities(uint8 cls, uint8 tab)
 {
-    // One canonical intended/spec-role mapping, shared with creation-time tuple
-    // filtering, talent-path filtering and role verification. It is a property
-    // of the spec: Druid Feral is TANK|DPS regardless of the current form.
+    // One canonical intended/spec-role CAPABILITY mapping, shared with
+    // creation-time tuple filtering, talent-path filtering and role
+    // verification. It is a property of the spec (Druid Feral is TANK|DPS
+    // regardless of the current form) and is a planning concept: runtime
+    // classification goes through GetPlayerRoles(Player*), which resolves ONE
+    // concrete role.
     static_assert(living::ROLE_TANK == BOT_ROLE_TANK
         && living::ROLE_HEALER == BOT_ROLE_HEALER
         && living::ROLE_DPS == BOT_ROLE_DPS,
@@ -144,58 +147,35 @@ BotRoles AiFactory::GetPlayerRoles(uint8 cls, uint8 tab)
 
 BotRoles AiFactory::GetPlayerRoles(const Player* player)
 {
-    uint8 cls = player->getClass();
-    uint8 tab = GetPlayerSpecTab(player);
+    uint8 const cls = player->getClass();
+    uint8 const tab = static_cast<uint8>(GetPlayerSpecTab(player));
 
-    BotRoles role = BOT_ROLE_NONE;
+    // Concrete CURRENT role, exactly one: the active tank form/stance/presence
+    // decides first, then the spec resolves unambiguously (a Feral druid in
+    // cat or caster form is DPS - the TANK|DPS capability mask is a planning
+    // concept and never leaks into runtime classification).
+    bool tankFormActive = false;
     switch (cls)
     {
-        case CLASS_WARRIOR: {
-            if (tab == 2 || player->HasAura(71)) // Defensive stance
-            {
-                role = BOT_ROLE_TANK;
-            }
+        case CLASS_WARRIOR:
+            tankFormActive = player->HasAura(71); // Defensive stance
             break;
-        }
-
-        case CLASS_PALADIN: {
-            if (tab == 1 || player->HasAura(25780)) // Righteous fury
-            {
-                role = BOT_ROLE_TANK;
-            }
-
+        case CLASS_PALADIN:
+            tankFormActive = player->HasAura(25780); // Righteous fury
             break;
-        }
-
-        case CLASS_DRUID: {
-            if (player->HasAura(5487) || player->HasAura(9634)) // Bear form, Dire bear form
-            {
-                role = BOT_ROLE_TANK;
-            }
-
+        case CLASS_DRUID:
+            tankFormActive = player->HasAura(5487) || player->HasAura(9634); // Bear form, Dire bear form
             break;
-        }
-
 #ifdef MANGOSBOT_TWO
-        case CLASS_DEATH_KNIGHT: {
-            if (player->HasAura(48263)) // Frost presence
-            {
-                role = BOT_ROLE_TANK;
-            }
-
+        case CLASS_DEATH_KNIGHT:
+            tankFormActive = player->HasAura(48263); // Frost presence
             break;
-        }
 #endif
-        default: {
-            role = GetPlayerRoles(cls,tab);
+        default:
             break;
-        }
     }
 
-    if (role == BOT_ROLE_NONE)
-        role = GetPlayerRoles(cls, tab);
-
-    return role;
+    return static_cast<BotRoles>(living::ConcreteRuntimeRole(cls, tab, tankFormActive));
 }
 
 void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const facade, Engine* combatEngine)
