@@ -120,3 +120,49 @@ LIVING_TEST(key_value_args_reject_every_malformed_shape)
     LIVING_CHECK(TryParseKeyValueArgs("name=Rob');DROP", allowed, out, error));
     LIVING_CHECK(out["name"] == "Rob');DROP");
 }
+
+// ResolveCommandTargets is the exact target-resolution step the console
+// player-command dispatch runs (execution-level cardinality lives here: the
+// handler is invoked once per returned GUID).
+
+LIVING_TEST(command_targets_first_available_resolves_exactly_one_bot)
+{
+    std::vector<std::pair<uint32_t, std::string>> const online =
+        { { 30, "Cora" }, { 10, "Alba" }, { 20, "Bern" }, { 40, "Dana" }, { 50, "Elke" } };
+
+    // Bare init with several online bots: exactly ONE deterministic target
+    // (the lowest GUID), never a fan-out.
+    auto targets = ResolveCommandTargets(CommandTargetMode::FirstAvailable, "", online);
+    LIVING_CHECK(targets.size() == 1);
+    LIVING_CHECK(targets[0] == 10);
+
+    // Deterministic regardless of enumeration order.
+    std::vector<std::pair<uint32_t, std::string>> const shuffled =
+        { { 50, "Elke" }, { 40, "Dana" }, { 30, "Cora" }, { 20, "Bern" }, { 10, "Alba" } };
+    auto again = ResolveCommandTargets(CommandTargetMode::FirstAvailable, "", shuffled);
+    LIVING_CHECK(again == targets);
+
+    // An explicit name resolves that bot only.
+    auto named = ResolveCommandTargets(CommandTargetMode::FirstAvailable, "Cora", online);
+    LIVING_CHECK(named.size() == 1 && named[0] == 30);
+
+    // No online bots: no target, nothing to mutate.
+    LIVING_CHECK(ResolveCommandTargets(CommandTargetMode::FirstAvailable, "", {}).empty());
+}
+
+LIVING_TEST(command_targets_bulk_and_exact_modes)
+{
+    std::vector<std::pair<uint32_t, std::string>> const online =
+        { { 1, "Bob" }, { 2, "Bobby" }, { 3, "Ann" } };
+
+    // BulkAll bare form fans out to every online bot.
+    LIVING_CHECK(ResolveCommandTargets(CommandTargetMode::BulkAll, "", online).size() == 3);
+
+    // ExactOne bare form resolves nothing (caller shows usage instead).
+    LIVING_CHECK(ResolveCommandTargets(CommandTargetMode::ExactOne, "", online).empty());
+
+    // Names match exactly: "Bob" never targets "Bobby".
+    auto bob = ResolveCommandTargets(CommandTargetMode::ExactOne, "Bob", online);
+    LIVING_CHECK(bob.size() == 1 && bob[0] == 1);
+    LIVING_CHECK(ResolveCommandTargets(CommandTargetMode::ExactOne, "Bo", online).empty());
+}

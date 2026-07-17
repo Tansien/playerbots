@@ -909,21 +909,59 @@ void RandomPlayerbotMgr::LoginFreeBots()
 
                 Player* master = nullptr;
 
-                if (sRandomPlayerbotMgr.GetValue(botGuid, "create group"))
+                uint32 const joinAttempts = sRandomPlayerbotMgr.GetValue(botGuid, "create group");
+                if (joinAttempts && time(0) >= groupJoinBackoffUntil[botGuid])
                 {
-                    std::string groupWith = sRandomPlayerbotMgr.GetData(botGuid, "create group");
+                    // The stored data is a stable target GUID (creation
+                    // resolves it before any mutation); legacy rows may still
+                    // hold a name. The event is cleared ONLY on verified
+                    // membership or a terminal outcome - offline targets, full
+                    // groups and failed invites keep it for a bounded retry.
+                    std::string const groupWith = sRandomPlayerbotMgr.GetData(botGuid, "create group");
 
-                    if (!groupWith.empty())
+                    bool targetExists = false;
+                    Player* target = nullptr;
+                    uint32 targetGuidLow = 0;
+                    if (living::TryParseUInt32InRange(groupWith, 1, 0xFFFFFFFFu, targetGuidLow))
                     {
-                        master = sObjectAccessor.FindPlayerByName(groupWith.c_str());
-
-                        if (master)
-                        {
-                            bot->GetPlayerbotAI()->DoSpecificAction("join", Event("create group", "", master));
-                        }
+                        ObjectGuid const targetGuid(HIGHGUID_PLAYER, targetGuidLow);
+                        targetExists = sObjectMgr.GetPlayerAccountIdByGUID(targetGuid) != 0;
+                        target = sObjectMgr.GetPlayer(targetGuid);
+                    }
+                    else if (!groupWith.empty())
+                    {
+                        targetExists = bool(sObjectMgr.GetPlayerGuidByName(groupWith));
+                        target = sObjectAccessor.FindPlayerByName(groupWith.c_str());
                     }
 
-                    sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
+                    bool membershipVerified = false;
+                    if (target)
+                    {
+                        master = target;
+                        bot->GetPlayerbotAI()->DoSpecificAction("join", Event("create group", "", target));
+                        // Verify the RESULTING membership; the action's return
+                        // value alone cannot prove the invite stuck.
+                        membershipVerified = bot->GetGroup() && bot->GetGroup() == target->GetGroup();
+                    }
+
+                    living::GroupJoinPlan const plan = living::PlanGroupJoinAttempt(
+                        targetExists, target != nullptr, membershipVerified,
+                        joinAttempts - 1, /*maxAttempts*/ 10, /*baseDelaySeconds*/ 30);
+
+                    if (plan.decision == living::GroupJoinDecision::RetryLater)
+                    {
+                        sRandomPlayerbotMgr.SetValue(botGuid, "create group", plan.attemptNumber + 1, groupWith);
+                        groupJoinBackoffUntil[botGuid] = time(0) + plan.retryDelaySeconds;
+                    }
+                    else
+                    {
+                        if (plan.decision == living::GroupJoinDecision::ClearTerminal)
+                            sLog.outDetail("Bot %s: giving up on group target '%s' (%s)", bot->GetName(), groupWith.c_str(),
+                                targetExists ? "retry budget exhausted" : "target deleted");
+
+                        sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
+                        groupJoinBackoffUntil.erase(botGuid);
+                    }
                 }
 
                 if (sRandomPlayerbotMgr.GetValue(botGuid, "create gear"))
@@ -1168,9 +1206,13 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
 
         currentAllowedBotCount = currentAllowedBotCount*2;      
 
+        // Legacy global switch kept: other paths still rely on async execution.
         CharacterDatabase.AllowAsyncTransactions();
-        CharacterDatabase.BeginTransaction();
 
+        // No transaction here: SetEventValue persists each event write through
+        // its own execution-confirmed synchronous statement, and the pinned
+        // cores assert on nested BeginTransaction. Selection state (currentBots,
+        // quotas, counters) changes only after both writes for a bot succeeded.
         bool enoughBotsForCriteria = true;
 
         for (uint32 noCriteria = 0; noCriteria < 3; noCriteria++)
@@ -1270,8 +1312,19 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                     if (classRaceAllowed[cls][race] <= 0)
                         continue;
 
-                    SetEventValue(guid, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
-                    SetEventValue(guid, "logout", 0, 0);
+                    // Persist the add/logout pair BEFORE any cache/quota/counter
+                    // update. A bot whose pair cannot be fully persisted is
+                    // skipped - with the half-written marker compensated - so
+                    // runtime selection state never runs ahead of durable state.
+                    if (!SetEventValue(guid, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
+                        continue;
+
+                    if (!SetEventValue(guid, "logout", 0, 0))
+                    {
+                        SetEventValue(guid, "add", 0, 0); // compensate; on failure the setter reloads durable state
+                        continue;
+                    }
+
                     currentBots.push_back(guid);
 
                     if(!noCriteria)
@@ -1336,8 +1389,6 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                 showLoginWarning = false;
             }
         }
-
-        CharacterDatabase.CommitTransaction();
 
         if (currentAllowedBotCount)
             currentAllowedBotCount = std::max(int64(GetEventValue(0, "bot_count")) - int64(currentBots.size()), int64(0));
@@ -2423,8 +2474,9 @@ living::RelocationCompleteResult RandomPlayerbotMgr::FinalizeRelocation(Player* 
 
     uint32 const botGuid = bot->GetGUIDLow();
 
-    // The homebind reuses the exact accepted destination (and its area, resolved
-    // when the candidate was validated), never a cached pre-adjustment location.
+    // The homebind reuses the exact accepted destination and the area resolved
+    // from those FINAL coordinates (post-jitter, post-terrain-height), never a
+    // cached pre-adjustment location.
     if (record.setHomebind)
         bot->SetHomebindToLocation(WorldLocation(record.mapId, record.x, record.y, record.z, record.orientation), record.homebindAreaId);
 
@@ -2557,6 +2609,63 @@ namespace
         return sPlayerbotAIConfig.IsInRandomAccountList(player->GetSession()->GetAccountId());
     }
 
+    // The ONE complete destination-eligibility validator. It runs both as the
+    // candidate pre-filter AND - decisively - on the FINAL x/y/z produced by
+    // retry jitter and terrain-height adjustment: zone/area are recomputed from
+    // the final coordinates, expansion/faction/starter/capital/map rules all
+    // rerun, and the resolved final area is returned for the relocation record
+    // so the persisted homebind zone always matches the landing coordinates.
+    bool IsEligibleTeleportDestination(Player* bot, uint32 mapId, float x, float y, float z, AreaTableEntry const*& outArea)
+    {
+        outArea = nullptr;
+
+        if (!MapManager::IsValidMapCoord(mapId, x, y, z, 0))
+            return false;
+
+        uint32 zoneId, areaId;
+        sTerrainMgr.GetZoneAndAreaId(zoneId, areaId, mapId, x, y, z);
+        AreaTableEntry const* area = GetAreaEntryByAreaID(areaId);
+        if (!area)
+            return false;
+
+#ifndef MANGOSBOT_ZERO
+        // Do not teleport to outland before portal opening (allow new races zones)
+        if (sWorldState.GetExpansion() == EXPANSION_NONE && (mapId == 571 || (mapId == 530 && area->team != 2 && area->team != 4)))
+            return false;
+#endif
+
+        bool const expansionZones =
+#ifdef MANGOSBOT_ZERO
+            false;
+#else
+            true;
+#endif
+
+        if (zoneId && zoneId != areaId)
+        {
+            AreaTableEntry const* zone = GetAreaEntryByAreaID(zoneId);
+            if (!zone)
+                return false;
+
+            bool const zoneIsEnemy = (zone->team == AREATEAM_ALLY && bot->GetTeam() != ALLIANCE)
+                || (zone->team == AREATEAM_HORDE && bot->GetTeam() != HORDE);
+
+            if (living::DestinationBlockedByEnemyZone(zoneIsEnemy, (zone->flags & AREA_FLAG_CAPITAL) != 0, bot->GetLevel()))
+                return false;
+
+            if (living::DestinationBlockedByStarterZone(zoneId, bot->getRace(), bot->GetTeam() == ALLIANCE, bot->GetLevel(), expansionZones))
+                return false;
+        }
+
+        bool const areaIsEnemy = (area->team == AREATEAM_ALLY && bot->GetTeam() != ALLIANCE)
+            || (area->team == AREATEAM_HORDE && bot->GetTeam() != HORDE);
+
+        if (living::DestinationBlockedByEnemyArea(areaIsEnemy, bot->GetLevel()))
+            return false;
+
+        outArea = area;
+        return true;
+    }
 }
 
 living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, living::PendingRelocation flags, bool activeOnly)
@@ -2702,80 +2811,13 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
         }*/
     }
 
-    // filter starter zones
+    // Candidate pre-filter: the SAME complete eligibility validator that later
+    // decides the final jittered/ground-adjusted tuple, run here on the raw
+    // candidate to avoid burning attempts on hopeless locations.
     tlocs.erase(std::remove_if(tlocs.begin(), tlocs.end(), [bot](const WorldPosition& l)
     {
-        uint32 mapId = l.getMapId();
-        uint32 zoneId, areaId;
-        sTerrainMgr.GetZoneAndAreaId(zoneId, areaId, mapId, l.coord_x, l.coord_y, l.coord_z);
-        AreaTableEntry const* area = GetAreaEntryByAreaID(areaId);
-        if (zoneId && zoneId != areaId)
-        {
-            AreaTableEntry const* zone = GetAreaEntryByAreaID(zoneId);
-            if (!zone)
-                return true;
-
-            bool isEnemyZone = false;
-            switch (zone->team)
-            {
-            case AREATEAM_ALLY:
-                isEnemyZone = bot->GetTeam() != ALLIANCE;
-                break;
-            case AREATEAM_HORDE:
-                isEnemyZone = bot->GetTeam() != HORDE;
-                break;
-            default:
-                isEnemyZone = false;
-                break;
-            }
-            if (isEnemyZone && (bot->GetLevel() < 21 || (zone->flags & AREA_FLAG_CAPITAL)))
-                return true;
-
-            // filter other races zones
-            if (bot->GetLevel() < 30)
-            {
-                if ((zoneId == 12 || zoneId == 40) && bot->getRace() != RACE_HUMAN)
-                    return true;
-                if ((zoneId == 1 || zoneId == 38) && bot->getRace() != RACE_DWARF)
-                    return true;
-                if ((zoneId == 85 || zoneId == 130) && bot->getRace() != RACE_UNDEAD)
-                    return true;
-                if ((zoneId == 141 || zoneId == 148) && bot->getRace() != RACE_NIGHTELF)
-                    return true;
-                if ((zoneId == 14 || zoneId == 17) && !(bot->getRace() == RACE_ORC || bot->getRace() == RACE_TROLL))
-                    return true;
-                if ((zoneId == 215) && bot->getRace() != RACE_TAUREN)
-                    return true;
-                // redridge / duskwood
-                if ((zoneId == 44 || zoneId == 10) && bot->GetTeam() != ALLIANCE)
-                    return true;
-#ifndef MANGOSBOT_ZERO
-                if ((zoneId == 3524 || zoneId == 3525) && bot->getRace() != RACE_DRAENEI)
-                    return true;
-                if ((zoneId == 3430 || zoneId == 3433) && bot->getRace() != RACE_BLOODELF)
-                    return true;
-#endif
-            }
-        }
-
-        if (!area)
-            return true;
-
-        bool isEnemyZone = false;
-        switch (area->team)
-        {
-        case AREATEAM_ALLY:
-            isEnemyZone = bot->GetTeam() != ALLIANCE;
-            break;
-        case AREATEAM_HORDE:
-            isEnemyZone = bot->GetTeam() != HORDE;
-            break;
-        default:
-            isEnemyZone = false;
-            break;
-        }
-        return isEnemyZone && bot->GetLevel() < 21;
-
+        AreaTableEntry const* area = nullptr;
+        return !IsEligibleTeleportDestination(bot, l.getMapId(), l.coord_x, l.coord_y, l.coord_z, area);
     }), tlocs.end());
 
     if (tlocs.empty())
@@ -2818,17 +2860,6 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
             if (!map)
                 continue;
 
-            uint32 areaId = sTerrainMgr.GetAreaId(loc.mapid, x, y, z);
-            AreaTableEntry const* area = GetAreaEntryByAreaID(areaId);
-            if (!area)
-                continue;
-
-#ifndef MANGOSBOT_ZERO
-            // Do not teleport to outland before portal opening (allow new races zones)
-            if (sWorldState.GetExpansion() == EXPANSION_NONE && (loc.mapid == 571 || (loc.mapid == 530 && area->team != 2 && area->team != 4)))
-                continue;
-#endif
-
 #ifdef MANGOSBOT_TWO
             float ground = map->GetHeight(bot->GetPhaseMask(), x, y, z + 0.5f);
 #else
@@ -2839,9 +2870,16 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
 
             z = 0.05f + ground;
 
-            // Preflight the core's own coordinate rejection so TeleportTo cannot
-            // fail after this point for a reason known in advance.
-            if (!MapManager::IsValidMapCoord(loc.mapid, x, y, z, 0))
+            // The FINAL tuple is now known (jitter applied, z replaced by the
+            // terrain height). Rerun the complete eligibility validation on
+            // exactly these coordinates: jitter or vertical area resolution may
+            // have crossed an expansion/faction/starter/capital boundary the
+            // raw candidate satisfied, and the area recorded for the homebind
+            // must be the area of the LANDING spot. This also preflights the
+            // core's own coordinate rejection so TeleportTo cannot fail for a
+            // reason known in advance.
+            AreaTableEntry const* area = nullptr;
+            if (!IsEligibleTeleportDestination(bot, loc.mapid, x, y, z, area))
                 continue;
 
             sLog.outDetail("Random teleporting bot %s to %s %f,%f,%f (%u/%zu locations)",
@@ -3586,37 +3624,79 @@ bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 val
     CharacterDatabase.escape_string(escapedEvent);
     CharacterDatabase.escape_string(escapedData);
 
-    // The DELETE+INSERT pair replaces atomically inside one transaction, and
-    // the cache changes only after the statements were accepted.
-    CharacterDatabase.BeginTransaction();
-
-    bool ok = CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
-            bot, escapedEvent.c_str());
-    if (value)
-    {
-        if (data != "")
+    // Execution-confirmed persistence only. In the pinned cores PExecute merely
+    // queues while a transaction is open, async CommitTransaction returns true
+    // after queueing, and CommitTransactionDirect discards the transaction's
+    // execution result - none of those return values can confirm durability.
+    // The old unconditional BeginTransaction here also nested (and asserted)
+    // inside callers that already batch, so this setter owns no transaction: it
+    // runs exactly one synchronous DirectPExecute whose return value is the
+    // actual execution result. A nonzero value UPDATEs existing matching rows
+    // or INSERTs a new one (decided by a synchronous probe); zero DELETEs.
+    uint32 const now = (uint32)time(0);
+    living::EventPersistOutcome const outcome = living::PersistEventValue(event, data, value,
+        [&]() -> std::optional<bool>
         {
-            ok = CharacterDatabase.PExecute(
-                "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`, `data`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u', '%s')",
-                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value, escapedData.c_str()) && ok;
-        }
-        else
+            // COUNT(*) always yields a row, so a null result is a failed probe,
+            // never an empty one.
+            auto result = CharacterDatabase.PQuery(
+                "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+                bot, escapedEvent.c_str());
+            if (!result)
+                return std::nullopt;
+
+            return result->Fetch()[0].GetUInt32() > 0;
+        },
+        [&](living::EventWriteKind kind)
         {
-            ok = CharacterDatabase.PExecute(
-                "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u')",
-                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value) && ok;
-        }
-    }
+            switch (kind)
+            {
+                case living::EventWriteKind::Delete:
+                    return CharacterDatabase.DirectPExecute(
+                        "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+                        bot, escapedEvent.c_str());
+                case living::EventWriteKind::Update:
+                    return CharacterDatabase.DirectPExecute(
+                        "UPDATE ai_playerbot_random_bots SET `time` = '%u', validIn = '%u', `value` = '%u', `data` = '%s' WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+                        now, validIn, value, escapedData.c_str(), bot, escapedEvent.c_str());
+                case living::EventWriteKind::Insert:
+                default:
+                    return CharacterDatabase.DirectPExecute(
+                        "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`, `data`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u', '%s')",
+                        0, bot, now, validIn, escapedEvent.c_str(), value, escapedData.c_str());
+            }
+        });
 
-    ok = CharacterDatabase.CommitTransaction() && ok;
-
-    if (!ok)
+    if (outcome == living::EventPersistOutcome::Rejected || outcome == living::EventPersistOutcome::ProbeFailed)
     {
-        sLog.outError("SetEventValue failed to persist event '%s' for bot %u; cache left unchanged", event.c_str(), bot);
+        sLog.outError("SetEventValue could not persist event '%s' for bot %u (%s); cache left unchanged",
+            event.c_str(), bot, outcome == living::EventPersistOutcome::Rejected ? "schema" : "probe failed");
         return false;
     }
 
-    CachedEvent e(value, (uint32)time(0), validIn, data);
+    if (outcome == living::EventPersistOutcome::ExecuteFailed)
+    {
+        // The statement failed after the probe: durable state is uncertain, so
+        // reload it instead of publishing the intended value optimistically.
+        // Last row wins, mirroring the bulk loader in GetEventValue.
+        sLog.outError("SetEventValue failed to persist event '%s' for bot %u; reloading durable value", event.c_str(), bot);
+        if (auto reload = CharacterDatabase.PQuery(
+                "SELECT `value`, `time`, validIn, `data` FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+                bot, escapedEvent.c_str()))
+        {
+            do
+            {
+                Field* fields = reload->Fetch();
+                eventCache[bot][event] = CachedEvent(fields[0].GetUInt32(), fields[1].GetUInt32(), fields[2].GetUInt32(), fields[3].GetString());
+            } while (reload->NextRow());
+        }
+        else
+            eventCache[bot].erase(event);
+
+        return false;
+    }
+
+    CachedEvent e(value, now, validIn, data);
     eventCache[bot][event] = e;
     return true;
 }
@@ -3716,26 +3796,29 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
     }
 
     // Per-command target policy: destructive commands never acquire implicit
-    // bulk targeting. `bulkAllowed` is set ONLY for commands whose help
-    // documents a bare bulk form; `nameOnly` commands accept exactly one
-    // target name and nothing else.
+    // bulk targeting. BulkAll is set ONLY for commands whose help documents a
+    // bare bulk form; init's contract is "the first available bot", so its bare
+    // form deterministically targets one bot, never every bot. `acceptsParams`
+    // marks the commands whose help documents extra arguments; everything else
+    // rejects unexpected arguments with usage instead of silently ignoring
+    // them.
     struct PlayerCommandSpec
     {
         ConsolePlayerCommandHandler handler;
-        bool bulkAllowed;
-        bool nameOnly;
+        living::CommandTargetMode mode;
+        bool acceptsParams;
     };
 
     std::map<std::string, PlayerCommandSpec> playerHandlers;
-    playerHandlers["init"] = { &RandomPlayerbotMgr::HandleRandomizeFirst, true, false };
-    playerHandlers["upgrade"] = { &RandomPlayerbotMgr::HandleUpdateGearSpells, true, false };
-    playerHandlers["refresh"] = { &RandomPlayerbotMgr::HandleRefresh, true, false };
-    playerHandlers["teleport"] = { &RandomPlayerbotMgr::HandleRandomTeleportForLevel, true, false };
-    playerHandlers["rpg"] = { &RandomPlayerbotMgr::HandleRandomTeleportForRpg, true, false };
-    playerHandlers["revive"] = { &RandomPlayerbotMgr::HandleRevive, true, false };
-    playerHandlers["grind"] = { &RandomPlayerbotMgr::HandleRandomTeleport, true, false };
-    playerHandlers["change_strategy"] = { &RandomPlayerbotMgr::HandleChangeStrategy, false, false };
-    playerHandlers["remove"] = { &RandomPlayerbotMgr::HandleRemove, false, true };
+    playerHandlers["init"] = { &RandomPlayerbotMgr::HandleRandomizeFirst, living::CommandTargetMode::FirstAvailable, false };
+    playerHandlers["upgrade"] = { &RandomPlayerbotMgr::HandleUpdateGearSpells, living::CommandTargetMode::BulkAll, false };
+    playerHandlers["refresh"] = { &RandomPlayerbotMgr::HandleRefresh, living::CommandTargetMode::BulkAll, false };
+    playerHandlers["teleport"] = { &RandomPlayerbotMgr::HandleRandomTeleportForLevel, living::CommandTargetMode::BulkAll, false };
+    playerHandlers["rpg"] = { &RandomPlayerbotMgr::HandleRandomTeleportForRpg, living::CommandTargetMode::BulkAll, false };
+    playerHandlers["revive"] = { &RandomPlayerbotMgr::HandleRevive, living::CommandTargetMode::BulkAll, false };
+    playerHandlers["grind"] = { &RandomPlayerbotMgr::HandleRandomTeleport, living::CommandTargetMode::BulkAll, false };
+    playerHandlers["change_strategy"] = { &RandomPlayerbotMgr::HandleChangeStrategy, living::CommandTargetMode::ExactOne, true };
+    playerHandlers["remove"] = { &RandomPlayerbotMgr::HandleRemove, living::CommandTargetMode::ExactOne, false };
 
     for (auto& [prefix, spec] : playerHandlers)
     {
@@ -3773,28 +3856,31 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
 
         // Destructive/per-bot commands require one explicit exact target; bare
         // and whitespace-only forms return usage without touching any bot.
-        if (name.empty() && !spec.bulkAllowed)
+        if (name.empty() && spec.mode == living::CommandTargetMode::ExactOne)
         {
             emit(GetCommandTexts(prefix));
             return true;
         }
 
-        if (spec.nameOnly && tokens.size() > 1)
+        // Undocumented extra arguments are rejected with usage, never silently
+        // ignored or misread as part of a target name.
+        if (!params.empty() && !spec.acceptsParams)
         {
             emit(GetCommandTexts(prefix));
             return true;
         }
-
-        sRandomPlayerbotMgr.consoleCmdParams = params;
 
         // Phase 1: resolve stable targets by GUID without mutating anything. A
         // named target matches EXACTLY - prefix matching made "remove Bob" also
-        // remove Bobby.
-        std::vector<uint32> targets;
+        // remove Bobby - and cardinality is the MODE's property: bare init
+        // resolves at most ONE bot (lowest online GUID, deterministically),
+        // while only BulkAll commands fan out.
+        std::vector<std::pair<uint32, std::string>> onlineBots;
         sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* bot) {
-            if (name.empty() || name == bot->GetName())
-                targets.push_back(bot->GetGUIDLow());
+            onlineBots.emplace_back(bot->GetGUIDLow(), bot->GetName());
         });
+
+        std::vector<uint32> targets = living::ResolveCommandTargets(spec.mode, name, onlineBots);
 
         if (targets.empty())
         {
@@ -3908,10 +3994,9 @@ void RandomPlayerbotMgr::OnPlayerLogout(Player* player)
 
 void RandomPlayerbotMgr::OnBotLoginInternal(Player * const bot)
 {
-    // A fresh login invalidates any relocation left pending across a logout or
-    // a mid-teleport disconnect; it is dropped without claiming completion, and
-    // the untouched retry markers drive a new attempt.
-    CancelPendingRelocation(bot->GetGUIDLow());
+    // Pending-relocation invalidation on login lives in the shared
+    // PlayerbotHolder::OnBotLogin, which runs for every holder and master
+    // arrangement (this hook is skipped for real-player-mastered bots).
 
     sLog.outDetail("%u/%d Bot %s logged in", GetPlayerbotsAmount(), sRandomPlayerbotMgr.GetMaxAllowedBotCount(), bot->GetName());
 	//if (loginProgressBar && playerBots.size() < sRandomPlayerbotMgr.GetMaxAllowedBotCount()) { loginProgressBar->step(); }
@@ -4361,8 +4446,14 @@ void RandomPlayerbotMgr::Remove(Player* bot)
 {
     uint32 owner = bot->GetGUIDLow();
     CancelPendingRelocation(owner);
-    CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%d'", owner);
-    eventCache[owner].clear();
+
+    // Execution-confirmed delete: the cache is cleared only after the rows are
+    // actually gone (a queued PExecute is not durable success, and clearing
+    // first published a state the DB might never reach).
+    if (CharacterDatabase.DirectPExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%d'", owner))
+        eventCache[owner].clear();
+    else
+        sLog.outError("Remove: failed to delete random-bot events for bot %u; cache left for reload", owner);
 
     LogoutPlayerBot(owner);
 }
@@ -4594,7 +4685,7 @@ std::unordered_map<std::string, std::string> RandomPlayerbotMgr::GetCommandTexts
 {
     return std::unordered_map<std::string, std::string>
     {
-        {"init", "Randomize the first available bot.\nUsage: init"},
+        {"init", "Randomize the first available bot (or one exact named bot).\nUsage: init [botname]"},
         {"upgrade", "Update gear and spells for all random bots.\nUsage: upgrade"},
         {"refresh", "Log out and log in all random bots to refresh their status.\nUsage: refresh"},
         {"teleport", "Teleport all random bots to a location suitable for their level.\nUsage: teleport"},

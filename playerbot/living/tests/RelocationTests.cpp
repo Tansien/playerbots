@@ -157,3 +157,53 @@ LIVING_TEST(relocation_revive_flags_travel_with_the_record)
     LIVING_CHECK(completed.rpgTravelCooldown);
     LIVING_CHECK(!completed.setHomebind);
 }
+
+// Destination-eligibility policy: the SAME rules the one production validator
+// (IsEligibleTeleportDestination) runs on the FINAL jittered/ground-adjusted
+// tuple. Terrain/vertical area resolution itself is core-bound and only
+// exercised in-world; these cover the policy boundaries.
+
+LIVING_TEST(relocation_destination_enemy_zone_boundaries)
+{
+    // Enemy zone blocks below 21; level 21 is allowed.
+    LIVING_CHECK(DestinationBlockedByEnemyZone(true, false, 20));
+    LIVING_CHECK(!DestinationBlockedByEnemyZone(true, false, 21));
+
+    // Enemy CAPITALS block at any level.
+    LIVING_CHECK(DestinationBlockedByEnemyZone(true, true, 60));
+
+    // Friendly/neutral zones never block, capital or not.
+    LIVING_CHECK(!DestinationBlockedByEnemyZone(false, true, 5));
+
+    // Sub-zone (area team) rule: below 21 only.
+    LIVING_CHECK(DestinationBlockedByEnemyArea(true, 20));
+    LIVING_CHECK(!DestinationBlockedByEnemyArea(true, 21));
+    LIVING_CHECK(!DestinationBlockedByEnemyArea(false, 20));
+}
+
+LIVING_TEST(relocation_destination_starter_zone_boundaries)
+{
+    // Elwynn (12) admits humans (race 1) only, below level 30.
+    LIVING_CHECK(DestinationBlockedByStarterZone(12, 4, true, 29, true));  // night elf
+    LIVING_CHECK(!DestinationBlockedByStarterZone(12, 1, true, 29, true)); // human
+    LIVING_CHECK(!DestinationBlockedByStarterZone(12, 4, true, 30, true)); // level 30+
+
+    // Durotar (14) admits orcs (2) and trolls (8).
+    LIVING_CHECK(!DestinationBlockedByStarterZone(14, 2, false, 10, true));
+    LIVING_CHECK(!DestinationBlockedByStarterZone(14, 8, false, 10, true));
+    LIVING_CHECK(DestinationBlockedByStarterZone(14, 6, false, 10, true)); // tauren
+
+    // Redridge (44) / Duskwood (10) are team-gated, not race-gated.
+    LIVING_CHECK(DestinationBlockedByStarterZone(44, 2, false, 10, true));
+    LIVING_CHECK(!DestinationBlockedByStarterZone(44, 1, true, 10, true));
+
+    // TBC starter zones apply only where the expansion races exist.
+    LIVING_CHECK(DestinationBlockedByStarterZone(3524, 1, true, 10, true));   // human in Azuremyst
+    LIVING_CHECK(!DestinationBlockedByStarterZone(3524, 11, true, 10, true)); // draenei
+    LIVING_CHECK(!DestinationBlockedByStarterZone(3524, 1, true, 10, false)); // classic core
+    LIVING_CHECK(DestinationBlockedByStarterZone(3430, 1, false, 10, true));  // Eversong
+    LIVING_CHECK(!DestinationBlockedByStarterZone(3430, 10, false, 10, true)); // blood elf
+
+    // Non-starter zones never block.
+    LIVING_CHECK(!DestinationBlockedByStarterZone(33, 1, true, 10, true)); // Stranglethorn
+}

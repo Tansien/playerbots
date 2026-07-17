@@ -1,12 +1,36 @@
 #pragma once
 
+#include "LivingEventSchema.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace living
 {
+    // Validates every event value bot creation may later persist against the
+    // real schema limits BEFORE any account allocation, GUID allocation, or
+    // SaveToDB. Returns "" when everything fits, otherwise the name of the
+    // offending field: an oversized value used to be rejected only after the
+    // character was already persisted, leaving a permanent bot without its
+    // required grouping/gear/test metadata while creation reported success.
+    inline std::string FindOversizedCreationValue(std::string const& gear, std::string const& groupWith,
+        std::string const& testName, std::string const& temporaryName)
+    {
+        if (!EventValueFitsSchema("create gear", gear))
+            return "gear";
+        if (!EventValueFitsSchema("create group", groupWith))
+            return "group";
+        if (!EventValueFitsSchema("test", testName))
+            return "test";
+        if (!EventValueFitsSchema("temporary", temporaryName))
+            return "name";
+
+        return "";
+    }
+
     // Typed outcome of one bot-creation attempt. Group creation must decide
     // success from THIS value, never by matching substrings in accumulated chat
     // messages: message sniffing counted later failures as created after one
@@ -48,6 +72,61 @@ namespace living
 
         static bool Counted(BotCreateStatus status) { return status == BotCreateStatus::Created; }
     };
+
+    // Outcome planning for one requested-group join attempt at bot login. The
+    // `create group` event is cleared ONLY on verified group membership or a
+    // deliberately terminal outcome (deleted target, retry budget exhausted).
+    // Offline targets, temporarily full groups and failed/declined invites keep
+    // the event for a later bounded retry - the join result is never ignored
+    // and the event never cleared unconditionally.
+    enum class GroupJoinDecision
+    {
+        // Keep the event and retry after the backoff delay.
+        RetryLater,
+        // Membership was verified: clear the event as completed work.
+        ClearJoined,
+        // No later attempt can succeed (deleted target) or the retry budget is
+        // exhausted: clear the event deliberately.
+        ClearTerminal,
+    };
+
+    struct GroupJoinPlan
+    {
+        GroupJoinDecision decision = GroupJoinDecision::RetryLater;
+        uint32_t attemptNumber = 0;     // the attempt just consumed (1-based)
+        uint32_t retryDelaySeconds = 0; // backoff before the next attempt
+    };
+
+    inline GroupJoinPlan PlanGroupJoinAttempt(bool targetExists, bool targetOnline, bool membershipVerified,
+        uint32_t attemptsSoFar, uint32_t maxAttempts, uint32_t baseDelaySeconds)
+    {
+        GroupJoinPlan plan;
+        plan.attemptNumber = attemptsSoFar + 1;
+
+        if (!targetExists)
+        {
+            plan.decision = GroupJoinDecision::ClearTerminal;
+            return plan;
+        }
+
+        if (targetOnline && membershipVerified)
+        {
+            plan.decision = GroupJoinDecision::ClearJoined;
+            return plan;
+        }
+
+        if (plan.attemptNumber >= maxAttempts)
+        {
+            plan.decision = GroupJoinDecision::ClearTerminal;
+            return plan;
+        }
+
+        plan.decision = GroupJoinDecision::RetryLater;
+        // ponytail: linear backoff; switch to exponential if login passes ever
+        // measurably spam.
+        plan.retryDelaySeconds = baseDelaySeconds * plan.attemptNumber;
+        return plan;
+    }
 
     // Consumes one unit of a role/class quota, refusing to wrap: decrementing a
     // zero quota corrupted the remaining allowance for the whole run. Returns
@@ -119,4 +198,44 @@ namespace living
     // ignored the filters.) Returns false for an empty/all-zero weight set or
     // an out-of-range draw.
     bool PickWeightedIndex(std::vector<uint32_t> const& weights, uint64_t draw, size_t& outIndex);
+
+    // Unbiased draw in [0, boundExclusive) assembled from full-range 32-bit
+    // draws (rejection sampling: only the residue-complete prefix of the
+    // 64-bit space is accepted, so every value keeps exactly equal
+    // probability). `rand32` must return uniform uint32 over the full range.
+    template <typename RandFn>
+    uint64_t DrawBounded64(uint64_t boundExclusive, RandFn&& rand32)
+    {
+        if (boundExclusive <= 1)
+            return 0;
+
+        // Largest multiple of the bound representable in 64 bits; draws at or
+        // above it are rejected instead of folding unevenly into the residues.
+        uint64_t const acceptBelow = (UINT64_MAX / boundExclusive) * boundExclusive;
+        for (;;)
+        {
+            uint64_t const hi = rand32();
+            uint64_t const lo = rand32();
+            uint64_t const r = (hi << 32) | lo;
+            if (r < acceptBelow)
+                return r % boundExclusive;
+        }
+    }
+
+    // The production weighted-tuple selector: sums the weights in uint64 (a
+    // custom-weight total above UINT32_MAX used to be truncated before urand),
+    // draws unbiased over the full 64-bit total, and picks the bucket. Returns
+    // false for an empty/all-zero weight set.
+    template <typename RandFn>
+    bool PickWeightedIndex64(std::vector<uint32_t> const& weights, RandFn&& rand32, size_t& outIndex)
+    {
+        uint64_t total = 0;
+        for (uint32_t const weight : weights)
+            total += weight;
+
+        if (total == 0)
+            return false;
+
+        return PickWeightedIndex(weights, DrawBounded64(total, rand32), outIndex);
+    }
 }

@@ -222,7 +222,6 @@ public:
         typedef std::list<std::string> (RandomPlayerbotMgr::*ConsoleCommandHandler) (std::string param);
         typedef std::list<std::string> (RandomPlayerbotMgr::*ConsolePlayerCommandHandler) (Player*);
 
-        std::string consoleCmdParams;
 
         std::list<std::string> HandleHelp(std::string param);
         std::list<std::string> HandleConsoleReset(std::string param);
@@ -262,6 +261,10 @@ public:
         std::map<uint32, std::map<uint32, std::vector<std::pair<ObjectGuid, WorldLocation>> > > innCacheLevel;
         std::map<Team, std::map<BattleGroundTypeId, std::list<uint32> > > BattleMastersCache;
         std::map<uint32, std::map<std::string, CachedEvent> > eventCache;
+        // Next-allowed group-join attempt per bot (bounded retry backoff for
+        // the `create group` event; in-memory only - a restart simply retries
+        // sooner).
+        std::map<uint32, time_t> groupJoinBackoffUntil;
         BarGoLink* loginProgressBar;
         std::list<uint32> currentBots;
         std::list<uint32> arenaTeamMembers;

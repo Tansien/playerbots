@@ -159,3 +159,108 @@ LIVING_TEST(weighted_pick_uses_exclusive_bound_and_filtered_weights)
     }
     LIVING_CHECK(counts[0] == 3 && counts[1] == 0 && counts[2] == 2);
 }
+
+LIVING_TEST(creation_metadata_validated_before_any_mutation)
+{
+    // 255 bytes fits every field; 256 must fail BEFORE account/character
+    // mutation (CreateBot runs exactly this check before GetOrCreateAccount).
+    std::string const atLimit(255, 'x');
+    std::string const oversized(256, 'x');
+
+    LIVING_CHECK(FindOversizedCreationValue(atLimit, atLimit, atLimit, atLimit).empty());
+    LIVING_CHECK(FindOversizedCreationValue(oversized, "", "", "") == "gear");
+    LIVING_CHECK(FindOversizedCreationValue("", oversized, "", "") == "group");
+    LIVING_CHECK(FindOversizedCreationValue("", "", oversized, "") == "test");
+    LIVING_CHECK(FindOversizedCreationValue("", "", "", oversized) == "name");
+
+    // Defaults (empty fields) always pass.
+    LIVING_CHECK(FindOversizedCreationValue("", "", "", "").empty());
+}
+
+LIVING_TEST(group_join_plan_clears_only_on_success_or_terminal)
+{
+    // Verified membership: clear as completed work.
+    auto joined = PlanGroupJoinAttempt(true, true, true, 0, 10, 30);
+    LIVING_CHECK(joined.decision == GroupJoinDecision::ClearJoined);
+
+    // Deleted target: deliberately terminal, clear.
+    auto deleted = PlanGroupJoinAttempt(false, false, false, 0, 10, 30);
+    LIVING_CHECK(deleted.decision == GroupJoinDecision::ClearTerminal);
+
+    // Offline target: keep the event, retry with backoff.
+    auto offline = PlanGroupJoinAttempt(true, false, false, 0, 10, 30);
+    LIVING_CHECK(offline.decision == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(offline.attemptNumber == 1);
+    LIVING_CHECK(offline.retryDelaySeconds == 30);
+
+    // Online but membership not verified (full group, declined/failed invite):
+    // keep the event, retry.
+    auto fullGroup = PlanGroupJoinAttempt(true, true, false, 3, 10, 30);
+    LIVING_CHECK(fullGroup.decision == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(fullGroup.attemptNumber == 4);
+    LIVING_CHECK(fullGroup.retryDelaySeconds == 120); // backoff grows with attempts
+
+    // Bounded: the retry budget exhausts into a terminal clear, so login
+    // processing cannot spam attempts forever.
+    auto exhausted = PlanGroupJoinAttempt(true, true, false, 9, 10, 30);
+    LIVING_CHECK(exhausted.decision == GroupJoinDecision::ClearTerminal);
+}
+
+LIVING_TEST(weighted_draw_stays_in_uint64_at_and_past_uint32_max)
+{
+    // Deterministic 32-bit source: returns queued values in order.
+    auto makeRand = [](std::vector<uint32_t> values)
+    {
+        size_t next = 0;
+        return [values, next]() mutable { return values[next++ % values.size()]; };
+    };
+
+    size_t index = 999;
+
+    // Total exactly UINT32_MAX through the production selector.
+    std::vector<uint32_t> atMax = { 0xFFFFFFFEu, 1u };
+    LIVING_CHECK(PickWeightedIndex64(atMax, makeRand({ 0, 0 }), index)); // draw 0
+    LIVING_CHECK(index == 0);
+    LIVING_CHECK(PickWeightedIndex64(atMax, makeRand({ 0, 0xFFFFFFFEu }), index)); // draw UINT32_MAX-1
+    LIVING_CHECK(index == 1);
+
+    // Total UINT32_MAX + 1: the old path truncated this to 0 before urand.
+    std::vector<uint32_t> pastMax = { 0xFFFFFFFFu, 1u };
+    LIVING_CHECK(PickWeightedIndex64(pastMax, makeRand({ 0, 0xFFFFFFFEu }), index)); // last unit of bucket 0
+    LIVING_CHECK(index == 0);
+    LIVING_CHECK(PickWeightedIndex64(pastMax, makeRand({ 0, 0xFFFFFFFFu }), index)); // the 2^32-th unit -> bucket 1
+    LIVING_CHECK(index == 1);
+
+    // Heavily skewed custom weights: a huge bucket followed by tiny ones still
+    // maps every unit of weight to exactly one entry.
+    std::vector<uint32_t> skewed = { 0xFFFFFFF0u, 1u, 1u };
+    LIVING_CHECK(PickWeightedIndex64(skewed, makeRand({ 0, 0xFFFFFFF0u }), index)); // first unit after bucket 0
+    LIVING_CHECK(index == 1);
+    LIVING_CHECK(PickWeightedIndex64(skewed, makeRand({ 0, 0xFFFFFFF1u }), index));
+    LIVING_CHECK(index == 2);
+
+    // All-zero and empty weight sets fail closed.
+    LIVING_CHECK(!PickWeightedIndex64({}, makeRand({ 0 }), index));
+    LIVING_CHECK(!PickWeightedIndex64({ 0, 0 }, makeRand({ 0 }), index));
+}
+
+LIVING_TEST(bounded_draw_rejection_sampling_is_unbiased)
+{
+    // For bound 6, acceptBelow = (UINT64_MAX / 6) * 6 = 2^64 - 4: the top four
+    // 64-bit values fold unevenly and MUST be rejected, not wrapped.
+    size_t calls = 0;
+    auto rigged = [&calls]() -> uint32_t
+    {
+        // First 64-bit draw: 0xFFFFFFFF'FFFFFFFF (rejected), second: 7.
+        static uint32_t const script[] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 7u };
+        return script[calls++];
+    };
+
+    LIVING_CHECK(DrawBounded64(6, rigged) == 1); // 7 % 6, after one rejection
+    LIVING_CHECK(calls == 4);
+
+    // Degenerate bounds need no randomness.
+    auto neverCalled = []() -> uint32_t { throw living::test::Failure{}; };
+    LIVING_CHECK(DrawBounded64(1, neverCalled) == 0);
+    LIVING_CHECK(DrawBounded64(0, neverCalled) == 0);
+}

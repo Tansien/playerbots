@@ -2,6 +2,9 @@
 #include "playerbot/playerbot.h"
 #include "AhAction.h"
 #include "playerbot/living/util/LivingAuction.h"
+
+#include <algorithm>
+#include <random>
 #include "playerbot/strategy/values/ItemCountValue.h"
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/BudgetValues.h"
@@ -214,9 +217,12 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
 
     AuctionEntry* auction = nullptr;
 
+    // Candidates hold the auction ID, never the entry pointer: an earlier
+    // buyout in the same batch removes (frees) the won auction, so a stored
+    // pointer to a later candidate could dangle by the time it is revisited.
     struct BidCandidate
     {
-        AuctionEntry* auction;
+        uint32 auctionId;
         uint32 cost;
         bool isBuyout;
         uint32 power;
@@ -229,8 +235,11 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
         uint32 count, totalcount = 0;
         auctionHouse->BuildListBidderItems(data, bot, 9999, count, totalcount);
 
-        if (totalcount > 10) //Already have 10 bids, stop.
-            return false;
+        // Standing-bid budget: >= 10 existing bids is AT capacity (the old
+        // `> 10` permitted an eleventh). The cap gates each NON-buyout bid
+        // right before it is sent; buyouts never consume a slot, so a bot at
+        // the cap may still buy out.
+        living::StandingBidCap bidCap(totalcount, 10);
 
         std::unordered_map <ItemUsage, int32> freeMoney;
 
@@ -242,25 +251,30 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
 
         std::vector<BidCandidate> candidates;
 
-        uint32 checkNumAuctions = map.size();
+        // BotCheckAllAuctionListings=1 scans EVERY auction exactly once. The
+        // old code performed map.size() random draws WITH replacement, which
+        // visits only ~63% of a large house on average. The bounded path
+        // (setting disabled) samples without replacement, so no draw is wasted
+        // on a duplicate either.
+        std::vector<AuctionEntry*> toScan;
+        toScan.reserve(map.size());
+        for (auto const& [auctionId, mapEntry] : map)
+            if (mapEntry)
+                toScan.push_back(mapEntry);
+
         if (!sPlayerbotAIConfig.botCheckAllAuctionListings)
         {
-            checkNumAuctions = urand(50, 250);
+            uint32 const sampleCount = std::min<uint32>(urand(50, 250), static_cast<uint32>(toScan.size()));
+            std::vector<AuctionEntry*> sampled;
+            sampled.reserve(sampleCount);
+            std::mt19937 gen(urand());
+            std::sample(toScan.begin(), toScan.end(), std::back_inserter(sampled), sampleCount, gen);
+            toScan = std::move(sampled);
         }
 
-        for (uint32 i = 0; i < checkNumAuctions; i++)
+        for (AuctionEntry* scanEntry : toScan)
         {
-            auto curAuction = std::next(std::begin(map), urand(0, map.size()-1));
-
-            auction = curAuction->second;
-
-            if (!auction)
-                continue;
-
-            if (std::find_if(candidates.begin(), candidates.end(), [auction](BidCandidate const& c){ return c.auction == auction; }) != candidates.end())
-                continue;
-
-            auction = auctionHouse->GetAuction(auction->Id);
+            auction = auctionHouse->GetAuction(scanEntry->Id);
 
             if (!auction)
                 continue;
@@ -347,7 +361,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             power *= 1000;
             power /= (cost + 1);
 
-            candidates.push_back({ auction, cost, isBuyout, power });
+            candidates.push_back({ auction->Id, cost, isBuyout, power });
         }
 
         // Sort by POWER: the old pair<pointer, power> comparison with `i > j`
@@ -362,7 +376,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             // Batched transactions revalidate CURRENT state immediately before
             // each mutation: earlier bids in this batch have already spent
             // money, so the scan-time snapshot authorizes nothing.
-            auction = auctionHouse->GetAuction(candidate.auction->Id);
+            auction = auctionHouse->GetAuction(candidate.auctionId);
 
             // Gone, changed hands, or the bot became high bidder meanwhile.
             if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
@@ -404,6 +418,11 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (cost > allowance || cost > bot->GetMoney())
                 continue;
 
+            // Enforce the standing-bid cap immediately before each NON-buyout
+            // bid; a buyout never consumes a slot and stays allowed at the cap.
+            if (!isBuyout && !bidCap.CanPlaceStandingBid())
+                continue;
+
             std::string reason = ItemUsageValue::ReasonForNeed(usage, auction, auction->itemCount, bot);
 
             bool const didBid = BidItem(requester, auction, cost, auctioneer, isBuyout, reason);
@@ -412,10 +431,11 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             // successful money mutation from the result.
             anyBid |= didBid;
 
-            if (didBid)
-                totalcount++;
+            // Only a successful STANDING bid occupies one of the 10 slots.
+            if (didBid && !isBuyout)
+                bidCap.RecordStandingBid();
 
-            if (!urand(0, 5) || totalcount > 10)
+            if (!urand(0, 5))
                 break;
         }
 
@@ -490,7 +510,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
 
         uint32 const power = auction->itemCount * 1000 / cost; // cost >= 1 by contract
 
-        candidates.push_back({ auction, cost, auction->buyout > 0 && cost == auction->buyout, power });
+        candidates.push_back({ auction->Id, cost, auction->buyout > 0 && cost == auction->buyout, power });
     }
 
     if (candidates.empty())
@@ -502,7 +522,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     // Revalidate the chosen auction's CURRENT state immediately before the bid:
     // the scan-time cost ranked candidates, it does not authorize spending.
     BidCandidate const& best = candidates.front();
-    auction = auctionHouse->GetAuction(best.auction->Id);
+    auction = auctionHouse->GetAuction(best.auctionId);
     if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
         return false;
 

@@ -2,6 +2,7 @@
 
 #include "playerbot/playerbot.h"
 #include "playerbot/living/util/LivingBotCreation.h"
+#include "playerbot/living/util/LivingRoles.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "Accounts/AccountMgr.h"
@@ -144,27 +145,11 @@ bool RandomPlayerbotFactory::isAvailableRole(uint8 cls, BotRoles role)
     if (role == BotRoles::BOT_ROLE_NONE)
         return true;
 
-    switch (cls)
-    {
-        case CLASS_WARRIOR:
-#ifdef MANGOSBOT_TWO
-        case CLASS_DEATH_KNIGHT:
-#endif
-            return role == BotRoles::BOT_ROLE_TANK || role == BotRoles::BOT_ROLE_DPS;
-        case CLASS_PALADIN:
-        case CLASS_DRUID:
-            return true;
-        case CLASS_HUNTER:
-        case CLASS_ROGUE:
-        case CLASS_MAGE:
-        case CLASS_WARLOCK:
-            return role == BotRoles::BOT_ROLE_DPS;
-        case CLASS_PRIEST:
-        case CLASS_SHAMAN:
-            return role == BotRoles::BOT_ROLE_HEALER || role == BotRoles::BOT_ROLE_DPS;
-        default:
-            return false;
-    }
+    // Tuple capability derives from the SAME canonical spec-role mapping that
+    // talent filtering and post-selection verification use (union of the
+    // class's spec tabs, bit containment): the selector can no longer
+    // advertise a capability that talent selection cannot produce.
+    return living::RolesSatisfy(living::ClassRolesMask(cls), static_cast<uint8>(role));
 }
 
 uint8 RandomPlayerbotFactory::GetRandomClass(uint8 useRace, BotRoles role)
@@ -237,7 +222,6 @@ bool RandomPlayerbotFactory::GetRandomTuple(Team team, BotRoles role, uint8 fixe
 
     std::vector<Candidate> candidates;
     std::vector<uint32> weights;
-    uint64 total = 0;
 
     for (uint32 race = 1; race < MAX_RACES; ++race)
     {
@@ -264,15 +248,18 @@ bool RandomPlayerbotFactory::GetRandomTuple(Team team, BotRoles role, uint8 fixe
 
             candidates.push_back({ static_cast<uint8>(race), static_cast<uint8>(cls) });
             weights.push_back(weight);
-            total += weight;
         }
     }
 
     if (candidates.empty())
         return false;
 
+    // Total and draw stay in uint64 end to end: custom weights can push the
+    // filtered total past UINT32_MAX, and truncating it before urand skewed
+    // (or crashed) the draw. The unbiased 64-bit draw is built from full-range
+    // 32-bit urand() samples inside the selector.
     size_t index = 0;
-    if (!living::PickWeightedIndex(weights, urand(0, static_cast<uint32>(total) - 1), index))
+    if (!living::PickWeightedIndex64(weights, []() { return urand(0, 0xFFFFFFFFu); }, index))
         return false;
 
     outRace = candidates[index].race;
