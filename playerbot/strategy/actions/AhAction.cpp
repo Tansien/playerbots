@@ -108,20 +108,32 @@ bool AhAction::ExecuteCommand(Player* requester, std::string text, Unit* auction
         return postedItem;
     }
 
-    int pos = text.find(" ");
-    if (pos == std::string::npos) return false;
-
-    std::string priceStr = text.substr(0, pos);
-    uint32 price = 0;
-    if (ChatHelper::parseMoney(priceStr, price) != living::MoneyParseStatus::Ok)
+    // Documented syntax: ah <itemlink> <money>. The buyout price is the
+    // trailing money token (the old parse read the FIRST token as money, so
+    // only the undocumented reversed form ever worked); everything before it is
+    // the item to post.
+    size_t const lastSpace = text.rfind(' ');
+    if (lastSpace == std::string::npos)
     {
-        // A malformed or out-of-range price must not post the auction at a zero
-        // or wrapped buyout.
-        ai->TellError(requester, "Invalid price: " + priceStr);
+        ai->TellError(requester, "Usage: ah <itemlink> <price>");
         return false;
     }
 
-    std::list<Item*> found = ai->InventoryParseItems(text, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
+    std::string const priceStr = text.substr(lastSpace + 1);
+    std::string itemQuery = text.substr(0, lastSpace);
+    while (!itemQuery.empty() && itemQuery.back() == ' ')
+        itemQuery.pop_back();
+
+    uint32 price = 0;
+    if (ChatHelper::parseMoney(priceStr, price) != living::MoneyParseStatus::Ok || itemQuery.empty())
+    {
+        // A malformed or out-of-range price must not post the auction at a zero
+        // or wrapped buyout.
+        ai->TellError(requester, "Usage: ah <itemlink> <price> (a money amount like 5g)");
+        return false;
+    }
+
+    std::list<Item*> found = ai->InventoryParseItems(itemQuery, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
     if (found.empty())
         return false;
 
@@ -194,7 +206,13 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
 
     AuctionEntry* auction = nullptr;
 
-    std::vector<std::pair<AuctionEntry*, uint32>> auctionPowers;
+    struct BidCandidate
+    {
+        AuctionEntry* auction;
+        uint32 cost;
+        bool isBuyout;
+        uint32 power;
+    };
 
     if (text == "vendor")
     {
@@ -214,6 +232,8 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
         freeMoney[ItemUsage::ITEM_USAGE_AMMO] = (uint32)NeedMoneyFor::ammo;
         freeMoney[ItemUsage::ITEM_USAGE_QUEST] = freeMoney[ItemUsage::ITEM_USAGE_AH] = freeMoney[ItemUsage::ITEM_USAGE_VENDOR] = freeMoney[ItemUsage::ITEM_USAGE_FORCE_NEED] = freeMoney[ItemUsage::ITEM_USAGE_FORCE_GREED] = (uint32)NeedMoneyFor::anything;
 
+        std::vector<BidCandidate> candidates;
+
         uint32 checkNumAuctions = map.size();
         if (!sPlayerbotAIConfig.botCheckAllAuctionListings)
         {
@@ -229,7 +249,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!auction)
                 continue;
 
-            if (std::find_if(auctionPowers.begin(), auctionPowers.end(), [auction](std::pair<AuctionEntry*, uint32> i){return i.first == auction;}) != auctionPowers.end())
+            if (std::find_if(candidates.begin(), candidates.end(), [auction](BidCandidate const& c){ return c.auction == auction; }) != candidates.end())
                 continue;
 
             auction = auctionHouse->GetAuction(auction->Id);
@@ -240,11 +260,40 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (auction->owner == bot->GetGUIDLow())
                 continue;
 
-            uint32 totalCost = std::min(auction->buyout, uint32(std::max(auction->bid, auction->startbid) * frand(1.05f, 1.25f)));
-
             usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
 
-            if (freeMoney.find(usage) == freeMoney.end() || totalCost > AI_VALUE2(uint32, "free money for", freeMoney[usage]))
+            if (freeMoney.find(usage) == freeMoney.end())
+                continue;
+
+            uint32 const allowance = AI_VALUE2(uint32, "free money for", freeMoney[usage]);
+
+            // ONE exact legal cost per candidate, mirroring the core handler's
+            // minimum-bid/outbid rules. The old min(buyout, randomized bid)
+            // made every no-buyout candidate cost zero and could emit bids the
+            // core rejects (price <= bid, missing outbid increment). Items the
+            // bot does not keep (vendor/greed) only bid; wanted items buy out
+            // when the buyout fits the allowance, else fall back to bidding.
+            uint32 bidCost = 0;
+            if (!living::TryComputeAuctionBidCost(auction->startbid, auction->bid, auction->GetAuctionOutBid(),
+                    auction->buyout, MAX_MONEY_AMOUNT, bidCost))
+                continue;
+
+            bool const bidOnly = usage == ItemUsage::ITEM_USAGE_VENDOR || usage == ItemUsage::ITEM_USAGE_FORCE_GREED;
+
+            uint32 cost;
+            bool isBuyout;
+            if (!bidOnly && auction->buyout > 0 && auction->buyout <= allowance)
+            {
+                cost = auction->buyout;
+                isBuyout = true;
+            }
+            else
+            {
+                cost = bidCost;
+                isBuyout = auction->buyout > 0 && bidCost == auction->buyout;
+            }
+
+            if (cost > allowance || cost > bot->GetMoney())
                 continue;
 
             uint32 power = 1;
@@ -258,7 +307,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             case ItemUsage::ITEM_USAGE_AH:
             {
                 auto pmo = sPerformanceMonitor.start(PERF_MON_VALUE, "IsWorthBuyingFromAhToResellAtAH", ai);
-                bool isWorthBuyingFromAhToResellAtAH = ItemUsageValue::IsWorthBuyingFromAhToResellAtAH(sObjectMgr.GetItemPrototype(auction->itemTemplate), totalCost, auction->itemCount);
+                bool isWorthBuyingFromAhToResellAtAH = ItemUsageValue::IsWorthBuyingFromAhToResellAtAH(sObjectMgr.GetItemPrototype(auction->itemTemplate), cost, auction->itemCount);
                 pmo.reset();
 
                 if (!isWorthBuyingFromAhToResellAtAH)
@@ -268,7 +317,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             }
             case ItemUsage::ITEM_USAGE_VENDOR:
                 //basically if AH price is lower than vendor sell price then it's worth it
-                if (totalCost / auction->itemCount >= (int32)sObjectMgr.GetItemPrototype(auction->itemTemplate)->SellPrice)
+                if (cost / auction->itemCount >= (int32)sObjectMgr.GetItemPrototype(auction->itemTemplate)->SellPrice)
                     continue;
                 power = 1000;
                 break;
@@ -279,75 +328,33 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             }
 
             power *= 1000;
-            power /= (totalCost +1);
+            power /= (cost + 1);
 
-            auctionPowers.push_back(std::make_pair(auction, power));
+            candidates.push_back({ auction, cost, isBuyout, power });
         }
 
-        std::sort(auctionPowers.begin(), auctionPowers.end(), [](std::pair<AuctionEntry*, uint32> i, std::pair<AuctionEntry*, uint32> j) {return i > j; });
+        // Sort by POWER: the old pair<pointer, power> comparison with `i > j`
+        // ranked candidates by allocation address first.
+        std::sort(candidates.begin(), candidates.end(),
+            [](BidCandidate const& a, BidCandidate const& b) { return a.power > b.power; });
 
         bool bidItems = false;
 
-        for (auto auctionPower : auctionPowers)
+        for (BidCandidate const& candidate : candidates)
         {
-            auction = auctionPower.first;
-
-            if (!auction)
-                continue;
-
-            auction = auctionHouse->GetAuction(auction->Id);
+            auction = auctionHouse->GetAuction(candidate.auction->Id);
 
             if (!auction)
                 continue;
 
             usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
 
-            uint32 currentBidPrice = std::max(auction->bid, auction->startbid);
-            uint32 currentBuyoutPrice = auction->buyout;
+            std::string reason = ItemUsageValue::ReasonForNeed(usage, auction, auction->itemCount, bot);
 
-            bool shouldBuyout = false;
-
-            //determine if should look at buyout or bid price depending on item usage
-            uint32 price = currentBuyoutPrice;
-
-            if (usage == ItemUsage::ITEM_USAGE_VENDOR || usage == ItemUsage::ITEM_USAGE_FORCE_GREED || usage == ItemUsage::ITEM_USAGE_NONE)
-            {
-                //do not care for buyout price for items that bot does not need
-                price = currentBidPrice;
-            }
-            else if (currentBidPrice < static_cast<uint32>(currentBuyoutPrice * 0.3f) && !urand(0,1))
-            {
-                //if bid price < 30% of buyout, then might as well (50/50) chance consider bid price directly
-                price = currentBidPrice;
-            }
-
-            //first check if has money for buyout price (if checking against buyout price)
-            if (price == currentBuyoutPrice && (freeMoney.find(usage) == freeMoney.end() || price > AI_VALUE2(uint32, "free money for", freeMoney[usage])))
-            {
-                //check for free money for bid price next if has no money for buyout
-                price = currentBidPrice;
-            }
-
-            //check if have money for bid price (if checking against bid price)
-            if (price != currentBuyoutPrice && (freeMoney.find(usage) == freeMoney.end() || price > AI_VALUE2(uint32, "free money for", freeMoney[usage])))
-            {
-                if (!urand(0, 5))
-                    break;
-                else
-                    continue;
-            }
-
-            freeMoney[ItemUsage::ITEM_USAGE_EQUIP] = freeMoney[ItemUsage::ITEM_USAGE_BAD_EQUIP] = (uint32)NeedMoneyFor::gear;
-            freeMoney[ItemUsage::ITEM_USAGE_USE] = (uint32)NeedMoneyFor::consumables;
-            freeMoney[ItemUsage::ITEM_USAGE_SKILL] = freeMoney[ItemUsage::ITEM_USAGE_DISENCHANT] = (uint32)NeedMoneyFor::tradeskill;
-            freeMoney[ItemUsage::ITEM_USAGE_AMMO] = (uint32)NeedMoneyFor::ammo;
-            freeMoney[ItemUsage::ITEM_USAGE_QUEST] = freeMoney[ItemUsage::ITEM_USAGE_AH] = freeMoney[ItemUsage::ITEM_USAGE_VENDOR] = freeMoney[ItemUsage::ITEM_USAGE_FORCE_NEED] = freeMoney[ItemUsage::ITEM_USAGE_FORCE_GREED] = (uint32)NeedMoneyFor::anything;
-         
-            ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
-
-            std::string reason = ItemUsageValue::ReasonForNeed(usage, auction, auction->itemCount, bot);            
-
-            bidItems = BidItem(requester, auction, price, auctioneer, price == currentBuyoutPrice, reason);
+            // The exact cost calculated (once) during scoring is what the
+            // packet gets; if the auction moved meanwhile the core safely
+            // rejects the stale value and no money moves.
+            bidItems = BidItem(requester, auction, candidate.cost, auctioneer, candidate.isBuyout, reason);
 
             if (bidItems)
                 totalcount++;
@@ -355,7 +362,8 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!urand(0, 5) || totalcount > 10)
                 break;
 
-            RESET_AI_VALUE2(uint32, "free money for", freeMoney[usage]);
+            if (freeMoney.find(usage) != freeMoney.end())
+                RESET_AI_VALUE2(uint32, "free money for", freeMoney[usage]);
         }
 
         return bidItems;
@@ -391,12 +399,6 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     // case-insensitively.
     std::set<uint32> const queryItemIds = ChatHelper::ExtractAllItemIds(itemQuery);
 
-    struct BidCandidate
-    {
-        AuctionEntry* auction;
-        uint32 cost;
-        uint32 power;
-    };
     std::vector<BidCandidate> candidates;
 
     for (auto curAuction : map)
@@ -433,7 +435,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
 
         uint32 const power = auction->itemCount * 1000 / cost; // cost >= 1 by contract
 
-        candidates.push_back({ auction, cost, power });
+        candidates.push_back({ auction, cost, auction->buyout > 0 && cost == auction->buyout, power });
     }
 
     if (candidates.empty())
@@ -443,8 +445,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
         [](BidCandidate const& a, BidCandidate const& b) { return a.power > b.power; });
 
     BidCandidate const& best = candidates.front();
-    return BidItem(requester, best.auction, best.cost, auctioneer,
-        best.auction->buyout > 0 && best.cost == best.auction->buyout);
+    return BidItem(requester, best.auction, best.cost, auctioneer, best.isBuyout);
 }
 
 bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price, Unit* auctioneer, bool isBuyout, std::string reason)

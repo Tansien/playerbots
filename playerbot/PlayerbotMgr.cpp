@@ -221,6 +221,11 @@ void PlayerbotHolder::LogoutPlayerBot(uint32 guid, bool allowInstant, bool forDe
         if (!ai)
             return;
 
+        // A logout abandons any relocation still awaiting its teleport
+        // acknowledgement: drop the pending record without claiming completion
+        // (retry markers stay, so a later login retries).
+        sRandomPlayerbotMgr.CancelPendingRelocation(bot->GetGUIDLow());
+
         if (!sPlayerbotAIConfig.bExplicitDbStoreSave)
         {
            Group* group = bot->GetGroup();
@@ -2076,6 +2081,60 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
 {
     BotCreationResult result;
 
+    // Resolve the EFFECTIVE race/class/faction/gender/role tuple first and
+    // validate it before any allocation or mutation. Explicit fields were
+    // already validated in Parse; resolution covers the randomly chosen rest
+    // (e.g. Classic "faction=horde class=paladin" used to fall back to a Human
+    // and persist a team-violating character).
+    Team team = options.team;
+    if (team == TEAM_BOTH_ALLOWED && master)
+        team = master->GetTeam();
+
+    uint8 gender = options.gender;
+    if (gender == GENDER_NONE)
+        gender = urand(GENDER_MALE, GENDER_FEMALE);
+
+    RandomPlayerbotFactory factory(0);
+
+    // The requested role constrains random class selection instead of being
+    // ignored ("role=healer" used to draw DPS-only classes).
+    uint8 cls = options.cls;
+    if (cls == 0)
+        cls = factory.GetRandomClass(options.race, static_cast<BotRoles>(options.role));
+
+    if (options.role && !RandomPlayerbotFactory::isAvailableRole(cls, static_cast<BotRoles>(options.role)))
+    {
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back("Class " + ChatHelper::formatClass(cls) + " cannot fill the requested role");
+        return result;
+    }
+
+    uint8 race = options.race;
+    if (race == 0)
+    {
+        race = factory.GetRandomRace(cls, team);
+        if (race == 0)
+        {
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back("No race on the requested faction can play class " + ChatHelper::formatClass(cls));
+            return result;
+        }
+    }
+
+    if (!sObjectMgr.GetPlayerInfo(race, cls))
+    {
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back("Invalid race/class combination");
+        return result;
+    }
+
+    if (team != TEAM_BOTH_ALLOWED && Player::TeamForRace(race) != team)
+    {
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back("Race does not match the requested faction");
+        return result;
+    }
+
     // Name collision is checked BEFORE account allocation, through the object
     // manager's escaped lookup - the raw name is never interpolated into SQL.
     // An explicit name can never succeed on retry, so this is terminal.
@@ -2111,26 +2170,6 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
 
     bool const explicitName = !options.name.empty();
     std::string name = options.name;
-
-    Team team = options.team;
-    if (team == TEAM_BOTH_ALLOWED && master)
-        team = master->GetTeam();
-
-    uint8 gender = options.gender;
-    if (gender == GENDER_NONE)
-        gender = urand(GENDER_MALE, GENDER_FEMALE);
-
-    RandomPlayerbotFactory factory(0);
-
-    uint8 cls = options.cls;
-    if (cls == 0)
-        cls = factory.GetRandomClass(options.race);
-
-    uint8 race = options.race;
-    if (race == 0)
-    {
-        race = factory.GetRandomRace(cls, team);
-    }
 
     if (name.empty())
     {
@@ -2196,6 +2235,26 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             std::ostringstream out;
             ChangeTalentsAction::AutoSelectTalents(newBot, &out, static_cast<BotRoles>(options.role));
 
+            // Verify the requested role was actually produced BEFORE any
+            // persistence (event rows below, SaveToDB later): a spec that
+            // cannot fill the requested slot is torn down unpersisted and the
+            // attempt reported retryable, so group quotas can never be filled
+            // by a bot of the wrong role.
+            if (options.requireRoleMatch && options.role)
+            {
+                uint32 const actualRoles = static_cast<uint32>(AiFactory::GetPlayerRoles(newBot));
+                if ((actualRoles & options.role) == 0)
+                {
+                    sObjectAccessor.RemoveObject(newBot);
+                    delete newBot;
+                    delete botSession;
+                    result.guid = ObjectGuid();
+                    result.status = living::BotCreateStatus::RetryableFailure;
+                    result.messages.push_back("Talent selection did not produce the requested role");
+                    return result;
+                }
+            }
+
             sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 1);
             sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, options.groupWith);
             sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, options.gear);
@@ -2205,9 +2264,9 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
 
         if (!options.testName.empty())
         {
-            std::string testName = std::regex_replace(options.testName, std::regex("'"), "\\'");
-
-            sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, testName);
+            // SetEventValue escapes at the persistence boundary; the old ad-hoc
+            // quote replacement here would now double-escape.
+            sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, options.testName);
         }
         if (options.temporary)
         {
@@ -2346,7 +2405,10 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         if (!maxTries)
             break;
 
-        BotRoles role = BotRoles(urand(BotRoles::BOT_ROLE_TANK, BotRoles::BOT_ROLE_DPS));
+        // BotRoles are bit flags (1/2/4): the old urand(TANK, DPS) sampled the
+        // integer 3 (TANK|HEALER), which is no role and wasted the attempt.
+        static BotRoles const groupRoles[3] = { BotRoles::BOT_ROLE_TANK, BotRoles::BOT_ROLE_HEALER, BotRoles::BOT_ROLE_DPS };
+        BotRoles role = groupRoles[urand(0, 2)];
 
         if (allowedClassNr[0][role] == 0)
         {
@@ -2378,11 +2440,16 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         // The typed options are constructed DIRECTLY with the selected
         // composition - no argument string is assembled and reparsed, so nothing
         // can override the selected class, and the selected role now reaches
-        // talent/spec selection.
+        // talent/spec selection. requireRoleMatch makes creation verify the
+        // produced spec BEFORE persistence: a bot that cannot fill the selected
+        // role slot is torn down and reported retryable instead of persisted.
+        // (Level-1 members have no spec; the verification applies to leveled
+        // creations, which is every case with role quotas in play.)
         CreateBotOptions options;
         options.level = masterLevel;
         options.cls = cls;
         options.role = static_cast<uint8>(role);
+        options.requireRoleMatch = true;
         options.groupWith = master->GetName();
         options.gear = gear;
         options.autoAdd = autoAdd;
@@ -2401,17 +2468,18 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         {
             currentGroupSize++;
 
-            // Quotas shrink only when a bot actually filled a slot, charged to
-            // the ACTUAL persisted class and the ACTUAL resulting role (if spec
-            // selection produced a different role than requested it is accounted
-            // where it landed), and never below zero.
+            // Quotas shrink only when a bot actually filled a slot. Class is
+            // the ACTUAL persisted class; the role slot is the selected role,
+            // which requireRoleMatch verified is contained in the persisted
+            // spec's roles before SaveToDB ran - so a counted bot always
+            // consumes exactly the slot it was created to fill, never below
+            // zero.
             uint8 const actualClass = result.createdClass;
-            BotRoles const actualRole = static_cast<BotRoles>(result.createdRole);
 
-            living::TryConsumeQuota(allowedClassNr[0][actualRole]);
+            living::TryConsumeQuota(allowedClassNr[0][role]);
 
-            if (allowedClassNr[actualClass].find(actualRole) != allowedClassNr[actualClass].end())
-                living::TryConsumeQuota(allowedClassNr[actualClass][actualRole]);
+            if (allowedClassNr[actualClass].find(role) != allowedClassNr[actualClass].end())
+                living::TryConsumeQuota(allowedClassNr[actualClass][role]);
         }
 
         // A terminal failure (invalid arguments, no account capacity) cannot

@@ -90,8 +90,11 @@ LIVING_TEST(key_value_args_reject_every_malformed_shape)
     out.clear();
     LIVING_CHECK(!TryParseKeyValueArgs("=Bob", allowed, out, error));
 
-    // Injection-shaped values stay inert data here: the value is carried
-    // verbatim to validators that never interpolate it into SQL.
+    // Injection-shaped values are ordinary data to THIS parser: it carries them
+    // verbatim. Downstream, name values go through the core name rules (which
+    // reject this shape outright) and every other value that reaches SQL is
+    // escaped at the persistence boundary (SetEventValue) - the parser itself
+    // guarantees neither, so nothing here claims end-to-end injection safety.
     out.clear();
     LIVING_CHECK(TryParseKeyValueArgs("name=Rob');DROP", allowed, out, error));
     LIVING_CHECK(out["name"] == "Rob');DROP");

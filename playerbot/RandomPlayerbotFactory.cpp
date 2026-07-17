@@ -236,7 +236,16 @@ uint8 RandomPlayerbotFactory::GetRandomRace(uint8 cls, Team team)
         totalClassProb += sPlayerbotAIConfig.classRaceProbability[cls][race];
     }
 
-    uint32 randomProb = urand(0, totalClassProb);
+    // No race of the requested team can play this class (e.g. a Classic Horde
+    // paladin): fail closed. The old fallback returned availableRaces.front()
+    // regardless of team, deterministically creating a team-violating
+    // character.
+    if (totalClassProb == 0)
+        return 0;
+
+    // Exclusive upper bound: urand is INCLUSIVE, so sampling 0..total let the
+    // draw == total case fall through every bucket into the fallback.
+    uint32 randomProb = urand(0, totalClassProb - 1);
 
     for (uint32 race = 1; race < MAX_RACES; ++race)
     {
@@ -249,7 +258,8 @@ uint8 RandomPlayerbotFactory::GetRandomRace(uint8 cls, Team team)
         randomProb -= sPlayerbotAIConfig.classRaceProbability[cls][race];
     }
 
-    return availableRaces[cls].front();
+    // Unreachable with the exclusive draw above; keep the closed failure.
+    return 0;
 }
 
 bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
@@ -262,6 +272,10 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     uint8 gender = urand(0, 1) ? GENDER_MALE : GENDER_FEMALE;
 
     uint8 race = inputRace == 0 ? GetRandomRace(cls) : inputRace;
+
+    // GetRandomRace fails closed when no race can play this class.
+    if (!race)
+        return false;
 
     NameRaceAndGender raceAndGender = CombineRaceAndGender(gender, race);
 

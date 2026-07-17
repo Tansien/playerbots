@@ -42,10 +42,12 @@ namespace living
         bool scheduleNextTeleport = false;
     };
 
-    // Acknowledged position must land on the accepted destination. The cores
-    // relocate to the exact teleport destination, so this only absorbs float
-    // rounding; a different (stale/foreign) teleport will not match.
-    inline constexpr float RELOCATION_ACK_TOLERANCE = 8.0f;
+    // Acknowledged position must land ON the accepted destination. The pinned
+    // cores install the exact teleport destination on acknowledgement, so this
+    // absorbs only float round-trip noise - it is deliberately far below one
+    // yard so a stale or foreign teleport that happens to land nearby can never
+    // be finalized as this relocation.
+    inline constexpr float RELOCATION_ACK_TOLERANCE = 0.25f;
 
     // Bounded pending-relocation registry: at most one entry per bot. A newer
     // attempt supersedes the previous one (its token dies with it), completion

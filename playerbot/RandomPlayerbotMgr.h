@@ -107,7 +107,9 @@ public:
         void AddTradeDiscount(Player* bot, Player* master, int32 value);
         void SetTradeDiscount(Player* bot, Player* master, uint32 value);
         uint32 GetTradeDiscount(Player* bot, Player* master);
-        void Refresh(Player* bot);
+        // resetAi = false lets a caller that already performed the full
+        // Reset(true) (FinalizeRelocation) skip the plain internal reset.
+        void Refresh(Player* bot, bool resetAi = true);
         // Relocation/recovery entry points return a typed outcome. In the pinned
         // cores TeleportTo QUEUES a near/far transfer, so acceptance is Pending -
         // Refresh, homebind, inn binding, revive-marker clearing and scheduling

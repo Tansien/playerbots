@@ -41,13 +41,25 @@ LIVING_TEST(relocation_completes_exactly_once_on_matching_ack)
     LIVING_CHECK(!tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, completed));
 }
 
-LIVING_TEST(relocation_small_landing_adjustment_still_matches)
+LIVING_TEST(relocation_float_noise_matches_but_nearby_landings_do_not)
 {
     RelocationTracker tracker;
     tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
 
+    // Sub-yard float round-trip noise still matches...
     PendingRelocation completed;
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.5f, 199.5f, 30.25f, completed));
+    LIVING_CHECK(tracker.Complete(1001, 1, 100.1f, 199.9f, 30.05f, completed));
+
+    // ...but a landing merely NEAR the destination is a different teleport: the
+    // cores install the exact destination, so 1..7 yard offsets must reject
+    // (the old 8-yard sphere accepted a foreign teleport as this relocation).
+    for (float offset = 1.0f; offset <= 7.0f; offset += 1.0f)
+    {
+        RelocationTracker nearMiss;
+        nearMiss.Begin(7, MakeRecord(1, 100.0f, 200.0f, 30.0f));
+        LIVING_CHECK(!nearMiss.Complete(7, 1, 100.0f + offset, 200.0f, 30.0f, completed));
+        LIVING_CHECK(nearMiss.HasPending(7)); // still pending, markers untouched
+    }
 }
 
 LIVING_TEST(relocation_stale_or_foreign_ack_does_not_finalize)
