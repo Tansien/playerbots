@@ -1,5 +1,6 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/AiFactory.h"
+#include "playerbot/living/util/LivingRoles.h"
 #include "strategy/AiObjectContext.h"
 #include "strategy/ReactionEngine.h"
 
@@ -130,107 +131,15 @@ std::map<uint32, int32> AiFactory::GetPlayerSpecTabs(const Player* bot)
 
 BotRoles AiFactory::GetPlayerRoles(uint8 cls, uint8 tab)
 {
-    BotRoles role = BOT_ROLE_NONE;
-    switch (cls)
-    {
-        case CLASS_PRIEST: {
-            if (tab == 2)
-            {
-                role = BOT_ROLE_DPS;
-            }
-            else
-            {
-                role = BOT_ROLE_HEALER;
-            }
+    // One canonical intended/spec-role mapping, shared with creation-time tuple
+    // filtering, talent-path filtering and role verification. It is a property
+    // of the spec: Druid Feral is TANK|DPS regardless of the current form.
+    static_assert(living::ROLE_TANK == BOT_ROLE_TANK
+        && living::ROLE_HEALER == BOT_ROLE_HEALER
+        && living::ROLE_DPS == BOT_ROLE_DPS,
+        "living role bits must match ai::BotRoles");
 
-            break;
-        }
-
-        case CLASS_SHAMAN: {
-            if (tab == 2)
-            {
-                role = BOT_ROLE_HEALER;
-            }
-            else
-            {
-                role = BOT_ROLE_DPS;
-            }
-
-            break;
-        }
-
-        case CLASS_WARRIOR: {
-            if (tab == 2)
-            {
-                role = BOT_ROLE_TANK;
-            }
-            else
-            {
-                role = BOT_ROLE_DPS;
-            }
-
-            break;
-        }
-
-        case CLASS_PALADIN: {
-            if (tab == 1)
-            {
-                role = BOT_ROLE_TANK;
-            }
-            else if (tab == 0)
-            {
-                role = BOT_ROLE_HEALER;
-            }
-            else if (tab == 2)
-            {
-                role = BOT_ROLE_DPS;
-            }
-
-            break;
-        }
-
-        case CLASS_DRUID: {
-            if (tab == 0)
-            {
-                role = BOT_ROLE_DPS;
-            }
-            else if (tab == 1)
-            {
-                role = BOT_ROLE_DPS;
-            }
-            else if (tab == 2)
-            {
-                role = BOT_ROLE_HEALER;
-            }
-
-            break;
-        }
-
-#ifdef MANGOSBOT_TWO
-        case CLASS_DEATH_KNIGHT: {
-            if (tab == 0)
-            {
-                role = BOT_ROLE_TANK;
-            }
-            else if (tab == 1)
-            {
-                role = (BotRoles)(BOT_ROLE_TANK | BOT_ROLE_DPS);
-            }
-            else if (tab == 2)
-            {
-                role = BOT_ROLE_DPS;
-            }
-
-            break;
-        }
-#endif
-        default: {
-            role = BOT_ROLE_DPS;
-            break;
-        }
-    }
-
-    return role;
+    return static_cast<BotRoles>(living::SpecTabRoles(cls, tab));
 }
 
 BotRoles AiFactory::GetPlayerRoles(const Player* player)

@@ -39,4 +39,25 @@ namespace living
     // exists within `maxCopper`.
     bool TryComputeAuctionBidCost(uint32_t startBid, uint32_t currentBid, uint32_t outBidIncrement,
         uint32_t buyout, uint64_t maxCopper, uint32_t& outCost);
+
+    // Active standing-bid budget for the automatic bid pass. A bot may hold at
+    // most `cap` simultaneous standing bids: `>= cap` existing bids is AT
+    // capacity (the old `> 10` checks permitted an eleventh), the cap is
+    // enforced immediately before each NON-buyout bid, and only a successful
+    // standing bid consumes a slot - a buyout removes the auction outright and
+    // never occupies one.
+    class StandingBidCap
+    {
+    public:
+        StandingBidCap(uint32_t existingStandingBids, uint32_t capLimit)
+            : active(existingStandingBids), cap(capLimit) {}
+
+        bool CanPlaceStandingBid() const { return active < cap; }
+        void RecordStandingBid() { ++active; }
+        uint32_t Active() const { return active; }
+
+    private:
+        uint32_t active;
+        uint32_t cap;
+    };
 }

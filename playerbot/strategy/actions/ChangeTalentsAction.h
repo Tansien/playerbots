@@ -27,6 +27,11 @@ namespace ai
             int specId = -1;         // chosen premade spec, -1 = none/custom link
             std::string specLink;    // custom link when specId == -1
             bool hadExistingSpec = false;
+            // Intended role mask of the SELECTED spec (canonical spec-tab
+            // mapping, ai::BotRoles bits) - never derived from transient combat
+            // auras. Creation verifies explicit role requests against this with
+            // bit containment.
+            uint8 selectedRoles = 0;
         };
 
         // Stages 1-2: select and apply a talent plan to the player. No

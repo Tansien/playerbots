@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 namespace living
@@ -18,5 +20,53 @@ namespace living
         return !event.empty()
             && event.size() <= EVENT_NAME_MAX_BYTES
             && data.size() <= EVENT_DATA_MAX_BYTES;
+    }
+
+    // The single execution-confirmed statement one event write must run.
+    enum class EventWriteKind { Delete, Update, Insert };
+
+    enum class EventPersistOutcome
+    {
+        // The value violates the schema; nothing was attempted.
+        Rejected,
+        // The synchronous existence probe failed; nothing was written.
+        ProbeFailed,
+        // The statement ran and reported failure; durable state is unknown to
+        // the caller, which must reload it rather than publish the intended
+        // value.
+        ExecuteFailed,
+        // The statement ran and reported success; the caller may now (and only
+        // now) publish the value to its cache.
+        Persisted,
+    };
+
+    // Drives the execution-confirmed persistence flow for one event write:
+    // schema validation first, then value == 0 -> Delete; otherwise a
+    // synchronous existence probe decides Update (matching rows exist) vs
+    // Insert - the schema has no unique key on (owner, bot, event), so a blind
+    // upsert is not available, and DELETE-then-INSERT loses the row when the
+    // INSERT fails. `probe` returns whether matching rows exist, or nullopt
+    // when the probe itself failed; `execute` runs the one statement
+    // synchronously and returns its actual execution result. Queued SQL is not
+    // durable success: both callables must be backed by synchronous,
+    // result-returning paths (DirectPExecute), never by transaction queueing.
+    template <typename ProbeFn, typename ExecuteFn>
+    EventPersistOutcome PersistEventValue(std::string const& event, std::string const& data, uint32_t value,
+        ProbeFn&& probe, ExecuteFn&& execute)
+    {
+        if (!EventValueFitsSchema(event, data))
+            return EventPersistOutcome::Rejected;
+
+        EventWriteKind kind = EventWriteKind::Delete;
+        if (value)
+        {
+            std::optional<bool> const exists = probe();
+            if (!exists)
+                return EventPersistOutcome::ProbeFailed;
+
+            kind = *exists ? EventWriteKind::Update : EventWriteKind::Insert;
+        }
+
+        return execute(kind) ? EventPersistOutcome::Persisted : EventPersistOutcome::ExecuteFailed;
     }
 }

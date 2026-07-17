@@ -62,6 +62,49 @@ namespace living
         TerminalMismatch,
     };
 
+    // Pure destination-eligibility policy pieces, shared by the ONE final
+    // destination validator in RandomPlayerbotMgr: the same rules run for the
+    // pre-filter (raw candidate) and for the FINAL tuple after retry jitter and
+    // terrain-height adjustment, so jitter can never cross a boundary the
+    // candidate check enforced.
+
+    // An enemy zone blocks low-level bots entirely and capitals at any level.
+    inline bool DestinationBlockedByEnemyZone(bool zoneIsEnemy, bool zoneIsCapital, uint32_t botLevel)
+    {
+        return zoneIsEnemy && (botLevel < 21 || zoneIsCapital);
+    }
+
+    // An enemy area (sub-zone team) blocks low-level bots.
+    inline bool DestinationBlockedByEnemyArea(bool areaIsEnemy, uint32_t botLevel)
+    {
+        return areaIsEnemy && botLevel < 21;
+    }
+
+    // Low-level starter/race zone policy (zone and race ids are core-stable).
+    // Returns true when the zone excludes this race/team below level 30.
+    // `expansionZones` gates the TBC-only starter zones on cores where those
+    // races exist.
+    inline bool DestinationBlockedByStarterZone(uint32_t zoneId, uint8_t race, bool isAlliance,
+        uint32_t botLevel, bool expansionZones)
+    {
+        if (botLevel >= 30)
+            return false;
+
+        switch (zoneId)
+        {
+            case 12: case 40:     return race != 1;              // Elwynn/Westfall: human only
+            case 1: case 38:      return race != 3;              // Dun Morogh/Loch Modan: dwarf only
+            case 85: case 130:    return race != 5;              // Tirisfal/Silverpine: undead only
+            case 141: case 148:   return race != 4;              // Teldrassil/Darkshore: night elf only
+            case 14: case 17:     return race != 2 && race != 8; // Durotar/Barrens: orc/troll only
+            case 215:             return race != 6;              // Mulgore: tauren only
+            case 44: case 10:     return !isAlliance;            // Redridge/Duskwood: alliance only
+            case 3524: case 3525: return expansionZones && race != 11; // Azuremyst/Bloodmyst: draenei only
+            case 3430: case 3433: return expansionZones && race != 10; // Eversong/Ghostlands: blood elf only
+            default:              return false;
+        }
+    }
+
     // Bounded pending-relocation registry: at most one in-flight entry per bot.
     // A newer attempt explicitly supersedes the previous one (its token dies
     // with it), completion/mismatch/cancellation erase, and a bot that never

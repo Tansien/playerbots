@@ -299,6 +299,12 @@ void PlayerbotHolder::DisablePlayerBot(uint32 guid, bool logOutPlayer)
     Player* bot = GetPlayerBot(guid);
     if (bot)
     {
+        // This is the shared disable path behind core-driven logout, kicks and
+        // disconnects: a pending relocation is abandoned here exactly like in
+        // LogoutPlayerBot - dropped without claiming completion, retry markers
+        // untouched.
+        sRandomPlayerbotMgr.CancelPendingRelocation(guid);
+
         if (logOutPlayer && bot->GetPlayerbotAI()->IsRealPlayer() && bot->GetGroup() && sPlayerbotAIConfig.IsFreeAltBot(guid))
             bot->GetSession()->SetOffline(); //Prevent groupkick
         bot->GetPlayerbotAI()->TellPlayer(bot->GetPlayerbotAI()->GetMaster(), BOT_TEXT("goodbye"));
@@ -423,6 +429,13 @@ void PlayerbotHolder::OnBotLogin(Player * const bot)
 {
     if (!sPlayerbotAIConfig.enabled)
         return;
+
+    // A fresh login invalidates any relocation left pending across a logout or
+    // a mid-teleport disconnect - for EVERY holder and master arrangement
+    // (OnBotLoginInternal is skipped for bots with a real-player master, so the
+    // cancellation cannot live there). The record is dropped without claiming
+    // completion; untouched retry markers drive a new attempt.
+    sRandomPlayerbotMgr.CancelPendingRelocation(bot->GetGUIDLow());
 
     PlayerbotAI* ai = bot->GetPlayerbotAI();
     if (!ai)
@@ -2162,6 +2175,39 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         return result;
     }
 
+    // Every event value this creation may persist must fit the real schema
+    // limits BEFORE any account allocation, GUID allocation, or SaveToDB. A
+    // 256-byte gear/group/test value must fail here, creating nothing - not
+    // after the character already exists.
+    {
+        std::string const oversized = living::FindOversizedCreationValue(options.gear, options.groupWith, options.testName, options.name);
+        if (!oversized.empty())
+        {
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back("Value for '" + oversized + "' exceeds the " + std::to_string(living::EVENT_DATA_MAX_BYTES) + "-byte limit");
+            return result;
+        }
+    }
+
+    // An explicit group target must resolve BEFORE creation, and is stored as
+    // a stable GUID instead of a mutable name: renames can no longer orphan
+    // the join, and the login path can distinguish "target offline" (retry)
+    // from "target deleted" (terminal).
+    bool const wantsGroupEvent = !options.groupWith.empty() && (options.explicitGroup || options.level > 1);
+    std::string groupTargetData;
+    if (wantsGroupEvent)
+    {
+        ObjectGuid const groupTarget = sObjectMgr.GetPlayerGuidByName(options.groupWith);
+        if (!groupTarget)
+        {
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back("Group target '" + options.groupWith + "' does not exist");
+            return result;
+        }
+
+        groupTargetData = std::to_string(groupTarget.GetCounter());
+    }
+
     std::string error;
     uint32 accountId = GetOrCreateAccount(master, error);
     if (accountId == 0)
@@ -2259,15 +2305,17 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             std::ostringstream out;
             talents = ChangeTalentsAction::SelectTalents(newBot, &out, static_cast<BotRoles>(options.role));
 
-            // Stage 3: verify the requested role BEFORE any persistence. The
-            // rejected transient player and session are destroyed, and the
-            // only cache touched so far (the empty event-cache entry created by
-            // the spec lookup) is dropped, so the discarded GUID leaves no DB
-            // row or cache state at all.
+            // Stage 3: verify the requested role BEFORE any persistence, from
+            // the SELECTED SPEC's intended role mask - never from runtime
+            // roles, which depend on transient combat auras (a fresh Feral
+            // druid has no bear-form aura yet is a tank). The rejected
+            // transient player and session are destroyed, and the only cache
+            // touched so far (the empty event-cache entry created by the spec
+            // lookup) is dropped, so the discarded GUID leaves no DB row or
+            // cache state at all.
             if (options.requireRoleMatch && options.role)
             {
-                uint32 const actualRoles = static_cast<uint32>(AiFactory::GetPlayerRoles(newBot));
-                if ((actualRoles & options.role) == 0)
+                if ((static_cast<uint32>(talents.selectedRoles) & options.role) == 0)
                 {
                     sObjectAccessor.RemoveObject(newBot);
                     delete newBot;
@@ -2278,6 +2326,21 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
                     result.messages.push_back("Talent selection did not produce the requested role");
                     return result;
                 }
+            }
+
+            // Spec metadata is part of the required creation payload: a link
+            // that cannot fit the schema must fail before the character is
+            // persisted, exactly like every other creation event value.
+            if (!living::EventValueFitsSchema("specLink", talents.specLink))
+            {
+                sObjectAccessor.RemoveObject(newBot);
+                delete newBot;
+                delete botSession;
+                sRandomPlayerbotMgr.ForgetEventCache(botGuid);
+                result.guid = ObjectGuid();
+                result.status = living::BotCreateStatus::RetryableFailure;
+                result.messages.push_back("Selected talent link exceeds the metadata schema limit");
+                return result;
             }
         }
         else
@@ -2305,9 +2368,10 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         // An EXPLICIT group request writes the group-join event at any level (it
         // used to be accidentally conditional on level > 1); the legacy
         // master-name default keeps its historical level>1-only behavior so a
-        // plain level-1 create does not silently start grouping.
-        if (!options.groupWith.empty() && (options.explicitGroup || options.level > 1))
-            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, options.groupWith) && metadataOk;
+        // plain level-1 create does not silently start grouping. The stored
+        // data is the STABLE target GUID resolved before creation.
+        if (wantsGroupEvent)
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, groupTargetData) && metadataOk;
 
         if (!options.testName.empty())
         {
@@ -2320,20 +2384,37 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "temporary", 1, name) && metadataOk;
         }
 
-        result.status = living::BotCreateStatus::Created;
         // Report the composition that was ACTUALLY persisted (class from the
-        // character, role derived from its selected talents/spec) so group
-        // accounting cannot drift from reality.
+        // character, role from the selected spec's intended role mask - never
+        // from aura-dependent runtime roles) so group accounting cannot drift
+        // from reality.
         result.createdClass = newBot->getClass();
-        result.createdRole = static_cast<uint8>(AiFactory::GetPlayerRoles(newBot));
-        result.messages.push_back("Bot created: " + name);
-        if (!metadataOk)
-            result.messages.push_back("Warning: some creation metadata failed to persist for " + name);
+        result.createdRole = talents.evaluated
+            ? static_cast<uint8>(talents.selectedRoles)
+            : static_cast<uint8>(AiFactory::GetPlayerRoles(newBot->getClass(), AiFactory::GetPlayerSpecTab(newBot)));
 
         botSession->LogoutPlayer();
         sObjectAccessor.RemoveObject(newBot);
         delete newBot;
         delete botSession;
+
+        // Creation reports Created only when every required metadata write
+        // persisted. An unexpected post-SaveToDB failure compensates through
+        // the safe deletion/event-cleanup path instead of leaving a permanent
+        // character that group accounting would count as provisioned.
+        if (!metadataOk)
+        {
+            Player::DeleteFromDB(result.guid, accountId, true, true);
+            CharacterDatabase.DirectPExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid);
+            sRandomPlayerbotMgr.ForgetEventCache(botGuid);
+            result.guid = ObjectGuid();
+            result.status = living::BotCreateStatus::RetryableFailure;
+            result.messages.push_back("Creation metadata failed to persist for " + name + "; the character was removed");
+            return result;
+        }
+
+        result.status = living::BotCreateStatus::Created;
+        result.messages.push_back("Bot created: " + name);
 
         if (options.autoAdd)
         {
@@ -2437,7 +2518,7 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             return messages;
         }
     }
-    
+
     // groupSize was validated against 1..MAX_RAID_SIZE above, so this narrowing
     // cannot alias.
     std::unordered_map<uint8, std::unordered_map<BotRoles, uint32>> allowedClassNr = LfgAction::AllowedClassRoleNr(master, static_cast<uint8>(groupSize));

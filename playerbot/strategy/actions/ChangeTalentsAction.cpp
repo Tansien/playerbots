@@ -3,6 +3,7 @@
 #include "playerbot/Talentspec.h"
 #include "ChangeTalentsAction.h"
 #include "playerbot/AiFactory.h"
+#include "playerbot/living/util/LivingRoles.h"
 
 using namespace ai;
 
@@ -167,7 +168,11 @@ std::vector<TalentPath*> ChangeTalentsAction::getPremadePaths(uint8 cls, std::st
         if (!findName.empty() && path.name.find(findName) == std::string::npos)
             continue;
 
-        if (role != BotRoles::BOT_ROLE_NONE && AiFactory::GetPlayerRoles(cls, path.talentSpec.back().highestTree()) != role)
+        // Bit containment against the canonical spec-role mapping: a Feral
+        // (TANK|DPS) path satisfies a TANK request; the old equality test
+        // rejected every multi-role spec.
+        if (role != BotRoles::BOT_ROLE_NONE
+            && !living::RolesSatisfy(static_cast<uint8>(AiFactory::GetPlayerRoles(cls, path.talentSpec.back().highestTree())), static_cast<uint8>(role)))
             continue;
 
         ret.push_back(&path);
@@ -381,6 +386,9 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
     selection.specId = specId;
     selection.specLink = specLink;
     selection.hadExistingSpec = specNo != 0;
+    // The APPLIED talents decide the intended role mask, through the canonical
+    // spec-tab mapping - aura/form state plays no part.
+    selection.selectedRoles = static_cast<uint8>(AiFactory::GetPlayerRoles(cls, static_cast<uint8>(AiFactory::GetPlayerSpecTab(bot))));
     return selection;
 }
 

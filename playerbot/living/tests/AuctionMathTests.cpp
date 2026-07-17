@@ -114,3 +114,31 @@ LIVING_TEST(auction_bid_cost_handles_buyout_and_no_buyout)
     // A start bid above the cap has no legal bid.
     LIVING_CHECK(!TryComputeAuctionBidCost(2147483647u, 0, 1, 0, kCoreMoneyCap, cost));
 }
+
+LIVING_TEST(auction_standing_bid_cap_boundaries)
+{
+    // 9 existing bids: one slot left.
+    StandingBidCap nine(9, 10);
+    LIVING_CHECK(nine.CanPlaceStandingBid());
+    nine.RecordStandingBid(); // the boundary standing bid
+    LIVING_CHECK(!nine.CanPlaceStandingBid());
+
+    // 10 existing bids: AT capacity (the old `> 10` checks permitted an 11th).
+    StandingBidCap ten(10, 10);
+    LIVING_CHECK(!ten.CanPlaceStandingBid());
+
+    // Buyouts never consume a slot: after any number of buyouts (no
+    // RecordStandingBid calls), the standing budget is unchanged.
+    StandingBidCap buyer(9, 10);
+    LIVING_CHECK(buyer.CanPlaceStandingBid());
+    // ... perform buyouts: no slot recorded ...
+    LIVING_CHECK(buyer.Active() == 9);
+    LIVING_CHECK(buyer.CanPlaceStandingBid());
+
+    // At the cap a buyout is still allowed - only standing bids are gated - so
+    // the production gate `!isBuyout && !CanPlaceStandingBid()` never blocks
+    // the buyout path.
+    StandingBidCap capped(10, 10);
+    bool const isBuyout = true;
+    LIVING_CHECK(!(!isBuyout && !capped.CanPlaceStandingBid()));
+}

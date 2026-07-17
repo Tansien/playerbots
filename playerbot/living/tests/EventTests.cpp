@@ -93,3 +93,159 @@ LIVING_TEST(events_noop_sink_has_no_observable_effect)
     LIVING_CHECK(event.characterGuid == 7);
     LIVING_CHECK(event.type == LivingEventType::SYNTHETIC_ACTION_REQUESTED);
 }
+
+#include "../util/LivingEventSchema.h"
+
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <vector>
+
+// PersistEventValue is the exact decision flow RandomPlayerbotMgr::SetEventValue
+// runs: schema gate, synchronous existence probe, then ONE execution-confirmed
+// statement. These are helper/spy tests - the live DirectPExecute/MySQL wiring
+// is exercised only by compilation and in-world runs, not here.
+
+namespace
+{
+    struct PersistSpy
+    {
+        int probeCalls = 0;
+        int executeCalls = 0;
+        std::optional<bool> probeResult = false;
+        bool executeResult = true;
+        std::optional<living::EventWriteKind> executedKind;
+
+        living::EventPersistOutcome Run(std::string const& event, std::string const& data, uint32_t value)
+        {
+            return living::PersistEventValue(event, data, value,
+                [&]() { ++probeCalls; return probeResult; },
+                [&](living::EventWriteKind kind) { ++executeCalls; executedKind = kind; return executeResult; });
+        }
+    };
+}
+
+LIVING_TEST(event_persist_zero_value_deletes_without_probe)
+{
+    PersistSpy spy;
+    LIVING_CHECK(spy.Run("add", "", 0) == EventPersistOutcome::Persisted);
+    LIVING_CHECK(spy.probeCalls == 0);
+    LIVING_CHECK(spy.executeCalls == 1);
+    LIVING_CHECK(spy.executedKind == EventWriteKind::Delete);
+}
+
+LIVING_TEST(event_persist_updates_existing_row_and_inserts_missing_row)
+{
+    PersistSpy spy;
+    spy.probeResult = true;
+    LIVING_CHECK(spy.Run("add", "", 1) == EventPersistOutcome::Persisted);
+    LIVING_CHECK(spy.executedKind == EventWriteKind::Update);
+
+    PersistSpy fresh;
+    fresh.probeResult = false;
+    LIVING_CHECK(fresh.Run("add", "", 1) == EventPersistOutcome::Persisted);
+    LIVING_CHECK(fresh.executedKind == EventWriteKind::Insert);
+}
+
+LIVING_TEST(event_persist_oversized_value_rejected_before_any_statement)
+{
+    PersistSpy spy;
+    std::string const oversized(EVENT_DATA_MAX_BYTES + 1, 'x');
+    LIVING_CHECK(spy.Run("create gear", oversized, 1) == EventPersistOutcome::Rejected);
+    LIVING_CHECK(spy.probeCalls == 0);
+    LIVING_CHECK(spy.executeCalls == 0);
+
+    std::string const atLimit(EVENT_DATA_MAX_BYTES, 'x');
+    LIVING_CHECK(spy.Run("create gear", atLimit, 1) == EventPersistOutcome::Persisted);
+}
+
+LIVING_TEST(event_persist_probe_failure_stops_before_execution)
+{
+    PersistSpy spy;
+    spy.probeResult = std::nullopt;
+    LIVING_CHECK(spy.Run("add", "", 1) == EventPersistOutcome::ProbeFailed);
+    LIVING_CHECK(spy.executeCalls == 0);
+}
+
+LIVING_TEST(event_persist_execution_failure_is_reported_not_swallowed)
+{
+    PersistSpy spy;
+    spy.probeResult = false;
+    spy.executeResult = false;
+    LIVING_CHECK(spy.Run("add", "", 1) == EventPersistOutcome::ExecuteFailed);
+    LIVING_CHECK(spy.executeCalls == 1);
+}
+
+LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_restart)
+{
+    // Spy-backed model of SetEventValue's cache protocol against a fake row
+    // store: publish the value only on Persisted, reload the durable row on
+    // ExecuteFailed. The cache must equal the durable state after every step,
+    // including a simulated restart (cache rebuilt from rows) - the exact
+    // invariant the live AddRandomBots default path relies on.
+    std::map<std::string, uint32_t> rows;    // durable
+    std::map<std::string, uint32_t> cache;   // runtime
+    bool failNext = false;
+
+    auto set = [&](std::string const& event, uint32_t value)
+    {
+        auto outcome = living::PersistEventValue(event, "", value,
+            [&]() -> std::optional<bool> { return rows.count(event) > 0; },
+            [&](living::EventWriteKind kind)
+            {
+                if (failNext)
+                {
+                    failNext = false;
+                    return false; // statement failed: durable state unchanged
+                }
+
+                if (kind == living::EventWriteKind::Delete)
+                    rows.erase(event);
+                else
+                    rows[event] = value;
+                return true;
+            });
+
+        if (outcome == living::EventPersistOutcome::Persisted)
+            cache[event] = value;
+        else if (outcome == living::EventPersistOutcome::ExecuteFailed)
+        {
+            // Reload durable value; never publish the intended one.
+            if (rows.count(event))
+                cache[event] = rows[event];
+            else
+                cache.erase(event);
+        }
+
+        return outcome == living::EventPersistOutcome::Persisted;
+    };
+
+    auto cacheValue = [&](std::string const& event) { return cache.count(event) ? cache[event] : 0u; };
+    auto rowValue = [&](std::string const& event) { return rows.count(event) ? rows[event] : 0u; };
+
+    // The AddRandomBots pair: add=1, logout=0.
+    LIVING_CHECK(set("add", 1));
+    LIVING_CHECK(set("logout", 0));
+    LIVING_CHECK(cacheValue("add") == 1 && rowValue("add") == 1);
+    LIVING_CHECK(cacheValue("logout") == 0 && rowValue("logout") == 0);
+
+    // Forced SQL failure: the intended value 2 must NOT appear in the cache.
+    failNext = true;
+    LIVING_CHECK(!set("add", 2));
+    LIVING_CHECK(cacheValue("add") == 1 && rowValue("add") == 1);
+
+    // Forced failure of the compensating delete: row stays, cache follows row.
+    failNext = true;
+    LIVING_CHECK(!set("add", 0));
+    LIVING_CHECK(cacheValue("add") == 1 && rowValue("add") == 1);
+
+    // Successful update, then restart round-trip: a cache rebuilt from the
+    // durable rows reads identically to the one maintained incrementally (a
+    // cleared event is value 0 either as an explicit entry or as no row).
+    LIVING_CHECK(set("add", 5));
+    LIVING_CHECK(cacheValue("add") == 5 && rowValue("add") == 5);
+    std::map<std::string, uint32_t> rebuilt(rows.begin(), rows.end());
+    auto rebuiltValue = [&](std::string const& event) { return rebuilt.count(event) ? rebuilt[event] : 0u; };
+    for (char const* event : { "add", "logout" })
+        LIVING_CHECK(rebuiltValue(event) == cacheValue(event));
+}
