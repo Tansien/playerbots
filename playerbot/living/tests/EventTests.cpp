@@ -249,3 +249,57 @@ LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_resta
     for (char const* event : { "add", "logout" })
         LIVING_CHECK(rebuiltValue(event) == cacheValue(event));
 }
+
+LIVING_TEST(event_reload_query_failure_is_not_confirmed_absence)
+{
+    // Model of the production reload protocol (ReloadEventRow + dirty
+    // tracking) against a fake row store: a write failure followed by a
+    // RELOAD failure must preserve the prior known value and mark the entry
+    // dirty - never erase it - even while a sibling event for the same bot
+    // stays cached (the whole-map-empty reload can never repair a single
+    // entry). Spy/model coverage; the live PQuery wiring is compile-verified.
+    std::map<std::string, uint32_t> rows = { { "add", 7 }, { "logout", 1 } };
+    std::map<std::string, uint32_t> cache = rows;
+    std::set<std::string> dirty;
+    bool reloadAvailable = true;
+
+    auto reload = [&](std::string const& event) -> living::EventReloadOutcome
+    {
+        if (!reloadAvailable)
+            return living::EventReloadOutcome::QueryFailed;
+
+        if (rows.count(event) == 0)
+        {
+            cache.erase(event);
+            return living::EventReloadOutcome::ConfirmedAbsent;
+        }
+
+        cache[event] = rows[event];
+        return living::EventReloadOutcome::Found;
+    };
+
+    // Write fails AND the reload fails: prior value preserved, entry dirty.
+    reloadAvailable = false;
+    if (reload("add") == living::EventReloadOutcome::QueryFailed)
+        dirty.insert("add");
+    LIVING_CHECK(cache["add"] == 7);          // not erased, not zeroed
+    LIVING_CHECK(dirty.count("add") == 1);
+    LIVING_CHECK(cache.count("logout") == 1); // sibling stays cached
+
+    // Read-side retry while still failing: serve the prior KNOWN value.
+    LIVING_CHECK(reload("add") == living::EventReloadOutcome::QueryFailed);
+    LIVING_CHECK(cache["add"] == 7);
+
+    // Recovery: a successful reload clears the dirty mark with durable truth.
+    reloadAvailable = true;
+    rows["add"] = 9;
+    if (reload("add") != living::EventReloadOutcome::QueryFailed)
+        dirty.erase("add");
+    LIVING_CHECK(cache["add"] == 9);
+    LIVING_CHECK(dirty.empty());
+
+    // Confirmed absence (COUNT succeeded, zero rows) IS allowed to erase.
+    rows.erase("add");
+    LIVING_CHECK(reload("add") == living::EventReloadOutcome::ConfirmedAbsent);
+    LIVING_CHECK(cache.count("add") == 0);
+}

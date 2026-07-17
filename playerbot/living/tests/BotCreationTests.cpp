@@ -38,10 +38,25 @@ LIVING_TEST(bot_creation_ledger_terminal_failure_stops_the_run)
     LIVING_CHECK(ledger.Record(BotCreateStatus::TerminalFailure)); // stop now
     LIVING_CHECK(ledger.created == 1);
 
-    // Quota/counter updates apply to created bots only - never to failures.
-    LIVING_CHECK(GroupCreationLedger::Counted(BotCreateStatus::Created));
-    LIVING_CHECK(!GroupCreationLedger::Counted(BotCreateStatus::RetryableFailure));
-    LIVING_CHECK(!GroupCreationLedger::Counted(BotCreateStatus::TerminalFailure));
+    // Composition slots are consumed by confirmed AND pending members (both
+    // reserve quota for planning) - never by failures.
+    LIVING_CHECK(GroupCreationLedger::CountsTowardComposition(BotCreateStatus::Created));
+    LIVING_CHECK(GroupCreationLedger::CountsTowardComposition(BotCreateStatus::PendingPersistence));
+    LIVING_CHECK(!GroupCreationLedger::CountsTowardComposition(BotCreateStatus::RetryableFailure));
+    LIVING_CHECK(!GroupCreationLedger::CountsTowardComposition(BotCreateStatus::TerminalFailure));
+}
+
+LIVING_TEST(bot_creation_ledger_pending_is_never_a_persisted_member)
+{
+    // A queued-but-unconfirmed creation reserves a composition slot yet is
+    // counted separately: `created` alone may be claimed as persisted.
+    GroupCreationLedger ledger;
+    LIVING_CHECK(!ledger.Record(BotCreateStatus::PendingPersistence, 11 /*druid*/));
+    LIVING_CHECK(!ledger.Record(BotCreateStatus::PendingPersistence, 1 /*warrior*/));
+    LIVING_CHECK(!ledger.Record(BotCreateStatus::Created, 5 /*priest*/));
+
+    LIVING_CHECK(ledger.created == 1);
+    LIVING_CHECK(ledger.pendingPersistence == 2);
 }
 
 LIVING_TEST(bot_creation_ledger_tallies_the_persisted_class_not_the_assumption)

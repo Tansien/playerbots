@@ -24,13 +24,20 @@ namespace ai
         struct TalentSelectionResult
         {
             bool evaluated = false;  // false = no talent points, nothing selected or to persist
+            // True ONLY when a concrete talent path/link was selected AND
+            // ApplyTalents ran. "No predefined talents found" and
+            // "multiple specs listed with auto-pick disabled" leave this false:
+            // a blank-talent character has no spec, so no role may be inferred
+            // from its default tab.
+            bool applied = false;
             int specId = -1;         // chosen premade spec, -1 = none/custom link
             std::string specLink;    // custom link when specId == -1
             bool hadExistingSpec = false;
-            // Intended role mask of the SELECTED spec (canonical spec-tab
-            // mapping, ai::BotRoles bits) - never derived from transient combat
-            // auras. Creation verifies explicit role requests against this with
-            // bit containment.
+            // Intended role capability mask of the APPLIED spec (canonical
+            // spec-tab mapping, ai::BotRoles bits) - never derived from
+            // transient combat auras, and ZERO when no path was applied.
+            // Creation verifies explicit role requests as
+            // `applied && (selectedRoles & requestedRole)`.
             uint8 selectedRoles = 0;
         };
 
@@ -40,8 +47,10 @@ namespace ai
 
         // Stage 5: persist the chosen spec metadata. Call only after the
         // character has been accepted/persisted. Returns false when the event
-        // writes failed.
+        // writes failed. The GUID overload serves the asynchronous creation
+        // finalizer, which runs after the transient Player is long destroyed.
         static bool PersistTalentSpec(Player* bot, TalentSelectionResult const& selection);
+        static bool PersistTalentSpec(uint32 botGuidLow, TalentSelectionResult const& selection);
 
         // Legacy combined behavior for LIVE bots (select + persist).
         static bool AutoSelectTalents(Player* bot, std::ostringstream* out, BotRoles role = BotRoles::BOT_ROLE_NONE);

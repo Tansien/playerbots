@@ -40,6 +40,33 @@ namespace living
     bool TryComputeAuctionBidCost(uint32_t startBid, uint32_t currentBid, uint32_t outBidIncrement,
         uint32_t buyout, uint64_t maxCopper, uint32_t& outCost);
 
+    // Admission rule for bidding on/buying out one auction. The pinned cores
+    // reject same-account bids only when the auction owner is OFFLINE (their
+    // normal invariant: one account cannot have two characters online), and
+    // playerbots deliberately pack 9/10 characters per account and log several
+    // in - an online sibling would bypass the core protection and spend the
+    // account's budget on its own auction. Returns true when the bid must be
+    // REJECTED:
+    //   - the owner is the bidder itself;
+    //   - the owner's account is the bidder's account;
+    //   - the owner's account cannot be resolved (fail closed) -
+    // except that ownerless listings (ownerGuidLow == 0, the auction-house-bot
+    // convention) are always admissible.
+    inline bool RejectAuctionBidder(uint32_t ownerGuidLow, uint32_t bidderGuidLow,
+        bool ownerAccountKnown, uint32_t ownerAccount, uint32_t bidderAccount)
+    {
+        if (ownerGuidLow == 0)
+            return false;
+
+        if (ownerGuidLow == bidderGuidLow)
+            return true;
+
+        if (!ownerAccountKnown || ownerAccount == 0)
+            return true;
+
+        return ownerAccount == bidderAccount;
+    }
+
     // Active standing-bid budget for the automatic bid pass. A bot may hold at
     // most `cap` simultaneous standing bids: `>= cap` existing bids is AT
     // capacity (the old `> 10` checks permitted an eleventh), the cap is

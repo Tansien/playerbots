@@ -25,6 +25,18 @@ namespace living
     // The single execution-confirmed statement one event write must run.
     enum class EventWriteKind { Delete, Update, Insert };
 
+    // Typed outcome of reloading one durable event row. A null query result
+    // can mean "query failed", not only "no row": treating it as absence
+    // turned unknown DB state into a confirmed zero in the cache. Absence is
+    // confirmed only through a successful COUNT.
+    enum class EventReloadOutcome
+    {
+        Found,           // row(s) read; cache now mirrors durable state
+        ConfirmedAbsent, // COUNT succeeded and returned zero rows
+        QueryFailed,     // durable state unknown; prior cache value must be
+                         // preserved and the entry marked dirty for retry
+    };
+
     enum class EventPersistOutcome
     {
         // The value violates the schema; nothing was attempted.

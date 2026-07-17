@@ -12,6 +12,32 @@
 
 using namespace ai;
 
+namespace
+{
+    // Shared same-account admission check (finding: bots bid on online sibling
+    // characters' auctions - the cores only block same-account bids for
+    // OFFLINE owners). Resolves the owner's account and fails CLOSED when the
+    // lookup cannot resolve; ownerless (auction-house-bot) listings pass.
+    // Applied at scan time, immediately before BidItem, and again inside
+    // BidItem at the packet boundary as defense in depth.
+    bool IsAdmissibleAuction(Player* bot, AuctionEntry const* auction)
+    {
+        uint32 ownerAccount = 0;
+        bool ownerAccountKnown = false;
+        if (auction->owner != 0)
+        {
+            ownerAccount = sObjectMgr.GetPlayerAccountIdByGUID(ObjectGuid(HIGHGUID_PLAYER, auction->owner));
+            ownerAccountKnown = ownerAccount != 0;
+            if (!ownerAccountKnown)
+                sLog.outError("AhAction: cannot resolve owner account for auction %u (owner guid %u); rejecting bid by %s",
+                    auction->Id, auction->owner, bot->GetName());
+        }
+
+        return !living::RejectAuctionBidder(auction->owner, bot->GetGUIDLow(),
+            ownerAccountKnown, ownerAccount, bot->GetSession()->GetAccountId());
+    }
+}
+
 bool AhAction::Execute(Event& event)
 {
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
@@ -81,8 +107,11 @@ bool AhAction::ExecuteCommand(Player* requester, std::string text, Unit* auction
             RESET_AI_VALUE2(uint32, "free money for", (uint32)NeedMoneyFor::ah);
             uint32 freeMoney = AI_VALUE2(uint32, "free money for", (uint32)NeedMoneyFor::ah);
 
+            // An unaffordable deposit skips THIS item only: returning false
+            // here erased an earlier successful posting from the result, and a
+            // cheaper item later in the list may still afford its deposit.
             if (deposit > freeMoney)
-                return false;
+                continue;
 
             const ItemPrototype* proto = item->GetProto();
 
@@ -279,7 +308,9 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!auction)
                 continue;
 
-            if (auction->owner == bot->GetGUIDLow())
+            // Never bid on the bot's own account's auctions (incl. online
+            // siblings); unresolvable owner accounts fail closed.
+            if (!IsAdmissibleAuction(bot, auction))
                 continue;
 
             // Also skip auctions the bot is already winning: the core accepts a
@@ -378,8 +409,9 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             // money, so the scan-time snapshot authorizes nothing.
             auction = auctionHouse->GetAuction(candidate.auctionId);
 
-            // Gone, changed hands, or the bot became high bidder meanwhile.
-            if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
+            // Gone, changed hands (incl. onto this account), or the bot became
+            // high bidder meanwhile.
+            if (!auction || !IsAdmissibleAuction(bot, auction) || auction->bidder == bot->GetGUIDLow())
                 continue;
 
             usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
@@ -478,9 +510,10 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     {
         auction = curAuction.second;
 
-        // Skip own auctions and auctions the bot is already winning (the core
-        // accepts a same-bidder raise and charges the delta).
-        if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
+        // Skip own-account auctions (incl. online siblings; fail closed on
+        // unresolvable owners) and auctions the bot is already winning (the
+        // core accepts a same-bidder raise and charges the delta).
+        if (!auction || !IsAdmissibleAuction(bot, auction) || auction->bidder == bot->GetGUIDLow())
             continue;
 
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
@@ -523,7 +556,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     // the scan-time cost ranked candidates, it does not authorize spending.
     BidCandidate const& best = candidates.front();
     auction = auctionHouse->GetAuction(best.auctionId);
-    if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
+    if (!auction || !IsAdmissibleAuction(bot, auction) || auction->bidder == bot->GetGUIDLow())
         return false;
 
     uint32 currentCost = 0;
@@ -553,6 +586,11 @@ bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price
     auction = auctionHouse->GetAuction(auction->Id);
 
     if (!auction)
+        return false;
+
+    // Defense in depth at the packet-send boundary: no same-account bid may
+    // leave this function regardless of which scan admitted the candidate.
+    if (!IsAdmissibleAuction(bot, auction))
         return false;
 
     WorldPacket packet;

@@ -51,4 +51,23 @@ namespace living
     {
         return (availableRoles & requestedRoles) != 0;
     }
+
+    // Concrete CURRENT role for runtime classification (IsTank/IsHeal, group
+    // quota accounting): exactly ONE role. Capability masks are a
+    // creation/planning concept - the Feral TANK|DPS capability never means
+    // "currently tanking". The class's tank form/stance/presence decides
+    // first; without it, a multi-role spec resolves to DPS (a Feral in cat or
+    // caster form, a Frost DK outside Frost Presence), while single-role specs
+    // are unambiguous.
+    inline uint8_t ConcreteRuntimeRole(uint8_t cls, uint8_t tab, bool tankFormActive)
+    {
+        if (tankFormActive)
+            return ROLE_TANK;
+
+        uint8_t const capabilities = SpecTabRoles(cls, tab);
+        if (capabilities == uint8_t(ROLE_TANK | ROLE_DPS))
+            return ROLE_DPS;
+
+        return capabilities;
+    }
 }

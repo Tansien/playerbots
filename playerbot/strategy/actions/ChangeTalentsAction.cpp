@@ -172,7 +172,7 @@ std::vector<TalentPath*> ChangeTalentsAction::getPremadePaths(uint8 cls, std::st
         // (TANK|DPS) path satisfies a TANK request; the old equality test
         // rejected every multi-role spec.
         if (role != BotRoles::BOT_ROLE_NONE
-            && !living::RolesSatisfy(static_cast<uint8>(AiFactory::GetPlayerRoles(cls, path.talentSpec.back().highestTree())), static_cast<uint8>(role)))
+            && !living::RolesSatisfy(static_cast<uint8>(AiFactory::GetSpecRoleCapabilities(cls, path.talentSpec.back().highestTree())), static_cast<uint8>(role)))
             continue;
 
         ret.push_back(&path);
@@ -279,6 +279,7 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
         TalentSpec newSpec = *GetBestPremadeSpec(bot, specId);
         newSpec.CropTalents(bot);
         newSpec.ApplyTalents(bot, out);
+        selection.applied = true;
         if (bot->GetPlayerbotAI())
             bot->GetPlayerbotAI()->UpdateTalentSpec();
         if (newSpec.GetTalentPoints() > 0)
@@ -291,6 +292,7 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
         TalentSpec newSpec(bot, specLink);
         newSpec.CropTalents(bot);
         newSpec.ApplyTalents(bot, out);
+        selection.applied = true;
         if (bot->GetPlayerbotAI())
             bot->GetPlayerbotAI()->UpdateTalentSpec();
         if (newSpec.GetTalentPoints() > 0)
@@ -368,6 +370,7 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
             specLink = newSpec.GetTalentLink();
             newSpec.CropTalents(bot);
             newSpec.ApplyTalents(bot, out);
+            selection.applied = true;
             if (bot->GetPlayerbotAI())
                 bot->GetPlayerbotAI()->UpdateTalentSpec();
 
@@ -386,24 +389,34 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
     selection.specId = specId;
     selection.specLink = specLink;
     selection.hadExistingSpec = specNo != 0;
-    // The APPLIED talents decide the intended role mask, through the canonical
-    // spec-tab mapping - aura/form state plays no part.
-    selection.selectedRoles = static_cast<uint8>(AiFactory::GetPlayerRoles(cls, static_cast<uint8>(AiFactory::GetPlayerSpecTab(bot))));
+    // The APPLIED talents decide the intended role capability mask, through
+    // the canonical spec-tab mapping - aura/form state plays no part. When no
+    // concrete path was applied (none found, or several merely listed with
+    // auto-pick disabled), the roles stay ZERO: a blank-talent character's
+    // default tab must never satisfy an explicit role request.
+    selection.selectedRoles = selection.applied
+        ? static_cast<uint8>(AiFactory::GetSpecRoleCapabilities(cls, static_cast<uint8>(AiFactory::GetPlayerSpecTab(bot))))
+        : 0;
     return selection;
 }
 
 bool ChangeTalentsAction::PersistTalentSpec(Player* bot, TalentSelectionResult const& selection)
+{
+    return PersistTalentSpec(bot->GetGUIDLow(), selection);
+}
+
+bool ChangeTalentsAction::PersistTalentSpec(uint32 botGuidLow, TalentSelectionResult const& selection)
 {
     // Nothing was selected (no talent points): nothing to persist, matching the
     // legacy early return before the writes.
     if (!selection.evaluated)
         return true;
 
-    bool ok = sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", selection.specId + 1);
+    bool ok = sRandomPlayerbotMgr.SetValue(botGuidLow, "specNo", selection.specId + 1);
     if (!selection.specLink.empty() && selection.specId == -1)
-        ok = sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 1, selection.specLink) && ok;
+        ok = sRandomPlayerbotMgr.SetValue(botGuidLow, "specLink", 1, selection.specLink) && ok;
     else
-        ok = sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 0) && ok;
+        ok = sRandomPlayerbotMgr.SetValue(botGuidLow, "specLink", 0) && ok;
 
     return ok;
 }
