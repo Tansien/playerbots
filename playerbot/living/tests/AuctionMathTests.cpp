@@ -29,8 +29,12 @@ LIVING_TEST(auction_opening_bid_is_exact_at_the_money_cap)
     LIVING_CHECK(TryComputeOpeningBid(2147483645u, kCoreMoneyCap, openingBid) && openingBid == 2040109462u);
     LIVING_CHECK(TryComputeOpeningBid(100, kCoreMoneyCap, openingBid) && openingBid == 95);
     LIVING_CHECK(TryComputeOpeningBid(99, kCoreMoneyCap, openingBid) && openingBid == 94);  // floor(94.05)
-    LIVING_CHECK(TryComputeOpeningBid(1, kCoreMoneyCap, openingBid) && openingBid == 0);
-    LIVING_CHECK(TryComputeOpeningBid(0, kCoreMoneyCap, openingBid) && openingBid == 0);
+    LIVING_CHECK(TryComputeOpeningBid(2, kCoreMoneyCap, openingBid) && openingBid == 1);    // smallest legal posting
+
+    // Prices whose 95% floor is zero cannot be posted: every pinned core's
+    // HandleAuctionSellItem rejects a zero start bid.
+    LIVING_CHECK(!TryComputeOpeningBid(1, kCoreMoneyCap, openingBid));
+    LIVING_CHECK(!TryComputeOpeningBid(0, kCoreMoneyCap, openingBid));
 
     // A price above the cap is rejected outright, never wrapped.
     LIVING_CHECK(!TryComputeOpeningBid(2147483647u, kCoreMoneyCap, openingBid));

@@ -13,6 +13,11 @@ namespace living
         if (openingBid > maxCopper)
             return false;
 
+        // Every pinned core's HandleAuctionSellItem rejects a zero start bid, so
+        // a price too small to produce a legal opening bid cannot be posted.
+        if (openingBid == 0)
+            return false;
+
         outOpeningBid = static_cast<uint32_t>(openingBid);
         return true;
     }

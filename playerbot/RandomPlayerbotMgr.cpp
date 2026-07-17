@@ -2412,10 +2412,18 @@ bool RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
     if (record.setHomebind)
         bot->SetHomebindToLocation(WorldLocation(record.mapId, record.x, record.y, record.z, record.orientation), record.homebindAreaId);
 
-    // Refresh resurrects/repairs/refills and resets the AI - exactly once, and
-    // only now that the bot demonstrably arrived (it exits early during a far
-    // transfer, which is why running it on acceptance silently did nothing).
-    Refresh(bot);
+    // Exactly one FULL AI reset per completed relocation, unconditionally:
+    // Reset(true) clears old-map movement/travel/spell state and reinitializes
+    // the engines. Refresh's own internal reset is both plain (Reset(false))
+    // and skipped entirely when random levels are disabled, so relying on it
+    // let bots resume stale cross-map navigation.
+    bot->GetPlayerbotAI()->Reset(true);
+
+    // Refresh resurrects/repairs/refills - exactly once, and only now that the
+    // bot demonstrably arrived (it exits early during a far transfer, which is
+    // why running it on acceptance silently did nothing). resetAi=false: the
+    // full reset above already ran.
+    Refresh(bot, /*resetAi*/ false);
 
     if (record.reviveRecovery)
     {
@@ -2436,21 +2444,37 @@ bool RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
     // Closest-inn selection runs from the post-acknowledgement position - the
     // pre-ack origin used to be measured instead. The old -1.0f sentinel also
     // made every nonnegative squared distance compare as "not closer", so no inn
-    // was ever selected and the bind packet never sent.
+    // was ever selected.
     if (record.bindInn)
     {
         WorldPosition botPos(bot);
 
         ObjectGuid closestInn;
+        WorldPosition closestInnPos;
         living::MinimumTracker closest;
         for (auto& [innGuid, innPosition] : innCacheLevel[bot->getRace()][bot->GetLevel()])
         {
             if (closest.Consider(botPos.sqDistance(innPosition)))
+            {
                 closestInn = innGuid;
+                closestInnPos = innPosition;
+            }
         }
 
         if (closestInn)
         {
+            // Perform the REAL bind: the state change is the homebind fields
+            // (the innkeeper creature may not even be loaded this far away, so
+            // the SendBindPoint interaction path is not available). The old
+            // code only emitted SMSG_TRAINER_BUY_SUCCEEDED, which is a visual
+            // confirmation and binds nothing.
+            uint32 const innAreaId = sTerrainMgr.GetAreaId(closestInnPos.getMapId(),
+                closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ());
+            bot->SetHomebindToLocation(
+                WorldLocation(closestInnPos.getMapId(), closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ(), 0.0f),
+                innAreaId);
+
+            // Legacy visual confirmation for nearby observers.
             WorldPacket data(SMSG_TRAINER_BUY_SUCCEEDED, (8 + 4));
             data << closestInn;
             data << uint32(3286);                               // Bind
@@ -3347,7 +3371,7 @@ uint32 RandomPlayerbotMgr::GetZoneLevel(uint16 mapId, float teleX, float teleY, 
     return level;
 }
 
-void RandomPlayerbotMgr::Refresh(Player* bot)
+void RandomPlayerbotMgr::Refresh(Player* bot, bool resetAi)
 {
     if (bot->IsBeingTeleportedFar() || !bot->IsInWorld())
         return;
@@ -3368,7 +3392,8 @@ void RandomPlayerbotMgr::Refresh(Player* bot)
     sLog.outDetail("Refreshing bot #%d <%s>", bot->GetGUIDLow(), bot->GetName());
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "Refresh");
 
-    bot->GetPlayerbotAI()->Reset();
+    if (resetAi)
+        bot->GetPlayerbotAI()->Reset();
 
     bot->DurabilityRepairAll(false, 1.0f
 #ifndef MANGOSBOT_ZERO
@@ -3387,8 +3412,11 @@ void RandomPlayerbotMgr::Refresh(Player* bot)
     if (bot->GetMaxPower(POWER_ENERGY) > 0)
         bot->SetPower(POWER_ENERGY, bot->GetMaxPower(POWER_ENERGY));
 
+    // Checked money grant, mirroring the cores' own AddMoney clamp: an
+    // unchecked add can wrap past MAX_MONEY_AMOUNT.
     uint32 money = bot->GetMoney();
-    bot->SetMoney(money + 500 * sqrt(urand(1, bot->GetLevel() * 5)));
+    uint32 bonus = static_cast<uint32>(500 * sqrt(urand(1, bot->GetLevel() * 5)));
+    bot->SetMoney(money < uint32(MAX_MONEY_AMOUNT) - bonus ? money + bonus : uint32(MAX_MONEY_AMOUNT));
 }
 
 bool RandomPlayerbotMgr::IsRandomBot(Player* bot)
@@ -3513,21 +3541,32 @@ std::string RandomPlayerbotMgr::GetEventData(uint32 bot, std::string event)
 
 uint32 RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data)
 {
+    // This is the shared persistence boundary for event metadata, and callers
+    // legitimately pass user-influenced strings (e.g. CreateBot's gear/group
+    // values). Escape here, once: an unescaped quote used to delete the prior
+    // row, fail the INSERT, and leave the in-memory cache diverged from the DB.
+    // The unescaped originals stay in the cache so memory matches what a
+    // round-trip through the driver produces.
+    std::string escapedEvent = event;
+    std::string escapedData = data;
+    CharacterDatabase.escape_string(escapedEvent);
+    CharacterDatabase.escape_string(escapedData);
+
     CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
-            bot, event.c_str());
+            bot, escapedEvent.c_str());
     if (value)
     {
         if (data != "")
         {
             CharacterDatabase.PExecute(
                 "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`, `data`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u', '%s')",
-                0, bot, (uint32)time(0), validIn, event.c_str(), value, data.c_str());
+                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value, escapedData.c_str());
         }
         else
         {
             CharacterDatabase.PExecute(
                 "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u')",
-                0, bot, (uint32)time(0), validIn, event.c_str(), value);
+                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value);
         }
     }
 
@@ -3649,7 +3688,7 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
         if (!living::MatchExactCommand(cmd, prefix, nameAndParams))
             continue;
 
-        std::string name = "%";
+        std::string name = "";
         std::string params = "";
 
         if (!nameAndParams.empty())
@@ -3672,9 +3711,15 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
 
         ConsolePlayerCommandHandler handler_copy = playerHandler;
 
+        // Target selection: a bare command is the documented bulk form and
+        // selects every random bot (the old "%" sentinel matched no name, so
+        // documented bulk commands did nothing). A named target must match
+        // EXACTLY - prefix matching made "remove Bob" also remove Bobby and
+        // every other prefix match, which is unacceptable for destructive
+        // commands.
         sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* bot) {
             std::string botName = bot->GetName();
-            if (botName.find(name) == 0)
+            if (name.empty() || botName == name)
             {
 
                 std::list<std::string> messages = (sRandomPlayerbotMgr.*handler_copy)(bot);

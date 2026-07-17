@@ -1128,9 +1128,11 @@ public:
 
         // One draw from 0..99 against a 0..100 chance: 0% never selects, 100%
         // always selects. The fixed draw shares the exact same domain (the
-        // default GetFixedBotNumber maxNum of 100 is inclusive, i.e. 101 values).
+        // default GetFixedBotNumber maxNum of 100 is inclusive, i.e. 101 values)
+        // and passes cyclePerMin = 0: the help promises "always the same bots",
+        // and the default cycle of 1 rotated the cohort every minute.
         uint32 const draw = selector.fixed
-            ? ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER, living::RANDOM_CHAT_DRAW_MAX)
+            ? ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER, living::RANDOM_CHAT_DRAW_MAX, 0)
             : urand(0, living::RANDOM_CHAT_DRAW_MAX);
 
         if (!living::RandomChatSelected(selector.chance, draw))

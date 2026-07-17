@@ -47,6 +47,11 @@ struct CreateBotOptions
     uint8 gender = GENDER_NONE;        // absent -> random
     Team team = TEAM_BOTH_ALLOWED;     // absent -> master's team
     uint8 role = 0;                    // ai::BotRoles; BOT_ROLE_NONE = auto talents
+    // When set (group composition), the role produced by talent selection is
+    // verified BEFORE any persistence; a mismatch is cleaned up unpersisted and
+    // reported as a retryable failure. Only meaningful for level > 1 creations
+    // (a level-1 character has no spec to verify).
+    bool requireRoleMatch = false;
     bool autoAdd = false;
     bool temporary = false;
     std::string groupWith;
