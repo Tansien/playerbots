@@ -3,6 +3,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/living/util/LivingBotCreation.h"
 #include "playerbot/living/util/LivingCommandSplit.h"
+#include "playerbot/living/util/LivingEventSchema.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "Maps/MapManager.h"
@@ -2389,21 +2390,36 @@ living::RelocationOutcome RandomPlayerbotMgr::Revive(Player* player)
     return RandomTeleportForLevel(player, false, false, /*reviveRecovery*/ true);
 }
 
-bool RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
+living::RelocationCompleteResult RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
 {
+    if (!bot || !relocations.HasPending(bot->GetGUIDLow()))
+        return living::RelocationCompleteResult::NoPending;
+
     // The acknowledgement is complete only when the bot is back in-world and no
     // longer teleporting; until then the record stays pending.
-    if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported())
-        return false;
+    if (!bot->IsInWorld() || bot->IsBeingTeleported())
+        return living::RelocationCompleteResult::StillPending;
 
-    // Complete() also verifies the bot is standing on the EXACT destination the
-    // accepted TeleportTo was given; a stale or foreign acknowledgement does not
-    // match and finalizes nothing. The record is erased on success, so
-    // completion runs exactly once.
+    // Complete() verifies the bot is standing on the EXACT destination the
+    // accepted TeleportTo was given. A finished acknowledgement anywhere else
+    // means the tracked teleport chain is dead (redirected, clobbered, or
+    // superseded mid-chain): the obsolete record is erased - never left armed
+    // for a later unrelated landing - while revive/retry markers stay, so the
+    // recovery is retried rather than falsely completed.
     living::PendingRelocation record;
-    if (!relocations.Complete(bot->GetGUIDLow(), bot->GetMapId(),
-            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), record))
-        return false;
+    living::RelocationCompleteResult const completion = relocations.Complete(
+        bot->GetGUIDLow(), bot->GetMapId(),
+        bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetOrientation(), record);
+
+    if (completion == living::RelocationCompleteResult::TerminalMismatch)
+    {
+        sLog.outDetail("Relocation of bot %s terminally cancelled: acknowledged landing does not match the accepted destination (token " UI64FMTD ")",
+            bot->GetName(), record.token);
+        return completion;
+    }
+
+    if (completion != living::RelocationCompleteResult::Completed)
+        return completion;
 
     uint32 const botGuid = bot->GetGUIDLow();
 
@@ -2449,12 +2465,16 @@ bool RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
     {
         WorldPosition botPos(bot);
 
+        // Only inns on the bot's CURRENT map are candidates: sqDistance has no
+        // map awareness, so a foreign-map inn with numerically similar
+        // coordinates could otherwise win and persist a homebind on the wrong
+        // continent.
         ObjectGuid closestInn;
         WorldPosition closestInnPos;
-        living::MinimumTracker closest;
+        living::MapLocalMinimum closest(bot->GetMapId());
         for (auto& [innGuid, innPosition] : innCacheLevel[bot->getRace()][bot->GetLevel()])
         {
-            if (closest.Consider(botPos.sqDistance(innPosition)))
+            if (closest.Consider(innPosition.mapid, botPos.sqDistance(innPosition)))
             {
                 closestInn = innGuid;
                 closestInnPos = innPosition;
@@ -2500,7 +2520,7 @@ bool RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
 
     sLog.outDetail("Relocation of bot %s to map %u completed (token " UI64FMTD ")",
         bot->GetName(), record.mapId, record.token);
-    return true;
+    return living::RelocationCompleteResult::Completed;
 }
 
 void RandomPlayerbotMgr::CancelPendingRelocation(uint32 botGuid)
@@ -2857,7 +2877,8 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
 
             // Some core paths complete a same-map transfer synchronously; if no
             // acknowledgement is owed, finalize right here.
-            if (!bot->IsBeingTeleported() && FinalizeRelocation(bot))
+            if (!bot->IsBeingTeleported()
+                && FinalizeRelocation(bot) == living::RelocationCompleteResult::Completed)
                 return living::RelocationOutcome::Completed;
 
             return living::RelocationOutcome::Pending;
@@ -3539,40 +3560,65 @@ std::string RandomPlayerbotMgr::GetEventData(uint32 bot, std::string event)
     return data;
 }
 
-uint32 RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data)
+bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data)
 {
     // This is the shared persistence boundary for event metadata, and callers
     // legitimately pass user-influenced strings (e.g. CreateBot's gear/group
-    // values). Escape here, once: an unescaped quote used to delete the prior
-    // row, fail the INSERT, and leave the in-memory cache diverged from the DB.
-    // The unescaped originals stay in the cache so memory matches what a
-    // round-trip through the driver produces.
+    // values).
+    //
+    // Schema limits are validated BEFORE any mutation: an over-limit value
+    // would either fail the INSERT after the DELETE (strict SQL) or be silently
+    // truncated (permissive SQL) while the cache kept the original - both
+    // diverge DB from cache.
+    if (!living::EventValueFitsSchema(event, data))
+    {
+        sLog.outError("SetEventValue rejected for bot %u: event '%s' (%zu bytes, max %zu) or data (%zu bytes, max %zu) exceeds the schema",
+            bot, event.c_str(), event.size(), living::EVENT_NAME_MAX_BYTES, data.size(), living::EVENT_DATA_MAX_BYTES);
+        return false;
+    }
+
+    // Escape here, once: an unescaped quote used to delete the prior row, fail
+    // the INSERT, and leave the in-memory cache diverged from the DB. The
+    // unescaped originals stay in the cache so memory matches what a round-trip
+    // through the driver produces.
     std::string escapedEvent = event;
     std::string escapedData = data;
     CharacterDatabase.escape_string(escapedEvent);
     CharacterDatabase.escape_string(escapedData);
 
-    CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
+    // The DELETE+INSERT pair replaces atomically inside one transaction, and
+    // the cache changes only after the statements were accepted.
+    CharacterDatabase.BeginTransaction();
+
+    bool ok = CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' AND event = '%s'",
             bot, escapedEvent.c_str());
     if (value)
     {
         if (data != "")
         {
-            CharacterDatabase.PExecute(
+            ok = CharacterDatabase.PExecute(
                 "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`, `data`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u', '%s')",
-                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value, escapedData.c_str());
+                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value, escapedData.c_str()) && ok;
         }
         else
         {
-            CharacterDatabase.PExecute(
+            ok = CharacterDatabase.PExecute(
                 "INSERT INTO ai_playerbot_random_bots (owner, bot, `time`, validIn, event, `value`) VALUES ('%u', '%u', '%u', '%u', '%s', '%u')",
-                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value);
+                0, bot, (uint32)time(0), validIn, escapedEvent.c_str(), value) && ok;
         }
+    }
+
+    ok = CharacterDatabase.CommitTransaction() && ok;
+
+    if (!ok)
+    {
+        sLog.outError("SetEventValue failed to persist event '%s' for bot %u; cache left unchanged", event.c_str(), bot);
+        return false;
     }
 
     CachedEvent e(value, (uint32)time(0), validIn, data);
     eventCache[bot][event] = e;
-    return value;
+    return true;
 }
 
 uint32 RandomPlayerbotMgr::GetValue(uint32 bot, std::string type)
@@ -3590,14 +3636,14 @@ std::string RandomPlayerbotMgr::GetData(uint32 bot, std::string type)
     return GetEventData(bot, type);
 }
 
-void RandomPlayerbotMgr::SetValue(uint32 bot, std::string type, uint32 value, std::string data, int32 validIn)
+bool RandomPlayerbotMgr::SetValue(uint32 bot, std::string type, uint32 value, std::string data, int32 validIn)
 {
-    SetEventValue(bot, type, value, validIn == -1 ? 15*24*3600 : validIn, data);
+    return SetEventValue(bot, type, value, validIn == -1 ? 15*24*3600 : validIn, data);
 }
 
-void RandomPlayerbotMgr::SetValue(Player* bot, std::string type, uint32 value, std::string data, int32 validIn)
+bool RandomPlayerbotMgr::SetValue(Player* bot, std::string type, uint32 value, std::string data, int32 validIn)
 {
-    SetValue(bot->GetObjectGuid().GetCounter(), type, value, data, validIn);
+    return SetValue(bot->GetObjectGuid().GetCounter(), type, value, data, validIn);
 }
 
 bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, char const* args)
@@ -3669,18 +3715,29 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
             return true;
     }
 
-    std::map<std::string, ConsolePlayerCommandHandler> playerHandlers;
-    playerHandlers["init"] = &RandomPlayerbotMgr::HandleRandomizeFirst;
-    playerHandlers["upgrade"] = &RandomPlayerbotMgr::HandleUpdateGearSpells;
-    playerHandlers["refresh"] = &RandomPlayerbotMgr::HandleRefresh;
-    playerHandlers["teleport"] = &RandomPlayerbotMgr::HandleRandomTeleportForLevel;
-    playerHandlers["rpg"] = &RandomPlayerbotMgr::HandleRandomTeleportForRpg;
-    playerHandlers["revive"] = &RandomPlayerbotMgr::HandleRevive;
-    playerHandlers["grind"] = &RandomPlayerbotMgr::HandleRandomTeleport;
-    playerHandlers["change_strategy"] = &RandomPlayerbotMgr::HandleChangeStrategy;
-    playerHandlers["remove"] = &RandomPlayerbotMgr::HandleRemove;
+    // Per-command target policy: destructive commands never acquire implicit
+    // bulk targeting. `bulkAllowed` is set ONLY for commands whose help
+    // documents a bare bulk form; `nameOnly` commands accept exactly one
+    // target name and nothing else.
+    struct PlayerCommandSpec
+    {
+        ConsolePlayerCommandHandler handler;
+        bool bulkAllowed;
+        bool nameOnly;
+    };
 
-    for (auto& [prefix, playerHandler] : playerHandlers)
+    std::map<std::string, PlayerCommandSpec> playerHandlers;
+    playerHandlers["init"] = { &RandomPlayerbotMgr::HandleRandomizeFirst, true, false };
+    playerHandlers["upgrade"] = { &RandomPlayerbotMgr::HandleUpdateGearSpells, true, false };
+    playerHandlers["refresh"] = { &RandomPlayerbotMgr::HandleRefresh, true, false };
+    playerHandlers["teleport"] = { &RandomPlayerbotMgr::HandleRandomTeleportForLevel, true, false };
+    playerHandlers["rpg"] = { &RandomPlayerbotMgr::HandleRandomTeleportForRpg, true, false };
+    playerHandlers["revive"] = { &RandomPlayerbotMgr::HandleRevive, true, false };
+    playerHandlers["grind"] = { &RandomPlayerbotMgr::HandleRandomTeleport, true, false };
+    playerHandlers["change_strategy"] = { &RandomPlayerbotMgr::HandleChangeStrategy, false, false };
+    playerHandlers["remove"] = { &RandomPlayerbotMgr::HandleRemove, false, true };
+
+    for (auto& [prefix, spec] : playerHandlers)
     {
         // Exact dispatch, same rule as above: "removeBob"/"reviveX" must not
         // resolve to remove/revive.
@@ -3688,53 +3745,78 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
         if (!living::MatchExactCommand(cmd, prefix, nameAndParams))
             continue;
 
-        std::string name = "";
-        std::string params = "";
-
-        if (!nameAndParams.empty())
+        auto const emit = [&](std::string const& msg)
         {
-            size_t spacePos = nameAndParams.find(' ');
-            if (spacePos != std::string::npos)
-            {
-                name = nameAndParams.substr(0, spacePos);
-                params = nameAndParams.substr(spacePos + 1);
-            }
-            else
-            {
-                name = nameAndParams;
-            }
+            sLog.outString("%s", msg.c_str());
+            if (isRA)
+                handler->SendSysMessage(msg.c_str());
+        };
+
+        // Tokenize with whitespace collapsing: "remove  Bob" is the exact
+        // target "Bob", never an empty bulk target.
+        std::vector<std::string> tokens;
+        size_t pos = 0;
+        while (pos < nameAndParams.size())
+        {
+            size_t const end = nameAndParams.find(' ', pos);
+            std::string const token = nameAndParams.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            pos = end == std::string::npos ? nameAndParams.size() : end + 1;
+            if (!token.empty())
+                tokens.push_back(token);
+        }
+
+        std::string const name = tokens.empty() ? "" : tokens[0];
+
+        std::string params;
+        for (size_t i = 1; i < tokens.size(); ++i)
+            params += (i > 1 ? " " : "") + tokens[i];
+
+        // Destructive/per-bot commands require one explicit exact target; bare
+        // and whitespace-only forms return usage without touching any bot.
+        if (name.empty() && !spec.bulkAllowed)
+        {
+            emit(GetCommandTexts(prefix));
+            return true;
+        }
+
+        if (spec.nameOnly && tokens.size() > 1)
+        {
+            emit(GetCommandTexts(prefix));
+            return true;
         }
 
         sRandomPlayerbotMgr.consoleCmdParams = params;
 
-        bool hasRandomBotCommand = false;
-
-        ConsolePlayerCommandHandler handler_copy = playerHandler;
-
-        // Target selection: a bare command is the documented bulk form and
-        // selects every random bot (the old "%" sentinel matched no name, so
-        // documented bulk commands did nothing). A named target must match
-        // EXACTLY - prefix matching made "remove Bob" also remove Bobby and
-        // every other prefix match, which is unacceptable for destructive
-        // commands.
+        // Phase 1: resolve stable targets by GUID without mutating anything. A
+        // named target matches EXACTLY - prefix matching made "remove Bob" also
+        // remove Bobby.
+        std::vector<uint32> targets;
         sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* bot) {
-            std::string botName = bot->GetName();
-            if (name.empty() || botName == name)
-            {
-
-                std::list<std::string> messages = (sRandomPlayerbotMgr.*handler_copy)(bot);
-                for (auto& msg : messages)
-                {
-                    sLog.outString("%s", msg.c_str());
-                    if (isRA)
-                        handler->SendSysMessage(msg.c_str());
-                    hasRandomBotCommand = true;
-                }
-            }
+            if (name.empty() || name == bot->GetName())
+                targets.push_back(bot->GetGUIDLow());
         });
 
-        if (hasRandomBotCommand)
+        if (targets.empty())
+        {
+            emit(name.empty() ? "No random bots are online" : "No random bot named '" + name + "' is online");
             return true;
+        }
+
+        // Phase 2: execute against re-fetched players, never against iterators
+        // of a container the handler may invalidate (removal logs the bot out
+        // and erases it from the very map ForEachPlayerbot walks).
+        for (uint32 targetGuid : targets)
+        {
+            Player* bot = sRandomPlayerbotMgr.GetPlayerBot(targetGuid);
+            if (!bot)
+                continue;
+
+            std::list<std::string> messages = (sRandomPlayerbotMgr.*spec.handler)(bot);
+            for (auto& msg : messages)
+                emit(msg);
+        }
+
+        return true;
     }
 
     std::list<std::string> messages = sRandomPlayerbotMgr.HandlePlayerbotCommand(args, handler->GetSession() ? handler->GetSession()->GetPlayer():nullptr, static_cast<CliHandler*>(handler) ? static_cast<CliHandler*>(handler)->GetAccessLevel() : SEC_PLAYER);
@@ -4723,8 +4805,12 @@ std::list<std::string> RandomPlayerbotMgr::HandleRemove(Player* bot)
         messages.push_back("Bot not found");
         return messages;
     }
+    // Capture everything needed for the response BEFORE removal: the default
+    // logout path deletes the Player, so `bot` must never be dereferenced
+    // afterward.
+    std::string const removedName = bot->GetName();
     Remove(bot);
-    messages.push_back("remove applied to " + std::string(bot->GetName()));
+    messages.push_back("remove applied to " + removedName);
     return messages;
 }
 

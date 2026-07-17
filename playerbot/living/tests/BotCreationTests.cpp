@@ -108,3 +108,54 @@ LIVING_TEST(minimum_tracker_several_candidates_keeps_the_smallest)
     LIVING_CHECK(tracker.HasSelection());
     LIVING_CHECK(tracker.Best() == 20.0f);
 }
+
+LIVING_TEST(map_local_minimum_ignores_foreign_map_candidates)
+{
+    // The inn-binding selection RandomPlayerbotMgr runs: cross-map squared
+    // distances are meaningless, so a numerically closer inn on ANOTHER map
+    // must never win over a same-map inn (or produce a wrong-map homebind).
+    MapLocalMinimum closest(0 /*bot's map*/);
+
+    LIVING_CHECK(!closest.Consider(1, 5.0f));      // foreign map, "closest" coords
+    LIVING_CHECK(closest.Consider(0, 900.0f));     // same map wins regardless
+    LIVING_CHECK(!closest.Consider(530, 1.0f));    // another foreign map
+    LIVING_CHECK(closest.Consider(0, 400.0f));     // closer same-map candidate
+    LIVING_CHECK(closest.HasSelection());
+
+    // Only foreign candidates: nothing is ever selected, so nothing binds.
+    MapLocalMinimum onlyForeign(0);
+    LIVING_CHECK(!onlyForeign.Consider(1, 1.0f));
+    LIVING_CHECK(!onlyForeign.Consider(571, 2.0f));
+    LIVING_CHECK(!onlyForeign.HasSelection());
+}
+
+LIVING_TEST(weighted_pick_uses_exclusive_bound_and_filtered_weights)
+{
+    // The joint race/class tuple selector samples with this helper: every unit
+    // of weight maps to exactly one candidate and the draw domain is exactly
+    // sum(weights) - the legacy inclusive urand(0, total) fell through every
+    // bucket once per total+1 draws into a filter-ignoring fallback.
+    std::vector<uint32_t> const weights = { 3, 0, 2 };
+    size_t index = 99;
+
+    LIVING_CHECK(PickWeightedIndex(weights, 0, index) && index == 0);
+    LIVING_CHECK(PickWeightedIndex(weights, 2, index) && index == 0);
+    LIVING_CHECK(PickWeightedIndex(weights, 3, index) && index == 2); // zero-weight entry skipped
+    LIVING_CHECK(PickWeightedIndex(weights, 4, index) && index == 2);
+
+    // The exclusive bound: draw == sum is out of range, not a fallback.
+    LIVING_CHECK(!PickWeightedIndex(weights, 5, index));
+
+    // Empty and all-zero weight sets select nothing.
+    LIVING_CHECK(!PickWeightedIndex({}, 0, index));
+    LIVING_CHECK(!PickWeightedIndex({ 0, 0 }, 0, index));
+
+    // Exhaustive: every draw maps to a nonzero-weight entry, proportionally.
+    uint32_t counts[3] = { 0, 0, 0 };
+    for (uint64_t draw = 0; draw < 5; ++draw)
+    {
+        LIVING_CHECK(PickWeightedIndex(weights, draw, index));
+        ++counts[index];
+    }
+    LIVING_CHECK(counts[0] == 3 && counts[1] == 0 && counts[2] == 2);
+}

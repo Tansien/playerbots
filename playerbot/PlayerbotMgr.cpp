@@ -2012,6 +2012,9 @@ bool CreateBotOptions::Parse(Player* master, std::string const& param, std::stri
             return false;
         }
         role = static_cast<uint8>(parsedRole);
+        // Every explicit role request is verified against the spec that talent
+        // selection actually produces - it is never silently approximated.
+        requireRoleMatch = true;
     }
 
     if (std::string const* value = get("login"))
@@ -2023,7 +2026,10 @@ bool CreateBotOptions::Parse(Player* master, std::string const& param, std::stri
     }
 
     if (std::string const* value = get("group"))
+    {
         groupWith = *value;
+        explicitGroup = true;
+    }
 
     if (std::string const* value = get("gear"))
         gear = *value;
@@ -2081,6 +2087,18 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
 {
     BotCreationResult result;
 
+    // One documented rule for unverifiable roles: roles are talent-derived, and
+    // below level 10 a character has no talent points, so a role-constrained
+    // creation cannot be verified there. It fails HERE - before any account,
+    // DB, or character mutation - instead of persisting a member with a
+    // fictional role counted against a quota.
+    if (options.requireRoleMatch && options.role && options.level < 10)
+    {
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back("Roles are talent-derived and cannot be verified below level 10; use level=10 or higher with role=");
+        return result;
+    }
+
     // Resolve the EFFECTIVE race/class/faction/gender/role tuple first and
     // validate it before any allocation or mutation. Explicit fields were
     // already validated in Parse; resolution covers the randomly chosen rest
@@ -2094,31 +2112,30 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
     if (gender == GENDER_NONE)
         gender = urand(GENDER_MALE, GENDER_FEMALE);
 
-    RandomPlayerbotFactory factory(0);
-
-    // The requested role constrains random class selection instead of being
-    // ignored ("role=healer" used to draw DPS-only classes).
+    // Joint constrained selection: any unresolved race/class is drawn as one
+    // race+class tuple filtered by team, role, explicit constraints, template
+    // existence and nonzero weight, so a random draw can never pick a class the
+    // team cannot play (Classic Horde drawing paladin) and then fail although
+    // compatible alternatives exist.
     uint8 cls = options.cls;
-    if (cls == 0)
-        cls = factory.GetRandomClass(options.race, static_cast<BotRoles>(options.role));
+    uint8 race = options.race;
+    if (cls == 0 || race == 0)
+    {
+        if (!RandomPlayerbotFactory::GetRandomTuple(team, static_cast<BotRoles>(options.role), options.race, options.cls, race, cls))
+        {
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back("No compatible race/class combination exists for the requested faction/role");
+            return result;
+        }
+    }
 
+    // Backstop validation of the effective tuple (also covers the fully
+    // explicit case, which skips the selector).
     if (options.role && !RandomPlayerbotFactory::isAvailableRole(cls, static_cast<BotRoles>(options.role)))
     {
         result.status = living::BotCreateStatus::TerminalFailure;
         result.messages.push_back("Class " + ChatHelper::formatClass(cls) + " cannot fill the requested role");
         return result;
-    }
-
-    uint8 race = options.race;
-    if (race == 0)
-    {
-        race = factory.GetRandomRace(cls, team);
-        if (race == 0)
-        {
-            result.status = living::BotCreateStatus::TerminalFailure;
-            result.messages.push_back("No race on the requested faction can play class " + ChatHelper::formatClass(cls));
-            return result;
-        }
     }
 
     if (!sObjectMgr.GetPlayerInfo(race, cls))
@@ -2218,6 +2235,13 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         uint32 botGuid = newBot->GetGUIDLow();
         result.guid = newBot->GetObjectGuid();
 
+        // Stages, in order: (1) apply the talent plan to the TRANSIENT player,
+        // (2) derive the resulting roles, (3) verify the requested role,
+        // (4) persist the character, (5) persist spec/creation metadata.
+        // Nothing before stage 4 may write a DB row or cache entry - a rejected
+        // creation must leave no state for a GUID that was never saved.
+        ChangeTalentsAction::TalentSelectionResult talents;
+
         if (options.level > 1)
         {
             newBot->SetLevel(options.level);
@@ -2233,13 +2257,13 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             newBot->learnDefaultSpells();
 
             std::ostringstream out;
-            ChangeTalentsAction::AutoSelectTalents(newBot, &out, static_cast<BotRoles>(options.role));
+            talents = ChangeTalentsAction::SelectTalents(newBot, &out, static_cast<BotRoles>(options.role));
 
-            // Verify the requested role was actually produced BEFORE any
-            // persistence (event rows below, SaveToDB later): a spec that
-            // cannot fill the requested slot is torn down unpersisted and the
-            // attempt reported retryable, so group quotas can never be filled
-            // by a bot of the wrong role.
+            // Stage 3: verify the requested role BEFORE any persistence. The
+            // rejected transient player and session are destroyed, and the
+            // only cache touched so far (the empty event-cache entry created by
+            // the spec lookup) is dropped, so the discarded GUID leaves no DB
+            // row or cache state at all.
             if (options.requireRoleMatch && options.role)
             {
                 uint32 const actualRoles = static_cast<uint32>(AiFactory::GetPlayerRoles(newBot));
@@ -2248,30 +2272,16 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
                     sObjectAccessor.RemoveObject(newBot);
                     delete newBot;
                     delete botSession;
+                    sRandomPlayerbotMgr.ForgetEventCache(botGuid);
                     result.guid = ObjectGuid();
                     result.status = living::BotCreateStatus::RetryableFailure;
                     result.messages.push_back("Talent selection did not produce the requested role");
                     return result;
                 }
             }
-
-            sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 1);
-            sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, options.groupWith);
-            sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, options.gear);
         }
         else
             newBot->SetLevel(1);
-
-        if (!options.testName.empty())
-        {
-            // SetEventValue escapes at the persistence boundary; the old ad-hoc
-            // quote replacement here would now double-escape.
-            sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, options.testName);
-        }
-        if (options.temporary)
-        {
-            sRandomPlayerbotMgr.SetValue(botGuid, "temporary", 1, name);
-        }
 
         if (master)
         {
@@ -2279,7 +2289,36 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             newBot->SetPosition(master->GetPositionX(), master->GetPositionY(), master->GetPositionZ(), master->GetOrientation());
         }
 
+        // Stage 4: the character itself.
         newBot->SaveToDB();
+
+        // Stage 5: metadata, only now that the character exists. Failures are
+        // reported, never silently swallowed.
+        bool metadataOk = ChangeTalentsAction::PersistTalentSpec(newBot, talents);
+
+        if (options.level > 1)
+        {
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 1) && metadataOk;
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, options.gear) && metadataOk;
+        }
+
+        // An EXPLICIT group request writes the group-join event at any level (it
+        // used to be accidentally conditional on level > 1); the legacy
+        // master-name default keeps its historical level>1-only behavior so a
+        // plain level-1 create does not silently start grouping.
+        if (!options.groupWith.empty() && (options.explicitGroup || options.level > 1))
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, options.groupWith) && metadataOk;
+
+        if (!options.testName.empty())
+        {
+            // SetEventValue escapes at the persistence boundary; the old ad-hoc
+            // quote replacement here would now double-escape.
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, options.testName) && metadataOk;
+        }
+        if (options.temporary)
+        {
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "temporary", 1, name) && metadataOk;
+        }
 
         result.status = living::BotCreateStatus::Created;
         // Report the composition that was ACTUALLY persisted (class from the
@@ -2288,6 +2327,8 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         result.createdClass = newBot->getClass();
         result.createdRole = static_cast<uint8>(AiFactory::GetPlayerRoles(newBot));
         result.messages.push_back("Bot created: " + name);
+        if (!metadataOk)
+            result.messages.push_back("Warning: some creation metadata failed to persist for " + name);
 
         botSession->LogoutPlayer();
         sObjectAccessor.RemoveObject(newBot);
@@ -2331,6 +2372,16 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     Group* group = master->GetGroup();
     if (group)
         currentGroupSize = group->GetMembersCount();
+
+    // Group composition is role-quota driven, and roles are talent-derived:
+    // below level 10 no member's role could be verified, so the command errors
+    // out instead of persisting members with fictional roles (same rule as
+    // CreateBot's role verification).
+    if (masterLevel < 10)
+    {
+        messages.push_back("group requires a level 10+ master: member roles are talent-derived and cannot be verified below level 10");
+        return messages;
+    }
 
     // Group-level options are parsed ONCE into typed values. Composition fields
     // (class, role, race, faction, level, group target, name, test) cannot be
@@ -2391,8 +2442,6 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     // cannot alias.
     std::unordered_map<uint8, std::unordered_map<BotRoles, uint32>> allowedClassNr = LfgAction::AllowedClassRoleNr(master, static_cast<uint8>(groupSize));
 
-    RandomPlayerbotFactory factory(0);
-
     uint32 maxTries = 10*groupSize;
 
     living::GroupCreationLedger ledger;
@@ -2416,20 +2465,19 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             continue;
         }
 
-        uint8 cls = factory.GetRandomClass(0, role);
-
-#ifdef MANGOSBOT_ZERO
-        if (cls == CLASS_PALADIN && team == HORDE)
+        // The same joint team/role-constrained selector direct creation uses:
+        // it can only produce tuples the master's faction can actually play, so
+        // the old Classic paladin/shaman faction skips are unnecessary.
+        uint8 race = 0;
+        uint8 cls = 0;
+        if (!RandomPlayerbotFactory::GetRandomTuple(team, role, 0, 0, race, cls))
         {
-            continue_race++;
+            // No tuple can ever satisfy this role for this faction: stop
+            // drawing the role instead of burning attempts on it.
+            allowedClassNr[0][role] = 0;
+            continue_role++;
             continue;
         }
-        if (cls == CLASS_SHAMAN && team == ALLIANCE)
-        {
-            continue_race++;
-            continue;
-        }
-#endif
 
         if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end() && allowedClassNr[cls][role] == 0)
         {
@@ -2447,10 +2495,12 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         // creations, which is every case with role quotas in play.)
         CreateBotOptions options;
         options.level = masterLevel;
+        options.race = race;
         options.cls = cls;
         options.role = static_cast<uint8>(role);
         options.requireRoleMatch = true;
         options.groupWith = master->GetName();
+        options.explicitGroup = true;
         options.gear = gear;
         options.autoAdd = autoAdd;
         options.temporary = temporary;

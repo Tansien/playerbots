@@ -252,13 +252,15 @@ TalentPath* ChangeTalentsAction::PickPremadePath(std::vector<TalentPath*> paths,
     return paths[0];
 }
 
-bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out, BotRoles role)
+ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Player* bot, std::ostringstream* out, BotRoles role)
 {
+    TalentSelectionResult selection;
+
     //Does the bot have talentpoints?
     if (bot->GetLevel() < 10)
     {
         *out << "No free talent points.";
-        return false;
+        return selection;
     }
 
     uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
@@ -371,13 +373,41 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
         }
     }
 
-    sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", specId + 1);
-    if (!specLink.empty() && specId == -1)
-        sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 1, specLink);
-    else
-        sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 0);
+    // Selection only: persistence is the caller's explicit second stage
+    // (PersistTalentSpec), run after the character itself is accepted. The old
+    // combined flow wrote specNo/specLink here, which leaked orphan event rows
+    // when creation later rejected the transient player.
+    selection.evaluated = true;
+    selection.specId = specId;
+    selection.specLink = specLink;
+    selection.hadExistingSpec = specNo != 0;
+    return selection;
+}
 
-    return (specNo == 0) ? false : true;
+bool ChangeTalentsAction::PersistTalentSpec(Player* bot, TalentSelectionResult const& selection)
+{
+    // Nothing was selected (no talent points): nothing to persist, matching the
+    // legacy early return before the writes.
+    if (!selection.evaluated)
+        return true;
+
+    bool ok = sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", selection.specId + 1);
+    if (!selection.specLink.empty() && selection.specId == -1)
+        ok = sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 1, selection.specLink) && ok;
+    else
+        ok = sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 0) && ok;
+
+    return ok;
+}
+
+bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out, BotRoles role)
+{
+    TalentSelectionResult const selection = SelectTalents(bot, out, role);
+    if (!selection.evaluated)
+        return false;
+
+    PersistTalentSpec(bot, selection);
+    return selection.hadExistingSpec;
 }
 
 //Returns a pre-made talent spec that best suits the bots current talents. 

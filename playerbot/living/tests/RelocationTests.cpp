@@ -5,99 +5,111 @@
 using namespace living;
 
 // RelocationTracker is the exact pending-relocation registry RandomPlayerbotMgr
-// uses: Begin on TeleportTo acceptance, Complete from the teleport
-// acknowledgement, Cancel on logout/removal/relogin.
+// uses: Begin on TeleportTo acceptance, Complete from the FINISHED teleport
+// acknowledgement, Cancel on logout/removal/relogin. Completion requires the
+// exact accepted destination (the pinned cores install the stored components
+// directly); any other finished landing terminally cancels the obsolete record.
 
 namespace
 {
-    PendingRelocation MakeRecord(uint32_t mapId, float x, float y, float z)
+    PendingRelocation MakeRecord(uint32_t mapId, float x, float y, float z, float o = 0.0f)
     {
         PendingRelocation record;
         record.mapId = mapId;
         record.x = x;
         record.y = y;
         record.z = z;
+        record.orientation = o;
         record.setHomebind = true;
         record.homebindAreaId = 42;
         return record;
     }
 }
 
-LIVING_TEST(relocation_completes_exactly_once_on_matching_ack)
+LIVING_TEST(relocation_completes_exactly_once_on_exact_ack)
 {
     RelocationTracker tracker;
     uint64_t const token = tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
     LIVING_CHECK(token != 0);
     LIVING_CHECK(tracker.HasPending(1001));
 
-    // The acknowledged position matches the accepted destination.
+    // The acknowledged landing is exactly the accepted destination.
     PendingRelocation completed;
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, completed));
+    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, completed) == RelocationCompleteResult::Completed);
     LIVING_CHECK(completed.token == token);
     LIVING_CHECK(completed.setHomebind && completed.homebindAreaId == 42);
 
-    // Exactly once: the record is gone, a second acknowledgement finalizes nothing.
+    // Exactly once: the record is gone, a second acknowledgement finds nothing.
     LIVING_CHECK(!tracker.HasPending(1001));
-    LIVING_CHECK(!tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, completed));
+    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, completed) == RelocationCompleteResult::NoPending);
 }
 
-LIVING_TEST(relocation_float_noise_matches_but_nearby_landings_do_not)
+LIVING_TEST(relocation_any_displacement_is_a_terminal_mismatch)
 {
-    RelocationTracker tracker;
-    tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
-
-    // Sub-yard float round-trip noise still matches...
-    PendingRelocation completed;
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.1f, 199.9f, 30.05f, completed));
-
-    // ...but a landing merely NEAR the destination is a different teleport: the
-    // cores install the exact destination, so 1..7 yard offsets must reject
-    // (the old 8-yard sphere accepted a foreign teleport as this relocation).
-    for (float offset = 1.0f; offset <= 7.0f; offset += 1.0f)
+    // The cores install the exact destination on acknowledgement, so even a
+    // 0.25-yard displacement is a different landing - the old gameplay-distance
+    // tolerance let a foreign teleport finalize this relocation. The obsolete
+    // record is ERASED (terminal), never left armed for a later landing.
+    float const offsets[] = { 0.25f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 500.0f };
+    for (float const offset : offsets)
     {
-        RelocationTracker nearMiss;
-        nearMiss.Begin(7, MakeRecord(1, 100.0f, 200.0f, 30.0f));
-        LIVING_CHECK(!nearMiss.Complete(7, 1, 100.0f + offset, 200.0f, 30.0f, completed));
-        LIVING_CHECK(nearMiss.HasPending(7)); // still pending, markers untouched
+        RelocationTracker tracker;
+        tracker.Begin(7, MakeRecord(1, 100.0f, 200.0f, 30.0f));
+
+        PendingRelocation record;
+        LIVING_CHECK(tracker.Complete(7, 1, 100.0f + offset, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::TerminalMismatch);
+        LIVING_CHECK(!tracker.HasPending(7));
+        LIVING_CHECK(tracker.Complete(7, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::NoPending);
     }
 }
 
-LIVING_TEST(relocation_stale_or_foreign_ack_does_not_finalize)
+LIVING_TEST(relocation_wrong_map_and_wrong_orientation_are_terminal)
 {
+    // Wrong map: a chained/redirected teleport landed elsewhere.
     RelocationTracker tracker;
     tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
 
-    PendingRelocation completed;
+    PendingRelocation record;
+    LIVING_CHECK(tracker.Complete(1001, 2, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::TerminalMismatch);
+    LIVING_CHECK(!tracker.HasPending(1001));
 
-    // Wrong map: some other teleport moved the bot. Nothing finalizes and the
-    // record stays pending (retry markers are never cleared by a mismatch).
-    LIVING_CHECK(!tracker.Complete(1001, 2, 100.0f, 200.0f, 30.0f, completed));
-    LIVING_CHECK(tracker.HasPending(1001));
+    // Wrong orientation with identical coordinates is still a different landing.
+    RelocationTracker byOrientation;
+    byOrientation.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f, 0.0f));
+    LIVING_CHECK(byOrientation.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 1.5f, record) == RelocationCompleteResult::TerminalMismatch);
+    LIVING_CHECK(!byOrientation.HasPending(1001));
 
-    // Same map but far from the accepted destination: also stale.
-    LIVING_CHECK(!tracker.Complete(1001, 1, 500.0f, 200.0f, 30.0f, completed));
-    LIVING_CHECK(tracker.HasPending(1001));
-
-    // A different bot's acknowledgement never completes this record.
-    LIVING_CHECK(!tracker.Complete(2002, 1, 100.0f, 200.0f, 30.0f, completed));
-    LIVING_CHECK(tracker.HasPending(1001));
+    // A different bot's acknowledgement never resolves this record.
+    RelocationTracker other;
+    other.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
+    LIVING_CHECK(other.Complete(2002, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::NoPending);
+    LIVING_CHECK(other.HasPending(1001));
 }
 
-LIVING_TEST(relocation_new_attempt_supersedes_the_stale_pending)
+LIVING_TEST(relocation_supersession_and_stale_ack)
 {
+    // One in-flight relocation per bot: a newer attempt explicitly supersedes.
     RelocationTracker tracker;
     uint64_t const first = tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
     uint64_t const second = tracker.Begin(1001, MakeRecord(2, 700.0f, 800.0f, 90.0f));
     LIVING_CHECK(second > first);
     LIVING_CHECK(tracker.PendingCount() == 1); // bounded: one record per bot
 
-    // An acknowledgement for the SUPERSEDED destination no longer matches...
-    PendingRelocation completed;
-    LIVING_CHECK(!tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, completed));
+    // A stale acknowledgement at the SUPERSEDED destination is a finished
+    // landing somewhere other than the current record's destination: terminal.
+    // The current attempt's own completion can then never falsely fire, and
+    // retry markers (owned by the caller) drive a fresh attempt.
+    PendingRelocation record;
+    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::TerminalMismatch);
+    LIVING_CHECK(record.token == second); // the erased record was the current one
+    LIVING_CHECK(!tracker.HasPending(1001));
 
-    // ...only the current attempt completes, carrying the fresh token.
-    LIVING_CHECK(tracker.Complete(1001, 2, 700.0f, 800.0f, 90.0f, completed));
-    LIVING_CHECK(completed.token == second);
+    // Clean supersession: the second attempt's own exact landing completes.
+    RelocationTracker clean;
+    clean.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
+    uint64_t const current = clean.Begin(1001, MakeRecord(2, 700.0f, 800.0f, 90.0f));
+    LIVING_CHECK(clean.Complete(1001, 2, 700.0f, 800.0f, 90.0f, 0.0f, record) == RelocationCompleteResult::Completed);
+    LIVING_CHECK(record.token == current);
 }
 
 LIVING_TEST(relocation_cancellation_drops_without_completing)
@@ -108,13 +120,13 @@ LIVING_TEST(relocation_cancellation_drops_without_completing)
     LIVING_CHECK(tracker.PendingCount() == 2);
 
     // Logout/removal: the record is dropped, never finalized - a later
-    // acknowledgement at the old destination cannot claim completion.
+    // acknowledgement at the old destination finds nothing.
     tracker.Cancel(1001);
     LIVING_CHECK(!tracker.HasPending(1001));
     LIVING_CHECK(tracker.PendingCount() == 1);
 
-    PendingRelocation completed;
-    LIVING_CHECK(!tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, completed));
+    PendingRelocation record;
+    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::NoPending);
 
     // Cancelling one bot never touches another's pending relocation.
     LIVING_CHECK(tracker.HasPending(2002));
@@ -138,7 +150,7 @@ LIVING_TEST(relocation_revive_flags_travel_with_the_record)
     tracker.Begin(7, record);
 
     PendingRelocation completed;
-    LIVING_CHECK(tracker.Complete(7, 1, 10.0f, 20.0f, 3.0f, completed));
+    LIVING_CHECK(tracker.Complete(7, 1, 10.0f, 20.0f, 3.0f, 0.0f, completed) == RelocationCompleteResult::Completed);
     LIVING_CHECK(completed.reviveRecovery);
     LIVING_CHECK(completed.bindInn);
     LIVING_CHECK(completed.scheduleNextTeleport);
