@@ -41,6 +41,32 @@ LIVING_TEST(auction_opening_bid_is_exact_at_the_money_cap)
     LIVING_CHECK(!TryComputeOpeningBid(4294967295u, kCoreMoneyCap, openingBid));
 }
 
+LIVING_TEST(auction_sell_price_products_are_checked)
+{
+    uint32_t perItem = 0;
+    uint32_t total = 0;
+
+    // Normal pricing keeps the floor and the 1-copper minimum.
+    LIVING_CHECK(TryComputePerItemSellPrice(100, 75, kCoreMoneyCap, perItem) && perItem == 75);
+    LIVING_CHECK(TryComputePerItemSellPrice(1, 75, kCoreMoneyCap, perItem) && perItem == 1); // floor(0.75) -> min 1
+    LIVING_CHECK(TryComputePerItemSellPrice(0, 100, kCoreMoneyCap, perItem) && perItem == 1);
+
+    // base x percentage wrapped in uint32 for cap-adjacent bases: 2147483646*75
+    // is far beyond uint32. The checked product stays exact.
+    LIVING_CHECK(TryComputePerItemSellPrice(2147483646u, 75, kCoreMoneyCap, perItem) && perItem == 1610612734u);
+    LIVING_CHECK(TryComputePerItemSellPrice(2147483646u, 100, kCoreMoneyCap, perItem) && perItem == 2147483646u);
+    // 101% of the cap exceeds it: rejected, not wrapped.
+    LIVING_CHECK(!TryComputePerItemSellPrice(2147483646u, 101, kCoreMoneyCap, perItem));
+
+    // perItem x stack count: exact maximum passes, one more copper fails, and
+    // large stacks cannot wrap into a tiny accepted total.
+    LIVING_CHECK(TryComputeSellTotal(1073741823u, 2, kCoreMoneyCap, total) && total == 2147483646u);
+    LIVING_CHECK(!TryComputeSellTotal(1073741824u, 2, kCoreMoneyCap, total)); // cap + 2
+    LIVING_CHECK(TryComputeSellTotal(100, 20, kCoreMoneyCap, total) && total == 2000);
+    LIVING_CHECK(!TryComputeSellTotal(214748365u, 1000, kCoreMoneyCap, total)); // wraps in uint32
+    LIVING_CHECK(!TryComputeSellTotal(100, 0, kCoreMoneyCap, total));
+}
+
 LIVING_TEST(auction_bid_cost_mirrors_core_minimums)
 {
     uint32_t cost = 0;

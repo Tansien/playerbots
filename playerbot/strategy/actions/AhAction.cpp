@@ -83,17 +83,25 @@ bool AhAction::ExecuteCommand(Player* requester, std::string text, Unit* auction
 
             const ItemPrototype* proto = item->GetProto();
 
+            // Both products are computed checked in uint64 against the core
+            // money cap: base x percentage and per-item x stack count each
+            // wrapped in uint32 for cap-adjacent prices/large stacks, letting an
+            // overflowed tiny price reach the posting path as if it were valid.
             if (!pricePerItemCache[proto->ItemId])
             {
                 uint32 basePerItem = ItemUsageValue::GetBotSellPrice(proto, bot);
                 uint32 initialPricePercentage = urand(75, 100);
-                uint32 pricePerItem = (basePerItem * initialPricePercentage) / 100;
-                if (!pricePerItem)
-                    pricePerItem = 1;
+                uint32 pricePerItem = 0;
+                if (!living::TryComputePerItemSellPrice(basePerItem, initialPricePercentage, MAX_MONEY_AMOUNT, pricePerItem))
+                    continue;
                 pricePerItemCache[proto->ItemId] = pricePerItem;
             }
 
-            bool didPost = PostItem(requester, item, pricePerItemCache[proto->ItemId] * item->GetCount(), auctioneer, time);
+            uint32 stackTotal = 0;
+            if (!living::TryComputeSellTotal(pricePerItemCache[proto->ItemId], item->GetCount(), MAX_MONEY_AMOUNT, stackTotal))
+                continue;
+
+            bool didPost = PostItem(requester, item, stackTotal, auctioneer, time);
 
             if (didPost)
             {
@@ -260,6 +268,12 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (auction->owner == bot->GetGUIDLow())
                 continue;
 
+            // Also skip auctions the bot is already winning: the core accepts a
+            // same-bidder raise and charges the delta, so repeated automatic
+            // cycles would outbid the bot against itself toward the buyout.
+            if (auction->bidder == bot->GetGUIDLow())
+                continue;
+
             usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
 
             if (freeMoney.find(usage) == freeMoney.end())
@@ -273,6 +287,9 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             // core rejects (price <= bid, missing outbid increment). Items the
             // bot does not keep (vendor/greed) only bid; wanted items buy out
             // when the buyout fits the allowance, else fall back to bidding.
+            // This scan-time cost RANKS the candidate only - it is never
+            // authorization: everything is revalidated against current state
+            // immediately before any bid is sent.
             uint32 bidCost = 0;
             if (!living::TryComputeAuctionBidCost(auction->startbid, auction->bid, auction->GetAuctionOutBid(),
                     auction->buyout, MAX_MONEY_AMOUNT, bidCost))
@@ -338,35 +355,71 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
         std::sort(candidates.begin(), candidates.end(),
             [](BidCandidate const& a, BidCandidate const& b) { return a.power > b.power; });
 
-        bool bidItems = false;
+        bool anyBid = false;
 
         for (BidCandidate const& candidate : candidates)
         {
+            // Batched transactions revalidate CURRENT state immediately before
+            // each mutation: earlier bids in this batch have already spent
+            // money, so the scan-time snapshot authorizes nothing.
             auction = auctionHouse->GetAuction(candidate.auction->Id);
 
-            if (!auction)
+            // Gone, changed hands, or the bot became high bidder meanwhile.
+            if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
                 continue;
 
             usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
 
+            if (freeMoney.find(usage) == freeMoney.end())
+                continue;
+
+            // Reset and re-read this usage's CURRENT free-money allowance - the
+            // cached value predates the earlier bids in this batch. Two
+            // individually affordable candidates must not cumulatively dip into
+            // money reserved for repairs/spells/consumables.
+            RESET_AI_VALUE2(uint32, "free money for", freeMoney[usage]);
+            uint32 const allowance = AI_VALUE2(uint32, "free money for", freeMoney[usage]);
+
+            // Recompute ONE exact legal cost from the auction's current state.
+            uint32 bidCost = 0;
+            if (!living::TryComputeAuctionBidCost(auction->startbid, auction->bid, auction->GetAuctionOutBid(),
+                    auction->buyout, MAX_MONEY_AMOUNT, bidCost))
+                continue;
+
+            bool const bidOnly = usage == ItemUsage::ITEM_USAGE_VENDOR || usage == ItemUsage::ITEM_USAGE_FORCE_GREED;
+
+            uint32 cost;
+            bool isBuyout;
+            if (!bidOnly && auction->buyout > 0 && auction->buyout <= allowance)
+            {
+                cost = auction->buyout;
+                isBuyout = true;
+            }
+            else
+            {
+                cost = bidCost;
+                isBuyout = auction->buyout > 0 && bidCost == auction->buyout;
+            }
+
+            if (cost > allowance || cost > bot->GetMoney())
+                continue;
+
             std::string reason = ItemUsageValue::ReasonForNeed(usage, auction, auction->itemCount, bot);
 
-            // The exact cost calculated (once) during scoring is what the
-            // packet gets; if the auction moved meanwhile the core safely
-            // rejects the stale value and no money moves.
-            bidItems = BidItem(requester, auction, candidate.cost, auctioneer, candidate.isBuyout, reason);
+            bool const didBid = BidItem(requester, auction, cost, auctioneer, isBuyout, reason);
 
-            if (bidItems)
+            // Accumulate: a later stale/rejected bid must not erase an earlier
+            // successful money mutation from the result.
+            anyBid |= didBid;
+
+            if (didBid)
                 totalcount++;
 
             if (!urand(0, 5) || totalcount > 10)
                 break;
-
-            if (freeMoney.find(usage) != freeMoney.end())
-                RESET_AI_VALUE2(uint32, "free money for", freeMoney[usage]);
         }
 
-        return bidItems;
+        return anyBid;
     }
 
     // Documented syntax: ah bid <item link or item name> <budget>. The budget is
@@ -405,7 +458,9 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     {
         auction = curAuction.second;
 
-        if (!auction || auction->owner == bot->GetGUIDLow())
+        // Skip own auctions and auctions the bot is already winning (the core
+        // accepts a same-bidder raise and charges the delta).
+        if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
             continue;
 
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
@@ -444,8 +499,23 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     std::sort(candidates.begin(), candidates.end(),
         [](BidCandidate const& a, BidCandidate const& b) { return a.power > b.power; });
 
+    // Revalidate the chosen auction's CURRENT state immediately before the bid:
+    // the scan-time cost ranked candidates, it does not authorize spending.
     BidCandidate const& best = candidates.front();
-    return BidItem(requester, best.auction, best.cost, auctioneer, best.isBuyout);
+    auction = auctionHouse->GetAuction(best.auction->Id);
+    if (!auction || auction->owner == bot->GetGUIDLow() || auction->bidder == bot->GetGUIDLow())
+        return false;
+
+    uint32 currentCost = 0;
+    if (!living::TryComputeAuctionBidCost(auction->startbid, auction->bid, auction->GetAuctionOutBid(),
+            auction->buyout, MAX_MONEY_AMOUNT, currentCost))
+        return false;
+
+    if (currentCost > budget || currentCost > bot->GetMoney())
+        return false;
+
+    return BidItem(requester, auction, currentCost, auctioneer,
+        auction->buyout > 0 && currentCost == auction->buyout);
 }
 
 bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price, Unit* auctioneer, bool isBuyout, std::string reason)

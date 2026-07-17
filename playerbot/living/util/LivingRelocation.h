@@ -42,18 +42,32 @@ namespace living
         bool scheduleNextTeleport = false;
     };
 
-    // Acknowledged position must land ON the accepted destination. The pinned
-    // cores install the exact teleport destination on acknowledgement, so this
-    // absorbs only float round-trip noise - it is deliberately far below one
-    // yard so a stale or foreign teleport that happens to land nearby can never
-    // be finalized as this relocation.
-    inline constexpr float RELOCATION_ACK_TOLERANCE = 0.25f;
+    // Outcome of a completion attempt from a finished teleport acknowledgement.
+    enum class RelocationCompleteResult
+    {
+        // No relocation is tracked for this bot.
+        NoPending,
+        // The acknowledgement has not finished yet (bot not in-world or still
+        // teleporting); the record stays armed. Decided by the caller, which
+        // owns those world-state checks.
+        StillPending,
+        // The bot landed on the EXACT accepted destination; the record is
+        // removed and finalization work may run - exactly once.
+        Completed,
+        // The acknowledgement finished but the bot is NOT on the accepted
+        // destination: the tracked teleport chain is dead (redirected, clobbered
+        // by a foreign teleport, or superseded mid-chain). The obsolete record
+        // is erased so no stale homebind/revive/scheduling work stays armed for
+        // a later unrelated landing; retry markers are untouched.
+        TerminalMismatch,
+    };
 
-    // Bounded pending-relocation registry: at most one entry per bot. A newer
-    // attempt supersedes the previous one (its token dies with it), completion
-    // and cancellation erase, and a bot that never acknowledges simply leaves a
-    // record that the next attempt overwrites - retry markers are untouched, so
-    // event-driven retry doubles as the timeout path.
+    // Bounded pending-relocation registry: at most one in-flight entry per bot.
+    // A newer attempt explicitly supersedes the previous one (its token dies
+    // with it), completion/mismatch/cancellation erase, and a bot that never
+    // acknowledges simply leaves a record that the next attempt overwrites -
+    // retry markers are untouched, so event-driven retry doubles as the timeout
+    // path.
     class RelocationTracker
     {
     public:
@@ -61,12 +75,14 @@ namespace living
         // fresh token. Returns that token.
         uint64_t Begin(uint32_t botGuid, PendingRelocation record);
 
-        // Finalizes iff a record exists for the bot AND the acknowledged position
-        // matches the accepted destination (same map, within tolerance). The
-        // record is removed - finalization happens exactly once. A mismatched
-        // acknowledgement (stale teleport, foreign relocation) leaves the record
-        // pending and returns false.
-        bool Complete(uint32_t botGuid, uint32_t mapId, float x, float y, float z, PendingRelocation& out);
+        // Resolves a FINISHED acknowledgement against the pending record using
+        // exact destination equality (map, x, y, z, orientation): the pinned
+        // cores install the stored destination components directly, so anything
+        // else is a different landing, not float noise. Completed and
+        // TerminalMismatch both erase the record; `out` receives it in both
+        // cases (for finalization or logging).
+        RelocationCompleteResult Complete(uint32_t botGuid, uint32_t mapId, float x, float y, float z,
+            float orientation, PendingRelocation& out);
 
         // Drops the bot's pending record (logout/removal/relogin). Never touches
         // retry markers; a cancelled relocation is simply never finalized.

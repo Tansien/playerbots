@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <vector>
 
 namespace living
 {
@@ -83,4 +85,38 @@ namespace living
         float best = 0.0f;
         bool selected = false;
     };
+
+    // Minimum selection restricted to one map: candidates on any other map are
+    // never considered, no matter how close their raw coordinates compare.
+    // Cross-map squared distances are meaningless, and ranking every inn with
+    // them could persist a homebind on the wrong continent.
+    class MapLocalMinimum
+    {
+    public:
+        explicit MapLocalMinimum(uint32_t wantedMapId) : mapId(wantedMapId) {}
+
+        // Returns true when the candidate is on the wanted map AND becomes the
+        // new minimum.
+        bool Consider(uint32_t candidateMapId, float value)
+        {
+            if (candidateMapId != mapId)
+                return false;
+
+            return tracker.Consider(value);
+        }
+
+        bool HasSelection() const { return tracker.HasSelection(); }
+
+    private:
+        MinimumTracker tracker;
+        uint32_t mapId;
+    };
+
+    // Weighted selection with an EXCLUSIVE draw: draw must be < sum(weights),
+    // zero-weight entries are never chosen, and every unit of weight maps to
+    // exactly one entry. (The legacy samplers drew urand(0, total) inclusively,
+    // so one draw in total+1 fell through every bucket into a fallback that
+    // ignored the filters.) Returns false for an empty/all-zero weight set or
+    // an out-of-range draw.
+    bool PickWeightedIndex(std::vector<uint32_t> const& weights, uint64_t draw, size_t& outIndex);
 }

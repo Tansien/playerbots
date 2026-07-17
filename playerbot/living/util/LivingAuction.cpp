@@ -22,6 +22,32 @@ namespace living
         return true;
     }
 
+    bool TryComputePerItemSellPrice(uint32_t basePerItem, uint32_t percentage, uint64_t maxCopper, uint32_t& outPerItem)
+    {
+        uint64_t perItem = static_cast<uint64_t>(basePerItem) * percentage / 100;
+        if (perItem == 0)
+            perItem = 1;
+
+        if (perItem > maxCopper)
+            return false;
+
+        outPerItem = static_cast<uint32_t>(perItem);
+        return true;
+    }
+
+    bool TryComputeSellTotal(uint32_t perItem, uint32_t stackCount, uint64_t maxCopper, uint32_t& outTotal)
+    {
+        if (stackCount == 0)
+            return false;
+
+        uint64_t const total = static_cast<uint64_t>(perItem) * stackCount;
+        if (total == 0 || total > maxCopper)
+            return false;
+
+        outTotal = static_cast<uint32_t>(total);
+        return true;
+    }
+
     bool TryComputeAuctionBidCost(uint32_t startBid, uint32_t currentBid, uint32_t outBidIncrement,
         uint32_t buyout, uint64_t maxCopper, uint32_t& outCost)
     {

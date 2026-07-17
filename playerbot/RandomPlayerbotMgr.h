@@ -122,22 +122,31 @@ public:
         int GetMaxAllowedBotCount();
         bool ProcessBot(Player* player);
         living::RelocationOutcome Revive(Player* player);
-        // Finalizes the bot's pending relocation after its teleport
+        // Resolves the bot's pending relocation after its teleport
         // acknowledgement: verifies the bot is in-world, no longer teleporting,
-        // and standing on the exact accepted destination, then (exactly once)
-        // runs Refresh, homebind/inn binding, revive-marker clearing and event
-        // scheduling. Returns true when a pending relocation was finalized.
-        bool FinalizeRelocation(Player* bot);
+        // and standing on the EXACT accepted destination, then (exactly once)
+        // runs the full AI reset, Refresh, homebind/inn binding, revive-marker
+        // clearing and event scheduling. A finished acknowledgement that landed
+        // anywhere else terminally cancels the obsolete record (retry markers
+        // stay) so no stale work remains armed for a later unrelated landing.
+        living::RelocationCompleteResult FinalizeRelocation(Player* bot);
         // Drops a pending relocation without finalizing it (logout/removal/
         // relogin). Retry markers are untouched.
         void CancelPendingRelocation(uint32 botGuid);
+        // Drops the in-memory event cache for a GUID whose creation was
+        // rejected before persistence, so a discarded transient character
+        // leaves no cache entry behind.
+        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); }
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
         int32 GetValueValidTime(uint32 bot, std::string event);
         std::string GetData(uint32 bot, std::string type);
-        void SetValue(uint32 bot, std::string type, uint32 value, std::string data = "", int32 validIn = -1);
-        void SetValue(Player* bot, std::string type, uint32 value, std::string data = "", int32 validIn = -1);
+        // Returns false when the value could not be persisted (schema limits or
+        // DB failure); the cache is not touched in that case. Callers that
+        // require metadata persistence must check the result.
+        bool SetValue(uint32 bot, std::string type, uint32 value, std::string data = "", int32 validIn = -1);
+        bool SetValue(Player* bot, std::string type, uint32 value, std::string data = "", int32 validIn = -1);
         void Remove(Player* bot);
         void Hotfix(Player* player, uint32 version);
         uint32 GetBattleMasterEntry(Player* bot, BattleGroundTypeId bgTypeId, bool fake = false);
@@ -194,7 +203,7 @@ public:
         std::map<std::string, uint32> databaseDelay;
         uint32 GetEventValue(uint32 bot, std::string event);
         std::string GetEventData(uint32 bot, std::string event);
-        uint32 SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data = "");
+        bool SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data = "");
         std::list<uint32> GetBots();
         std::list<uint32> GetBgBots(uint32 bracket);
         time_t BgCheckTimer;

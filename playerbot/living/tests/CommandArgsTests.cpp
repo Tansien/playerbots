@@ -1,7 +1,10 @@
 #include "LivingTest.h"
 
 #include "../util/LivingCommandSplit.h"
+#include "../util/LivingEventSchema.h"
 #include "../util/LivingKeyValueArgs.h"
+
+#include <string>
 
 using namespace living;
 
@@ -43,6 +46,24 @@ LIVING_TEST(command_split_matches_exact_command_or_space_separator_only)
     // The separator must be the single character after the command.
     LIVING_CHECK(MatchExactCommand("remove Bob", "remove", params));
     LIVING_CHECK(params == "Bob");
+}
+
+LIVING_TEST(event_schema_limits_are_validated_before_any_mutation)
+{
+    // SetEventValue's pre-mutation gate: the schema stores event varchar(45)
+    // and data varchar(255). Over-limit values must be rejected BEFORE the
+    // DELETE/INSERT/cache steps - strict SQL would delete then fail the insert,
+    // permissive SQL would truncate while the cache kept the original.
+    LIVING_CHECK(EventValueFitsSchema("add", ""));
+    LIVING_CHECK(EventValueFitsSchema(std::string(45, 'e'), std::string(255, 'd'))); // exact limits
+    LIVING_CHECK(!EventValueFitsSchema(std::string(46, 'e'), ""));                   // event 46 bytes
+    LIVING_CHECK(!EventValueFitsSchema("add", std::string(256, 'd')));               // data 256 bytes
+    LIVING_CHECK(!EventValueFitsSchema("", ""));                                     // empty event names no row
+
+    // Quotes are legal data (escaping happens separately at the boundary);
+    // limits count raw bytes, before escaping.
+    LIVING_CHECK(EventValueFitsSchema("create gear", "be'st"));
+    LIVING_CHECK(!EventValueFitsSchema("create gear", std::string(250, 'x') + "''''''"));
 }
 
 LIVING_TEST(key_value_args_accept_only_known_complete_pairs)

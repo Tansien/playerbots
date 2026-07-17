@@ -1,6 +1,7 @@
 #include "Config/Config.h"
 
 #include "playerbot/playerbot.h"
+#include "playerbot/living/util/LivingBotCreation.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "Accounts/AccountMgr.h"
@@ -224,6 +225,59 @@ bool RandomPlayerbotFactory::isRaceForTeam(uint8 race, Team team)
         return true;
 
     return false;
+}
+
+bool RandomPlayerbotFactory::GetRandomTuple(Team team, BotRoles role, uint8 fixedRace, uint8 fixedClass, uint8& outRace, uint8& outClass)
+{
+    struct Candidate
+    {
+        uint8 race;
+        uint8 cls;
+    };
+
+    std::vector<Candidate> candidates;
+    std::vector<uint32> weights;
+    uint64 total = 0;
+
+    for (uint32 race = 1; race < MAX_RACES; ++race)
+    {
+        if (fixedRace && race != fixedRace)
+            continue;
+
+        if (!isRaceForTeam(race, team))
+            continue;
+
+        for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
+        {
+            if (fixedClass && cls != fixedClass)
+                continue;
+
+            if (!isAvailableRole(cls, role))
+                continue;
+
+            uint32 const weight = sPlayerbotAIConfig.classRaceProbability[cls][race];
+            if (!weight)
+                continue;
+
+            if (!sObjectMgr.GetPlayerInfo(race, cls))
+                continue;
+
+            candidates.push_back({ static_cast<uint8>(race), static_cast<uint8>(cls) });
+            weights.push_back(weight);
+            total += weight;
+        }
+    }
+
+    if (candidates.empty())
+        return false;
+
+    size_t index = 0;
+    if (!living::PickWeightedIndex(weights, urand(0, static_cast<uint32>(total) - 1), index))
+        return false;
+
+    outRace = candidates[index].race;
+    outClass = candidates[index].cls;
+    return true;
 }
 
 uint8 RandomPlayerbotFactory::GetRandomRace(uint8 cls, Team team)

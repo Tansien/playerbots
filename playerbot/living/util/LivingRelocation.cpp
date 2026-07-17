@@ -9,25 +9,26 @@ namespace living
         return record.token;
     }
 
-    bool RelocationTracker::Complete(uint32_t botGuid, uint32_t mapId, float x, float y, float z, PendingRelocation& out)
+    RelocationCompleteResult RelocationTracker::Complete(uint32_t botGuid, uint32_t mapId, float x, float y, float z,
+        float orientation, PendingRelocation& out)
     {
         auto const it = pending.find(botGuid);
         if (it == pending.end())
-            return false;
+            return RelocationCompleteResult::NoPending;
 
-        PendingRelocation const& record = it->second;
-        if (record.mapId != mapId)
-            return false;
-
-        float const dx = record.x - x;
-        float const dy = record.y - y;
-        float const dz = record.z - z;
-        if (dx * dx + dy * dy + dz * dz > RELOCATION_ACK_TOLERANCE * RELOCATION_ACK_TOLERANCE)
-            return false;
-
-        out = record;
+        // Copy out BEFORE erasing - the map node dies with the erase.
+        out = it->second;
         pending.erase(it);
-        return true;
+
+        // Exact equality: the acknowledgement handlers relocate to the exact
+        // stored destination floats, so any difference means a different
+        // teleport landed. The record was erased above either way - obsolete
+        // work must never stay armed for a later unrelated landing.
+        bool const exactMatch = out.mapId == mapId
+            && out.x == x && out.y == y && out.z == z
+            && out.orientation == orientation;
+
+        return exactMatch ? RelocationCompleteResult::Completed : RelocationCompleteResult::TerminalMismatch;
     }
 
     void RelocationTracker::Cancel(uint32_t botGuid)

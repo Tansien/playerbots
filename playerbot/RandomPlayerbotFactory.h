@@ -70,6 +70,17 @@ class RandomPlayerbotFactory
         static std::string CreateRandomGuildName();
         static bool isAvailableRace(uint8 cls, uint8 race);
         static bool isAvailableRole(uint8 cls, BotRoles role = BotRoles::BOT_ROLE_NONE);
+
+        // Joint constrained race+class selection: builds the candidate set of
+        // tuples that satisfy the effective team, the requested role, any
+        // explicit race/class constraint (0 = unconstrained), a nonzero
+        // configured weight, AND a real player-creation template
+        // (GetPlayerInfo), then samples once from the FILTERED weight total
+        // with an exclusive upper bound. Returns false only when no compatible
+        // tuple exists - choosing a class globally and then hunting a race for
+        // the team randomly rejected requests (Classic Horde drawing paladin)
+        // even though compatible alternatives existed.
+        static bool GetRandomTuple(Team team, BotRoles role, uint8 fixedRace, uint8 fixedClass, uint8& outRace, uint8& outClass);
         uint8 GetRandomClass(uint8 race = 0, BotRoles role = BotRoles::BOT_ROLE_NONE);
         static bool isRaceForTeam(uint8 race, Team team = Team::TEAM_BOTH_ALLOWED);
         uint8 GetRandomRace(uint8 cls, Team team = Team::TEAM_BOTH_ALLOWED);

@@ -55,6 +55,11 @@ struct CreateBotOptions
     bool autoAdd = false;
     bool temporary = false;
     std::string groupWith;
+    // True when group= was explicitly requested (or set by HandleGroup), as
+    // opposed to the legacy master-name default. An explicit group request
+    // writes the group-join event at ANY level; the defaulted value keeps the
+    // legacy level>1-only behavior.
+    bool explicitGroup = false;
     std::string gear = "default";
 
     // Parses and validates a chat-supplied argument string. Explicit names are
