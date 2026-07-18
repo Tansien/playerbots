@@ -34,4 +34,9 @@ public:
     // which resolves exactly one concrete role from form/spec.
     static BotRoles GetSpecRoleCapabilities(uint8 cls, uint8 specTab);
     static BotRoles GetPlayerRoles(const Player* player);
+    // Concrete role of the APPLIED talent build (creation-time verification):
+    // resolves a same-tab tank/dps hybrid from its LEARNED talents, not the
+    // capability mask or a transient form/aura, so a DPS build cannot pass as
+    // the requested tank.
+    static BotRoles GetAppliedSpecRole(Player* player);
 };

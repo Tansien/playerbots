@@ -961,49 +961,55 @@ void RandomPlayerbotFactory::CreateRandomBots()
 #else
 	    uint32 maxAllowed = 9 - count;
 #endif
-	    uint32 created = 0;
+            living::FillAccount(maxAllowed, [&](uint32 allowance) -> living::AccountFillRound
+            {
+                living::AccountFillRound round;
 
-	    while (!remaining.empty() && created < maxAllowed)
-	    {
-	        std::vector<std::pair<uint8, uint8>> shuffledKeys;
-	        for (const auto& entry : remaining)
-	            shuffledKeys.push_back(entry.first);
+                std::vector<std::pair<uint8, uint8>> shuffledKeys;
+                for (const auto& entry : remaining)
+                    shuffledKeys.push_back(entry.first);
 
-	        // Shuffle the keys of the map
-	        std::random_device rnd;
-		std::mt19937 rng(rnd()); // Mersenne Twister RNG
-		std::shuffle(shuffledKeys.begin(), shuffledKeys.end(), rng);
+                // Shuffle the keys of the map
+                std::random_device rnd;
+                std::mt19937 rng(rnd()); // Mersenne Twister RNG
+                std::shuffle(shuffledKeys.begin(), shuffledKeys.end(), rng);
 
-	        for (const auto& key : shuffledKeys)
-	        {
-	            if (created >= maxAllowed)
-	                break;
+                for (const auto& key : shuffledKeys)
+                {
+                    if (round.created >= allowance)
+                        break;
 
-	            uint8 cls = key.first;
-	            uint8 race = key.second;
+                    uint8 cls = key.first;
+                    uint8 race = key.second;
 
-	            if (!((1 << (cls - 1)) & CLASSMASK_ALL_PLAYABLE) || !sChrClassesStore.LookupEntry(cls))
-	                continue;
+                    if (!((1 << (cls - 1)) & CLASSMASK_ALL_PLAYABLE) || !sChrClassesStore.LookupEntry(cls))
+                        continue;
 
 #ifdef MANGOSBOT_TWO
-	            if (cls == 10)
-	                continue;
+                    if (cls == 10)
+                        continue;
 #else
-	            if (cls == 10 || cls == 6)
-	                continue;
+                    if (cls == 10 || cls == 6)
+                        continue;
 #endif
 
-                    // One shared reservation per queued character (the ledger
-                    // also counts pending manual/group creations, so an
-                    // overlapping runtime reload cannot overfill the account).
+                    // One shared reservation per queued character (the ledger also
+                    // counts pending manual/group creations, so an overlapping runtime
+                    // reload cannot overfill the account). Any non-Reserved result
+                    // terminates this account's fill cleanly: the durable-only
+                    // maxAllowed can still count a ledger-reserved slot as free, so
+                    // respinning the outer loop on a refusal never makes progress.
                     if (PlayerbotHolder::TryReserveCharacterSlot(accountId, durableCount)
                         != living::SlotReservationOutcome::Reserved)
+                    {
+                        round.reservationBlocked = true;
                         break;
+                    }
 
                     if (factory.CreateRandomBot(cls, race))
                     {
                         bulkReservedSlots[accountId]++;
-                        created++;
+                        round.created++;
                         botsCreated++;
                         bar1.step();
                         if (--remaining[key] == 0)
@@ -1011,8 +1017,10 @@ void RandomPlayerbotFactory::CreateRandomBots()
                     }
                     else
                         PlayerbotHolder::ReleaseCharacterSlot(accountId); // nothing was queued
-	        }
-	    }
+                }
+
+                return round;
+            });
 	}
 	else
 	{

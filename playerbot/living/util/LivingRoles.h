@@ -59,6 +59,10 @@ namespace living
     // first; without it, a multi-role spec resolves to DPS (a Feral in cat or
     // caster form, a Frost DK outside Frost Presence), while single-role specs
     // are unambiguous.
+    // The tank signal is the class's active tank form/stance/presence at
+    // runtime (bear/dire bear, defensive stance, righteous fury, frost
+    // presence) OR, at creation time, the learned tank talents of the applied
+    // build (a freshly created bot has no auras yet) - see AiFactory.
     inline uint8_t ConcreteRuntimeRole(uint8_t cls, uint8_t tab, bool tankFormActive)
     {
         if (tankFormActive)
@@ -69,5 +73,32 @@ namespace living
             return ROLE_DPS;
 
         return capabilities;
+    }
+
+    // Pre-Living-Realm runtime classification, reproduced EXACTLY for disabled
+    // mode. It differs from ConcreteRuntimeRole in only one case: a Frost DK
+    // (cls 6, tab 1) with no tank presence - legacy reported the TANK|DPS mask,
+    // the Living resolver reports the single concrete DPS. Druid Feral (cls 11,
+    // tab 1) out of bear form was DPS in legacy too, so it must NOT inherit the
+    // PR's new TANK|DPS capability mask here (that would be a THIRD behavior
+    // matching neither legacy nor the Living resolver). Every other (cls, tab)
+    // already maps identically to the legacy 2-arg classifier.
+    inline uint8_t LegacyRuntimeRoleMask(uint8_t cls, uint8_t tab, bool tankFormActive)
+    {
+        if (tankFormActive)
+            return ROLE_TANK;
+        if (cls == 11 && tab == 1)
+            return ROLE_DPS; // legacy druid feral (non-bear) is DPS, not TANK|DPS
+        return SpecTabRoles(cls, tab);
+    }
+
+    // Living Realm resolves ONE concrete runtime role; with the feature disabled,
+    // the legacy classification mask is restored so autonomous role/LFG behavior
+    // (IsTank/IsHeal, group composition, dungeon-finder) is unchanged from the
+    // pre-Living fork - the disabled-mode parity contract.
+    inline uint8_t RuntimeRoleForMode(uint8_t cls, uint8_t tab, bool tankFormActive, bool livingRealmEnabled)
+    {
+        return livingRealmEnabled ? ConcreteRuntimeRole(cls, tab, tankFormActive)
+                                  : LegacyRuntimeRoleMask(cls, tab, tankFormActive);
     }
 }

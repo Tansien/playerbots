@@ -31,23 +31,22 @@ void TestContext::Reset()
     }
     spawnedBots.clear();
 
-    // A creation still pending at reset finalizes on its own (bounded) and
-    // may leave a temporary character until the finalizer/quarantine path
-    // resolves it - collect any already-terminal result so a finalized GUID
-    // is deleted rather than orphaned.
+    // A creation still pending at reset finalizes on its own (bounded), so the
+    // reset must NOT poll-once-and-clear: that abandoned a still-pending token
+    // (a later finalization leaked a temporary character), and for a partial
+    // batch it deleted already-finalized GUIDs out from under the still-live
+    // batch. Instead, transfer ownership to the deferred cleanup owner, which
+    // survives the reset, polls each token to terminal, and deletes every
+    // finalized temporary character exactly once.
     if (spawnBotToken)
     {
-        living::CreationPollResult const poll = PlayerbotHolder::PollBotCreation(spawnBotToken, true);
-        if (poll.status == living::CreationPollStatus::Created && poll.guid)
-            sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, poll.guid), true);
+        PlayerbotHolder::AbandonCreationToken(spawnBotToken);
         spawnBotToken = 0;
     }
 
     if (spawnGroupBatchToken)
     {
-        living::BatchPollResult const poll = PlayerbotHolder::PollBotCreationBatch(spawnGroupBatchToken, true);
-        for (uint32 const guid : poll.finalizedGuids)
-            sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
+        PlayerbotHolder::AbandonBatchToken(spawnGroupBatchToken);
         spawnGroupBatchToken = 0;
     }
 

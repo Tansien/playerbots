@@ -261,7 +261,7 @@ namespace living
         // retries and never consume the replacement budget; retryable
         // failures consume it; terminal failures are recorded.
         void OnAttemptResult(uint64_t batchToken, size_t memberIndex, BotCreateStatus status,
-            uint64_t creationToken, uint8_t actualClass, uint64_t pumpCount)
+            uint64_t creationToken, uint8_t actualClass, uint64_t pumpCount, uint8_t actualRole = 0)
         {
             auto it = batches.find(batchToken);
             if (it == batches.end() || memberIndex >= it->second.members.size())
@@ -278,6 +278,12 @@ namespace living
                     member.state = BatchMemberState::PendingPersistence;
                     member.creationToken = creationToken;
                     member.cls = actualClass;
+                    // Persist the role the pump drew/verified for this slot so
+                    // quota accounting (which skips role-0 outstanding members)
+                    // charges the right role and a later retry/extension keeps
+                    // it. A 0 never clobbers an already-selected role.
+                    if (actualRole)
+                        member.role = actualRole;
                     member.transientRetries = 0;
                     break;
                 case BotCreateStatus::TransientFailure:
@@ -413,15 +419,40 @@ namespace living
             }
         }
 
-        // The initiator's most recent still-tracked batch (0 when none): the
-        // single owner of that group's deficit; a repeated command extends it
-        // instead of enqueueing a second one.
+        // The initiator's most recent ACTIVE batch (0 when none): the single
+        // owner of that group's deficit; a repeated command extends it instead
+        // of enqueueing a second one. Only a genuinely active batch (some member
+        // still awaiting an attempt or pending persistence) is extendable - a
+        // completed, merely-retained batch is NOT returned, so a later request
+        // starts a FRESH batch with re-armed completion/retention/replacement
+        // state instead of reviving one carrying a stale completionReported flag
+        // and an expired retention timer. Deficit/quota accounting stays correct
+        // because OutstandingSlotsForInitiator/ForEachOutstandingMember still
+        // iterate every one of the initiator's batches, including the retained
+        // completed one's finalized-but-unjoined members.
         uint64_t FindBatchTokenForInitiator(uint32_t initiatorGuid) const
         {
+            if (initiatorGuid == 0)
+                return 0;
+
             uint64_t newest = 0;
             for (auto const& [token, batch] : batches)
-                if (initiatorGuid != 0 && batch.initiatorGuid == initiatorGuid && token > newest)
+            {
+                if (batch.initiatorGuid != initiatorGuid || token <= newest)
+                    continue;
+
+                bool active = false;
+                for (CreationBatchMember const& member : batch.members)
+                    if (member.state == BatchMemberState::AwaitingAttempt
+                        || member.state == BatchMemberState::PendingPersistence)
+                    {
+                        active = true;
+                        break;
+                    }
+
+                if (active)
                     newest = token;
+            }
             return newest;
         }
 

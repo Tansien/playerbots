@@ -108,6 +108,26 @@ LIVING_TEST(numeric_chat_link_ids_reject_overflow_without_throwing)
     LIVING_CHECK(!living::TryParseUInt32("", value));
 }
 
+LIVING_TEST(quest_link_id_overflow_cannot_alias_quest_one)
+{
+    // Finding 10: PlayerbotChatHandler::extractQuestId used atol + narrowing, so
+    // Hquest:4294967297 (2^32 + 1) wrapped to quest 1 and DropQuestAction would
+    // abandon the WRONG quest. The shared checked parser must reject it, leaving
+    // the caller with "no quest" (0) instead of a phantom id.
+    uint32_t q = 0xDEADu;
+    LIVING_CHECK(!living::TryParseUInt32("4294967297", q)); // 2^32 + 1: reject (was atol -> 1)
+    LIVING_CHECK(q == 0xDEADu);                              // out untouched on rejection
+    LIVING_CHECK(!living::TryParseUInt32("4294967296", q)); // 2^32
+    LIVING_CHECK(!living::TryParseUInt32("18446744073709551617", q)); // 2^64 + 1
+    LIVING_CHECK(!living::TryParseUInt32("1 ", q));          // trailing space
+    LIVING_CHECK(!living::TryParseUInt32("+5", q));          // sign
+
+    // Valid quest ids across the whole uint32 domain still parse.
+    LIVING_CHECK(living::TryParseUInt32("4294967295", q) && q == 4294967295u); // UINT32_MAX
+    LIVING_CHECK(living::TryParseUInt32("12345", q) && q == 12345u);
+    LIVING_CHECK(living::TryParseUInt32("0", q) && q == 0u); // 0 => caller treats as "no quest"
+}
+
 LIVING_TEST(numeric_parse_in_range_validates_domain_with_the_parse)
 {
     uint32_t value = 0;

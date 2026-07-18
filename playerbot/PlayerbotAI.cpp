@@ -16,6 +16,7 @@
 #include "strategy/values/LastSpellCastValue.h"
 #include "LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 #include "PlayerbotAI.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "PlayerbotSecurity.h"
@@ -68,7 +69,14 @@ uint32 PlayerbotChatHandler::extractQuestId(std::string str)
 {
     char* source = (char*)str.c_str();
     char* cId = ExtractKeyFromLink(&source,"Hquest");
-    return cId ? atol(cId) : 0;
+    // Checked parse: atol narrowed to uint32, so Hquest:4294967297 wrapped to
+    // quest 1 and DropQuestAction could abandon the wrong quest. TryParseUInt32
+    // rejects signs, suffixes, overflow and any value beyond uint32; a rejected
+    // link yields 0 ("no quest"), which GetQuestTemplate(0) resolves to null.
+    uint32 questId = 0;
+    if (cId && living::TryParseUInt32(cId, questId))
+        return questId;
+    return 0;
 }
 
 void PacketHandlingHelper::AddHandler(uint16 opcode, std::string handler, bool shouldDelay)

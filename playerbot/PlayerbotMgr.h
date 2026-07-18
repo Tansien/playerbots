@@ -148,6 +148,11 @@ public:
     static living::CreationPollResult PollBotCreation(uint64 creationToken, bool acknowledgeTerminal);
     // Polls one HandleGroup batch token (asynchronous group completion).
     static living::BatchPollResult PollBotCreationBatch(uint64 batchToken, bool acknowledgeComplete);
+    // Transfer a still-pending creation token to the deferred cleanup owner
+    // (TestContext::Reset): it survives the reset, polls the token to terminal,
+    // and deletes any finalized temporary character exactly once.
+    static void AbandonCreationToken(uint64 creationToken);
+    static void AbandonBatchToken(uint64 batchToken);
     // Typed durable character count. The cores' GetCharactersCount collapses
     // a FAILED query to zero, which fails admission OPEN (a full account
     // admitted as empty); this returns false on query failure so admission

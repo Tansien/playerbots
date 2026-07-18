@@ -1,9 +1,16 @@
 # Living Realm Phase 0: implementation map
 
 Maps the **first Phase 0 tranche** and its tests to the requirements in
-[0001A section A.7](0001-living-realm-implementation-contract.md). This tranche
-is pure models, seams, and tests: nothing here executes synthetic actions,
-blocks startup, touches the database, or changes runtime bot behavior.
+[0001A section A.7](0001-living-realm-implementation-contract.md). The Living
+Realm feature itself is inert until enabled (with `AiPlayerbot.LivingRealm.Enabled = 0`
+it only logs a report - it starts nothing, blocks nothing, and needs no schema).
+This tranche is **not** purely additive, though: alongside the pure models,
+seams, and tests it lands a disclosed set of **unconditional legacy correctness
+fixes** that apply in both modes, plus one **mode-gated runtime change** -
+role/LFG classification - that restores legacy behavior when the feature is
+disabled. Both categories are inventoried under LR-001 below; the earlier claim
+that "nothing here changes runtime bot behavior" was inaccurate and is corrected
+there.
 
 Phase 0 items from [0001 section 7](0001-living-realm.md) that are **not** in
 this tranche and land with the next implementation PR: the single-writer
@@ -37,12 +44,36 @@ partial, with the remainder enumerated here.
 - `EvaluateOrganicPolicy` returns a legacy passthrough for every action, known or
   unknown, when `livingRealmEnabled` is false; `BuildEffectiveConfigReport`
   emits a single informational entry and validates nothing when disabled.
-- Enabling nothing: the config hook in `PlayerbotAIConfig.cpp` only reads three
-  keys and, when enabled, logs the report. No schema, query, or behavior change
-  exists in disabled mode.
+- The config hook in `PlayerbotAIConfig.cpp` reads three keys and, when enabled,
+  logs the report - it starts nothing, blocks nothing, and needs no schema.
+- **Mode-gated runtime behavior (restored to legacy when disabled).** Runtime
+  role/LFG classification: `AiFactory::GetPlayerRoles(Player*)` resolves ONE
+  concrete role when enabled, but restores the legacy multi-bit mask when
+  disabled through `living::RuntimeRoleForMode`, so IsTank/IsHeal, group
+  composition and the dungeon finder are byte-for-byte legacy with the feature
+  off. The only class/tab this gate affects is a WotLK Frost DK outside Frost
+  Presence (legacy `TANK|DPS` vs the resolver's `DPS`); every other case already
+  maps identically. Test: `roles_disabled_mode_restores_legacy_runtime_classification`.
+- **Unconditional legacy correctness fixes (apply in BOTH modes, by design).**
+  These are bug fixes, not feature behavior, so they are intentionally not gated:
+  - event-write durability - full-row write confirmation, dirty typed-read
+    gating, execution-confirmed persistence - in `RandomPlayerbotMgr`;
+  - creation finalizer / group-batch lifecycle - cleanup-verify enqueue
+    ownership, fixed-count bulk-fill loop termination, role-preserving batch
+    accounting, a fresh batch after completion, and deferred cleanup of
+    test-creation tokens abandoned by a context reset;
+  - concrete creation-time role verification (a DPS Feral build can no longer
+    satisfy or consume a tank quota) - the *creation* path, distinct from the
+    gated *runtime* classifier above;
+  - group-join target existence (COUNT-first, resilient to a database outage);
+  - the `.bot always` durable-write boundary;
+  - input parsing / overflow safety (numeric, chat-link, money and quest-link
+    IDs; non-throwing);
+  - relocation staging and auction bid math.
 - Tests: `policy_disabled_realm_preserves_legacy_behavior`,
   `config_disabled_realm_validates_nothing_and_needs_no_schema`,
-  `config_unknown_profile_blocks_only_when_enabled`.
+  `config_unknown_profile_blocks_only_when_enabled`,
+  `roles_disabled_mode_restores_legacy_runtime_classification`.
 
 ### LR-003: Organic config and unknown actions fail closed
 
