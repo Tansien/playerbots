@@ -82,3 +82,47 @@ LIVING_TEST(creation_lifecycle_uncertain_cleanup_stays_quarantined)
     LIVING_CHECK(deleteFails.OnCleanupVerify(RowVerifyOutcome::Absent, 3) == CreationStage::Quarantined);
     LIVING_CHECK(deleteFails.OnMetadataResult(true) == CreationStage::Quarantined);
 }
+
+LIVING_TEST(one_shot_marker_applies_effect_once_and_retries_only_the_clear)
+{
+    // Finding N2: a one-shot post-create marker (create gear/levelup/test) must
+    // apply its runtime effect EXACTLY ONCE; if the durable clear fails or is
+    // ambiguous, only the CLEAR is retried - the mutation is never replayed.
+    OneShotMarker marker;
+    int effects = 0;
+    int clears = 0;
+
+    auto pump = [&](bool present, EventWriteResult clearResult) -> bool
+    {
+        MarkerConsumeStep const step = marker.Plan(present);
+        if (step == MarkerConsumeStep::ApplyThenClear)
+        {
+            ++effects;
+            marker.OnEffectApplied();
+        }
+        if (step == MarkerConsumeStep::Idle)
+            return false;
+        ++clears;
+        return marker.OnClearResult(clearResult);
+    };
+
+    // Present: apply the effect once, then the clear fails.
+    LIVING_CHECK(!pump(true, EventWriteResult::DefinitelyNotApplied));
+    LIVING_CHECK(effects == 1 && clears == 1);
+
+    // Still present (clear did not land): retry the CLEAR only - no replay.
+    LIVING_CHECK(!pump(true, EventWriteResult::StateUnknown));
+    LIVING_CHECK(effects == 1 && clears == 2); // effect count unchanged: the replay guard
+
+    // Confirmed clear consumes the marker.
+    LIVING_CHECK(pump(true, EventWriteResult::DesiredStateConfirmed));
+    LIVING_CHECK(effects == 1 && clears == 3);
+
+    // Gone: nothing to do.
+    LIVING_CHECK(!pump(false, EventWriteResult::DesiredStateConfirmed));
+    LIVING_CHECK(effects == 1 && clears == 3);
+
+    // A fresh marker for the same slot (e.g. a re-add wrote it again) applies once more.
+    OneShotMarker readded;
+    LIVING_CHECK(readded.Plan(true) == MarkerConsumeStep::ApplyThenClear);
+}

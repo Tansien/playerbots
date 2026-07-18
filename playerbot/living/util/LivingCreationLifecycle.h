@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LivingEventSchema.h"
+
 #include <cstdint>
 
 namespace living
@@ -128,6 +130,48 @@ namespace living
             }
 
             return stage;
+        }
+    };
+
+    // Which step a one-shot post-create marker (create gear / levelup / test)
+    // owes this pass.
+    enum class MarkerConsumeStep
+    {
+        Idle,           // marker absent: nothing to do
+        ApplyThenClear, // present and the runtime effect has not run: apply once, then clear
+        ClearOnly,      // present but the effect already ran: retry ONLY the durable clear
+    };
+
+    // Per-(bot, marker) one-shot ledger. The runtime effect (destroy/generate
+    // gear, level up, install a test strategy) must run EXACTLY ONCE, then the
+    // durable marker row is cleared. A marker that is `create X = 1` and never
+    // cleared - or whose clear is unconfirmed - would otherwise replay the
+    // mutation every manager pass for an always-online bot. This separates
+    // "effect applied" from "marker consumed": the effect runs once and, until
+    // the clear is execution-confirmed, only the CLEAR is retried; a confirmed
+    // clear ends the obligation. A transient read blip (marker briefly absent)
+    // does NOT reset the applied flag, so it can never license a replay.
+    struct OneShotMarker
+    {
+        bool effectApplied = false;
+
+        MarkerConsumeStep Plan(bool present) const
+        {
+            if (!present)
+                return MarkerConsumeStep::Idle;
+            return effectApplied ? MarkerConsumeStep::ClearOnly : MarkerConsumeStep::ApplyThenClear;
+        }
+
+        void OnEffectApplied() { effectApplied = true; }
+
+        // Feeds the typed clear result; returns whether the marker is now fully
+        // consumed (only a confirmed clear ends it and resets the ledger).
+        bool OnClearResult(EventWriteResult clearResult)
+        {
+            bool const consumed = clearResult == EventWriteResult::DesiredStateConfirmed;
+            if (consumed)
+                effectApplied = false;
+            return consumed;
         }
     };
 }

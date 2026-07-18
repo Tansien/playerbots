@@ -170,7 +170,11 @@ namespace living
         }
 
         // Raises the batch's target size (a compatible repeated request
-        // extends the EXISTING batch; it never shrinks).
+        // extends the EXISTING batch; it never shrinks). Growing the target
+        // also grants one replacement per ADDED slot: the strictly-greater
+        // guard makes the delta positive, so replacementBudget keeps pace with
+        // desiredSize (one replacement per requested slot) instead of leaving
+        // the added slots to share the original run's budget.
         bool ExtendDesiredSize(uint64_t batchToken, uint32_t desiredSize)
         {
             auto it = batches.find(batchToken);
@@ -178,7 +182,10 @@ namespace living
                 return false;
 
             if (desiredSize > it->second.desiredSize)
+            {
+                it->second.replacementBudget += desiredSize - it->second.desiredSize;
                 it->second.desiredSize = desiredSize;
+            }
             return true;
         }
 

@@ -58,15 +58,29 @@ partial, with the remainder enumerated here.
   These are bug fixes, not feature behavior, so they are intentionally not gated:
   - event-write durability - full-row write confirmation, dirty typed-read
     gating, execution-confirmed persistence - in `RandomPlayerbotMgr`;
+  - one-shot post-create markers (`create gear`/`levelup`/`test`) apply their
+    runtime effect exactly once and retry only the durable clear, so an
+    always-online bot no longer replays the mutation (e.g. `gear=empty`
+    destroying items) every manager pass;
   - creation finalizer / group-batch lifecycle - cleanup-verify enqueue
     ownership, fixed-count bulk-fill loop termination, role-preserving batch
-    accounting, a fresh batch after completion, and deferred cleanup of
-    test-creation tokens abandoned by a context reset;
+    accounting, replacement-budget growth on extension, a fresh batch after
+    completion (a completed batch never blocks a new request), and deferred
+    cleanup of test-creation tokens abandoned by a context reset (with a
+    per-command transient-spawn-retry budget);
   - concrete creation-time role verification (a DPS Feral build can no longer
     satisfy or consume a tank quota) - the *creation* path, distinct from the
     gated *runtime* classifier above;
-  - group-join target existence (COUNT-first, resilient to a database outage);
+  - relocation finalization debt - a Finalizing relocation's owed homebind
+    verify / marker clear / next-teleport schedule is retained across an
+    ordinary logout and resumed on relogin (only an explicit removal
+    force-cancels it), each effect run exactly once;
+  - group-join target existence (COUNT-first, resilient to a database outage),
+    with backoff/retry state advanced only after its persistence is confirmed;
   - the `.bot always` durable-write boundary;
+  - command correctness - `@quest=<selector>` consumes only the leading selector
+    and preserves trailing operands; `change_strategy <bot> <strategy>` validates
+    and applies the named strategy instead of choosing one at random;
   - input parsing / overflow safety (numeric, chat-link, money and quest-link
     IDs; non-throwing);
   - relocation staging and auction bid math.

@@ -247,10 +247,12 @@ void PlayerbotHolder::LogoutPlayerBot(uint32 guid, bool allowInstant, bool forDe
         if (!ai)
             return;
 
-        // A logout abandons any relocation still awaiting its teleport
-        // acknowledgement: drop the pending record without claiming completion
-        // (retry markers stay, so a later login retries).
-        sRandomPlayerbotMgr.CancelPendingRelocation(bot->GetGUIDLow());
+        // An ordinary logout drops a relocation still awaiting its teleport
+        // acknowledgement (retry markers drive a later login), but RETAINS a
+        // Finalizing record so its owed durable work resumes on relogin. Only a
+        // logout for deletion FORCE-cancels (the character is going away).
+        sRandomPlayerbotMgr.CancelPendingRelocation(bot->GetGUIDLow(),
+            forDelete ? living::RelocationCancelMode::Force : living::RelocationCancelMode::Ordinary);
 
         if (!sPlayerbotAIConfig.bExplicitDbStoreSave)
         {

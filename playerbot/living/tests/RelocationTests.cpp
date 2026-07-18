@@ -405,8 +405,10 @@ LIVING_TEST(relocation_stale_generation_verify_result_is_ignored)
     spy.homebindTarget = HomebindWrite{ 1, 10.0f, 20.0f, 3.0f, 42 };
     tracker.Advance(5, spy.Make()); // verification for staleToken in flight
 
-    // The bot logs out; a NEW generation begins later.
-    tracker.Cancel(5);
+    // The bot is force-removed (ending the generation); a NEW generation begins
+    // later. (An ordinary logout would RETAIN the Finalizing record - covered by
+    // the retain-and-resume tests below - so this uses Force to free the slot.)
+    tracker.Cancel(5, RelocationCancelMode::Force);
     uint64_t const currentToken = tracker.Begin(5, request);
     LIVING_CHECK(currentToken != 0 && currentToken != staleToken);
     tracker.Acknowledge(5, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
@@ -497,9 +499,10 @@ LIVING_TEST(relocation_cancellation_drops_without_completing)
     tracker.Begin(2002, MakeRecord(1, 300.0f, 400.0f, 50.0f));
     LIVING_CHECK(tracker.PendingCount() == 2);
 
-    // Logout/removal: the record is dropped, never finalized - a later
-    // acknowledgement at the old destination finds nothing.
-    tracker.Cancel(1001);
+    // Ordinary cancel of a PendingAck record (nothing durable owed yet): dropped,
+    // never finalized - a later acknowledgement at the old destination finds
+    // nothing.
+    LIVING_CHECK(tracker.Cancel(1001, RelocationCancelMode::Ordinary) == true);
     LIVING_CHECK(!tracker.HasPending(1001));
     LIVING_CHECK(tracker.PendingCount() == 1);
 
@@ -509,15 +512,18 @@ LIVING_TEST(relocation_cancellation_drops_without_completing)
     // Cancelling one bot never touches another's pending relocation.
     LIVING_CHECK(tracker.HasPending(2002));
 
-    // Cancelling a bot with nothing pending is a no-op.
-    tracker.Cancel(9999);
+    // Cancelling a bot with nothing pending is a no-op (returns false).
+    LIVING_CHECK(tracker.Cancel(9999, RelocationCancelMode::Ordinary) == false);
     LIVING_CHECK(tracker.PendingCount() == 1);
 
-    // A Finalizing record is cancellable too (logout during finalization
-    // releases the reservation; retry markers stay with the caller).
+    // A Finalizing record is RETAINED by an ordinary cancel (logout during
+    // finalization keeps the owed durable work - it resumes on relogin); only a
+    // FORCE cancel (explicit removal/deletion) drops it.
     tracker.Acknowledge(2002, 1, 300.0f, 400.0f, 50.0f, 0.0f, record);
     LIVING_CHECK(tracker.IsFinalizing(2002));
-    tracker.Cancel(2002);
+    LIVING_CHECK(tracker.Cancel(2002, RelocationCancelMode::Ordinary) == false); // retained
+    LIVING_CHECK(tracker.PendingCount() == 1);
+    LIVING_CHECK(tracker.Cancel(2002, RelocationCancelMode::Force) == true);     // force drops
     LIVING_CHECK(tracker.PendingCount() == 0);
 }
 
@@ -576,10 +582,10 @@ LIVING_TEST(relocation_density_reservations_count_both_stages_and_exclude_self)
     LIVING_CHECK(tracker.Advance(1, spy.Make()) == RelocationAdvanceResult::Completed);
     LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 0);
 
-    // Cancellation (logout) also releases.
+    // Cancellation of a PendingAck record (ordinary logout) also releases.
     tracker.Begin(3, MakeRecord(0, 100.0f, 200.0f, 30.0f));
     LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 1);
-    tracker.Cancel(3);
+    tracker.Cancel(3, RelocationCancelMode::Ordinary);
     LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 0);
 
     // A terminal mismatch releases as well.
@@ -684,4 +690,108 @@ LIVING_TEST(relocation_destination_starter_zone_boundaries)
 
     // Non-starter zones never block.
     LIVING_CHECK(!DestinationBlockedByStarterZone(33, 1, true, 10, true)); // Stranglethorn
+}
+
+LIVING_TEST(relocation_ordinary_cancel_retains_finalizing_homebind_and_resumes_once)
+{
+    // Finding N1(a): land -> homebind AwaitingResult -> logout -> relogin ->
+    // completion occurs EXACTLY ONCE. An ordinary logout must NOT discard the
+    // Finalizing ledger while durable homebind verification is still owed.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.setHomebind = true;
+    uint64_t const token = tracker.Begin(9, request);
+    PendingRelocation acked;
+    tracker.Acknowledge(9, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.homebindHasTarget = true;
+    spy.homebindTarget = HomebindWrite{ 1, 10.0f, 20.0f, 3.0f, 42 };
+
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.runtimeResets == 1);          // one-shot runtime reset already ran
+    LIVING_CHECK(spy.homebindApplies == 1);
+    LIVING_CHECK(spy.homebindVerifyRequests == 1); // verification in flight (AwaitingResult)
+
+    // Logout: ordinary cancel RETAINS the Finalizing ledger.
+    LIVING_CHECK(tracker.Cancel(9, RelocationCancelMode::Ordinary) == false);
+    LIVING_CHECK(tracker.IsFinalizing(9));
+    for (int i = 0; i < 5; ++i)
+        LIVING_CHECK(tracker.NoteBotAbsent(9) == false); // offline, well under the bound
+    LIVING_CHECK(tracker.IsFinalizing(9));
+    LIVING_CHECK(tracker.Cancel(9, RelocationCancelMode::Ordinary) == false); // relogin cancel: still retained
+
+    // The token-addressed verify result confirms even while the bot was offline.
+    tracker.OnHomebindVerifyResult(token, HomebindVerifyOutcome::Match);
+    auto events = tracker.DrainHomebindVerifyEvents();
+    LIVING_CHECK(events.size() == 1);
+    LIVING_CHECK(tracker.ApplyHomebindVerify(events[0].relocationToken, events[0].outcome,
+        RelocationTracker::kMaxHomebindWriteAttempts) == HomebindVerifyAction::Confirmed);
+
+    // Relogin: the retained record resumes and completes exactly once.
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.runtimeResets == 1);   // EXACTLY once across logout/relogin
+    LIVING_CHECK(spy.homebindApplies == 1); // exactly one homebind write
+    LIVING_CHECK(!tracker.HasPending(9));
+}
+
+LIVING_TEST(relocation_ordinary_cancel_retains_finalizing_schedule_debt_and_resumes_once)
+{
+    // Finding N1(b): land -> failed next-teleport schedule -> logout -> relogin
+    // -> completes exactly once. A failed schedule keeps the record armed;
+    // logout must not drop it.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.scheduleNextTeleport = true;
+    tracker.Begin(42, request);
+    PendingRelocation acked;
+    tracker.Acknowledge(42, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.scheduleSucceeds = false;
+    LIVING_CHECK(tracker.Advance(42, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.runtimeResets == 1);
+    LIVING_CHECK(spy.scheduleAttempts == 1); // schedule write failed; debt owed
+
+    LIVING_CHECK(tracker.Cancel(42, RelocationCancelMode::Ordinary) == false); // logout retains
+    LIVING_CHECK(tracker.IsFinalizing(42));
+    LIVING_CHECK(tracker.NoteBotAbsent(42) == false);
+    LIVING_CHECK(tracker.Cancel(42, RelocationCancelMode::Ordinary) == false); // relogin retains
+    LIVING_CHECK(tracker.Begin(42, MakeRecord(2, 1.0f, 2.0f, 3.0f)) == 0);     // still armed: no second teleport
+
+    spy.scheduleSucceeds = true;
+    LIVING_CHECK(tracker.Advance(42, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.runtimeResets == 1);    // EXACTLY once
+    LIVING_CHECK(spy.scheduleAttempts == 2); // retried until it landed
+    LIVING_CHECK(!tracker.HasPending(42));
+}
+
+LIVING_TEST(relocation_force_cancel_drops_finalizing_and_offline_watchdog_is_bounded)
+{
+    // Force cancel drops a Finalizing record (explicit removal); ordinary cancel
+    // drops a PendingAck record; the offline watchdog terminally drops a
+    // Finalizing record only after the bound, so a never-returning bot is not
+    // retained forever.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.setHomebind = true;
+    PendingRelocation acked;
+
+    tracker.Begin(1, request);
+    tracker.Acknowledge(1, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+    LIVING_CHECK(tracker.IsFinalizing(1));
+    LIVING_CHECK(tracker.Cancel(1, RelocationCancelMode::Force) == true); // force drops Finalizing
+    LIVING_CHECK(!tracker.HasPending(1));
+
+    tracker.Begin(2, request); // PendingAck
+    LIVING_CHECK(tracker.Cancel(2, RelocationCancelMode::Ordinary) == true); // ordinary drops PendingAck
+    LIVING_CHECK(!tracker.HasPending(2));
+
+    tracker.Begin(3, request);
+    tracker.Acknowledge(3, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+    bool dropped = false;
+    for (uint32_t i = 0; i <= RelocationTracker::kMaxOfflineSweeps && !dropped; ++i)
+        dropped = tracker.NoteBotAbsent(3);
+    LIVING_CHECK(dropped); // terminal after the bounded offline wait
+    LIVING_CHECK(!tracker.HasPending(3));
 }

@@ -73,3 +73,31 @@ LIVING_TEST(chat_selector_zero_and_hundred_are_exact)
         LIVING_CHECK(selected == chance);
     }
 }
+
+LIVING_TEST(quest_selector_parses_only_leading_selector_and_preserves_operands)
+{
+    // Finding N5: only the LEADING @quest= selector is consumed; trailing
+    // command operands (including further quest links) are preserved verbatim.
+    auto link = [](uint32_t id, std::string const& title)
+    {
+        return "|cFFFFFF00|Hquest:" + std::to_string(id) + ":10|h[" + title + "]|h|r";
+    };
+    QuestChatSelector sel;
+    std::string const a = link(100, "Deep Ocean, Vast Sea"); // title with spaces + comma
+    std::string const b = link(200, "Wanted: Bandits");
+
+    // `@quest=<A> share <B>` -> selector A only; remainder "share <B>" verbatim.
+    LIVING_CHECK(ParseQuestChatSelector("@quest=" + a + " share " + b, sel) == QuestChatSelectorParse::Parsed);
+    LIVING_CHECK(sel.questId == 100 && sel.fromLink); // NOT 200
+    LIVING_CHECK(sel.remainder == "share " + b);       // B's link untouched
+
+    LIVING_CHECK(ParseQuestChatSelector("@quest=523 status", sel) == QuestChatSelectorParse::Parsed);
+    LIVING_CHECK(sel.questId == 523 && !sel.fromLink && sel.remainder == "status");
+
+    LIVING_CHECK(ParseQuestChatSelector("@quest=" + a, sel) == QuestChatSelectorParse::Parsed);
+    LIVING_CHECK(sel.remainder.empty()); // selector-only
+
+    LIVING_CHECK(ParseQuestChatSelector("follow", sel) == QuestChatSelectorParse::NotSelector);
+    LIVING_CHECK(ParseQuestChatSelector("@quest=abc x", sel) == QuestChatSelectorParse::Malformed);
+    LIVING_CHECK(ParseQuestChatSelector("@quest=9999999999 x", sel) == QuestChatSelectorParse::Malformed); // overflow, no throw
+}

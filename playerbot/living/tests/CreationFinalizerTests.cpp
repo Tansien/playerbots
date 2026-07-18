@@ -755,6 +755,79 @@ LIVING_TEST(creation_batch_planned_slot_persists_drawn_role)
     LIVING_CHECK(retry[0].cls == 1);
 }
 
+LIVING_TEST(creation_batch_completed_batch_never_blocks_a_new_run)
+{
+    // Finding N4: a completed/joined batch is retained for polling but must NOT
+    // own the deficit or block a differently-configured new request. It stays
+    // counted for anti-duplication until its members are verified joined, but
+    // FindBatchTokenForInitiator (the block gate) never returns it.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 77;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.useRandomAccounts = true; // distinct options
+    a.members.push_back(PendingMember(51, 1, 1));
+    uint64_t const tokenA = registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(51, CreationPollStatus::Created, 7001), 1);
+
+    auto nobodyJoined = [](uint32_t) { return false; };
+    auto joined7001 = [](uint32_t g) { return g == 7001; };
+
+    // Finalized-but-unjoined: retained + pollable + still counted for the
+    // deficit, but NOT the active owner -> the different-options gate is bypassed.
+    LIVING_CHECK(registry.Poll(tokenA, false).status == BatchPollStatus::Complete);
+    LIVING_CHECK(registry.Find(tokenA) != nullptr);
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(77) == 0);
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(77, nobodyJoined) == 1); // anti-dup retained
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(77, joined7001) == 0);   // joined -> no deficit
+
+    // A differently-configured request opens a FRESH batch instead of being refused.
+    CreationBatchRegistry::Batch b;
+    b.initiatorGuid = 77;
+    b.desiredSize = 3;
+    b.preexistingMembers = 1;
+    b.memberGear = "default";
+    b.useRandomAccounts = false;
+    b.members.push_back(PendingMember(52, 2, 2));
+    uint64_t const tokenB = registry.Begin(std::move(b));
+    LIVING_CHECK(tokenB && tokenB != tokenA);
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(77) == tokenB);
+}
+
+LIVING_TEST(creation_batch_extension_grows_replacement_budget_by_positive_delta)
+{
+    // Finding N3: extending desiredSize must grant one replacement per ADDED
+    // slot. A 5 -> 40 extension leaving the original 5 replacements would starve
+    // the 35 new slots. The delta is added to the REMAINING budget; equal/smaller
+    // extensions never shrink either field.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batch;
+    batch.initiatorGuid = 501;
+    batch.desiredSize = 5;
+    batch.replacementBudget = 5; // seeded == groupSize
+    batch.members.push_back(PendingMember(71, 1, 1));
+    uint64_t const token = registry.Begin(std::move(batch));
+
+    // A retryable failure BEFORE extending draws the budget down, proving the
+    // delta adds to the REMAINING budget, not the original seed.
+    registry.OnCreationTerminal(MakeCompletion(71, CreationPollStatus::FailedRetryable, 0), 1); // 5 -> 4
+    LIVING_CHECK(registry.Find(token)->replacementBudget == 4);
+
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 40));         // +35 delta
+    LIVING_CHECK(registry.Find(token)->desiredSize == 40);
+    LIVING_CHECK(registry.Find(token)->replacementBudget == 39); // 4 + 35 (pre-fix: stuck at 4)
+
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 40));         // equal: no-op
+    LIVING_CHECK(registry.Find(token)->replacementBudget == 39);
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 10));         // smaller: never shrinks
+    LIVING_CHECK(registry.Find(token)->desiredSize == 40);
+    LIVING_CHECK(registry.Find(token)->replacementBudget == 39);
+}
+
 LIVING_TEST(creation_batch_completed_batch_is_not_extended)
 {
     // Finding 7b: a completed batch is retained for pollers but must NOT be
