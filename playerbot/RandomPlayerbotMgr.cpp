@@ -3977,6 +3977,7 @@ bool RandomPlayerbotMgr::TryGetEventValue(uint32 bot, std::string const& event, 
     // events keep the per-bot map populated (the bulk load above only runs
     // while the load state demands it). Until a reload succeeds, the prior
     // KNOWN value is served - a failed query is not absence.
+    bool eventStillDirty = false;
     if (auto botDirty = dirtyEvents.find(bot); botDirty != dirtyEvents.end() && botDirty->second.count(event))
     {
         if (ReloadEventRow(bot, event) != living::EventReloadOutcome::QueryFailed)
@@ -3984,6 +3985,15 @@ bool RandomPlayerbotMgr::TryGetEventValue(uint32 bot, std::string const& event, 
             botDirty->second.erase(event);
             if (botDirty->second.empty())
                 dirtyEvents.erase(botDirty);
+        }
+        else
+        {
+            // The dirty reload failed again: durable state stays unknown. The
+            // write that marked this event dirty may already have landed, so the
+            // still-cached value cannot be trusted to gate a lifecycle mutation.
+            // Report NOT trusted (the stale value remains in `value` for
+            // diagnostics) until a later reload reconciles the row.
+            eventStillDirty = true;
         }
     }
 
@@ -4007,8 +4017,9 @@ bool RandomPlayerbotMgr::TryGetEventValue(uint32 bot, std::string const& event, 
 
     // Known: a cached entry (confirmed write or successful load), or a
     // completed bulk load confirming absence. Absent + Unloaded/Unknown reads
-    // as zero but reports NOT KNOWN - destructive callers skip.
-    return living::EventValueKnown(loadState, hasCachedEntry);
+    // as zero but reports NOT KNOWN - destructive callers skip. A still-dirty
+    // event whose reload could not reconcile also reports NOT trusted.
+    return living::EventValueTrusted(loadState, hasCachedEntry, eventStillDirty);
 }
 
 uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
@@ -4109,20 +4120,24 @@ living::EventWriteResult RandomPlayerbotMgr::SetEventValueEx(uint32 bot, std::st
     // against it - "the prior value remained" is DefinitelyNotApplied, "the
     // requested value landed anyway" is DesiredStateConfirmed, anything else
     // is StateUnknown.
-    uint32 priorRawValue = 0;
+    living::EventRow priorRow;
     bool priorPresent = false;
     if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
     {
         if (auto entry = botCache->second.find(event); entry != botCache->second.end())
         {
-            priorRawValue = entry->second.value;
+            priorRow = living::EventRow{entry->second.value, entry->second.lastChangeTime, entry->second.validIn, entry->second.data};
             priorPresent = true;
         }
     }
     living::EventCacheLoadState priorLoadState = living::EventCacheLoadState::Unloaded;
     if (auto stateIt = eventCacheLoadState.find(bot); stateIt != eventCacheLoadState.end())
         priorLoadState = stateIt->second;
-    bool const priorKnown = living::EventValueKnown(priorLoadState, priorPresent);
+    // A prior state that is still dirty (an earlier reported-failed write that
+    // never reconciled) is NOT trustworthy: it can never prove
+    // DefinitelyNotApplied, so a same-value refresh over a dirty row stays
+    // StateUnknown rather than being falsely confirmed.
+    bool const priorKnown = living::EventValueTrusted(priorLoadState, priorPresent, IsEventDirty(bot, event));
 
     // Escape here, once: an unescaped quote used to delete the prior row, fail
     // the INSERT, and leave the in-memory cache diverged from the DB. The
@@ -4194,32 +4209,32 @@ living::EventWriteResult RandomPlayerbotMgr::SetEventValueEx(uint32 bot, std::st
         // result is StateUnknown so compensating callers restore this event
         // too.
         sLog.outError("SetEventValue failed to persist event '%s' for bot %u; reloading durable value", event.c_str(), bot);
-        switch (ReloadEventRow(bot, event))
-        {
-            case living::EventReloadOutcome::Found:
-            {
-                uint32 durableValue = 0;
-                if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
-                    if (auto entry = botCache->second.find(event); entry != botCache->second.end())
-                        durableValue = entry->second.value;
 
-                if (durableValue == value)
-                    return living::EventWriteResult::DesiredStateConfirmed; // landed despite the report
-                if (priorKnown && priorPresent && durableValue == priorRawValue)
-                    return living::EventWriteResult::DefinitelyNotApplied;  // prior state remained
-                return living::EventWriteResult::StateUnknown;
-            }
-            case living::EventReloadOutcome::ConfirmedAbsent:
-                if (value == 0)
-                    return living::EventWriteResult::DesiredStateConfirmed; // the delete landed
-                if (priorKnown && !priorPresent)
-                    return living::EventWriteResult::DefinitelyNotApplied;  // confirmed-absent before AND after
-                return living::EventWriteResult::StateUnknown;
-            case living::EventReloadOutcome::QueryFailed:
-            default:
-                dirtyEvents[bot].insert(event);
-                return living::EventWriteResult::StateUnknown;
+        // Reload and classify against the COMPLETE requested and prior rows, not
+        // the value alone: a same-value refresh with a new expiry/data, and an
+        // expired add/teleport re-scheduled to the same raw value, must NOT be
+        // confirmed just because the stale value still matches. Deletion is
+        // confirmed only by a confirmed-absent row.
+        living::EventReloadOutcome const reload = ReloadEventRow(bot, event);
+        living::EventRow durableRow;
+        if (reload == living::EventReloadOutcome::Found)
+        {
+            if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
+                if (auto entry = botCache->second.find(event); entry != botCache->second.end())
+                    durableRow = living::EventRow{entry->second.value, entry->second.lastChangeTime, entry->second.validIn, entry->second.data};
         }
+
+        living::EventRow const requestedRow{value, now, validIn, data};
+        living::EventWriteResult const classified = living::ClassifyFailedWriteReload(
+            reload, /*isDeletion=*/ value == 0, requestedRow, durableRow, priorKnown, priorPresent, priorRow);
+
+        // A failed reload leaves durable state unknown: keep the prior cached
+        // value for diagnostics but mark the entry dirty so later typed reads
+        // stay untrusted and keep retrying until reconciliation succeeds.
+        if (reload == living::EventReloadOutcome::QueryFailed)
+            dirtyEvents[bot].insert(event);
+
+        return classified;
     }
 
     CachedEvent e(value, now, validIn, data);
