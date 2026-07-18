@@ -228,6 +228,12 @@ public:
         float activityMod = 0.25;
         std::map<std::string, uint32> databaseDelay;
         uint32 GetEventValue(uint32 bot, std::string event);
+        // Typed read: returns whether the value is KNOWN (cached entry, or a
+        // completed bulk load confirming absence). While the bulk-load state
+        // is Unloaded/Unknown an absent event reads as value 0 but NOT known -
+        // destructive callers (timed-logout deactivation) must skip their
+        // mutation instead of consuming a load failure as an expired event.
+        bool TryGetEventValue(uint32 bot, std::string const& event, uint32& value);
         std::string GetEventData(uint32 bot, std::string event);
         bool SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data = "");
         // Reloads ONE durable event row into the cache with a typed outcome:
@@ -241,8 +247,10 @@ public:
         living::CountedLoadOutcome LoadCurrentBotsFromDb();
         // SQL result callback for the relocation homebind verification: parses
         // the row into a match/mismatch outcome and enqueues it on the
-        // relocation tracker - no database work, no decisions.
-        void HandleHomebindVerify(QueryResult* result, uint32 botGuid);
+        // relocation tracker - no database work, no decisions. The parameter
+        // is the RELOCATION TOKEN of the requesting generation, so a stale
+        // callback can never be applied to a later record.
+        void HandleHomebindVerify(QueryResult* result, uint64 relocationToken);
         // Advances one Finalizing relocation's owed completion work.
         living::RelocationAdvanceResult AdvanceRelocation(Player* bot);
         std::list<uint32> GetBots();

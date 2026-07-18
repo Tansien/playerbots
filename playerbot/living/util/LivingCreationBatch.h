@@ -61,6 +61,13 @@ namespace living
         uint32_t preexistingMembers = 0;
         std::vector<uint32_t> finalizedGuids;
         std::vector<std::string> failures;
+        // Desired-size invariant, computed at poll time for COMPLETE batches:
+        // preexisting + finalized members fell short of the requested size.
+        // This catches shortfalls the failure list alone can miss (the
+        // initial run stopping on a terminal error or maxTries exhaustion
+        // before enough members were even queued) - a partial group must
+        // never report success.
+        bool undersized = false;
     };
 
     class CreationBatchRegistry
@@ -82,6 +89,11 @@ namespace living
             std::string memberGear;
             bool memberAutoAdd = false;
             bool memberTemporary = false;
+            // Allocation mode of the ORIGINAL run: replacements must allocate
+            // on the same holder (random-account manager vs the initiator's
+            // personal manager) - a retry must never silently move a random
+            // group member onto the master's personal account.
+            bool useRandomAccounts = false;
             // Set once the completion summary has been surfaced.
             bool completionReported = false;
         };
@@ -183,6 +195,8 @@ namespace living
             result.preexistingMembers = batch.preexistingMembers;
             result.finalizedGuids = batch.finalizedGuids;
             result.failures = batch.failures;
+            result.undersized = result.status == BatchPollStatus::Complete
+                && batch.preexistingMembers + batch.finalizedGuids.size() < batch.desiredSize;
 
             if (result.status == BatchPollStatus::Complete && acknowledgeComplete)
                 batches.erase(it);

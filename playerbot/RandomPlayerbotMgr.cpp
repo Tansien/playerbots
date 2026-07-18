@@ -2243,12 +2243,21 @@ bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
     if (!GetEventValue(bot, "login"))
     {
         AddPlayerBot(bot, 0);
-        SetEventValue(bot, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
-        SetEventValue(bot, "logout", 0, 0);
+        // The add/logout pair is one logical activation: if either durable
+        // write failed, the in-memory vector may diverge from durable truth,
+        // so mark it dirty - GetBots reconciles from the canonical query
+        // before the list is trusted again.
+        bool activationDurable = SetEventValue(bot, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
+        activationDurable = SetEventValue(bot, "logout", 0, 0) && activationDurable;
         SetEventValue(bot, "login", 1, -1);
         uint32 randomTime = urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime);
         SetEventValue(bot, "update", 1, randomTime);
         currentBots.push_back(bot);
+        if (!activationDurable)
+        {
+            currentBotsDirty = true;
+            sLog.outError("AddRandomBot: activation writes for bot %u not confirmed; bot list marked dirty", bot);
+        }
         sLog.outDetail("Random bot added #%d", bot);
     }
 
@@ -2277,8 +2286,16 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     bool botsAllowedInWorld = !sPlayerbotAIConfig.randomBotLoginWithPlayer || (!players.empty() && sWorld.GetActiveSessionCount() > 0);
 
     bool isValid = true;
-   
-    if (sPlayerbotAIConfig.randomBotTimedLogout && !GetEventValue(bot, "add") && !sPlayerbotAIConfig.asyncBotLogin) // RandomBotInWorldTime is expired.
+
+    // Typed read: a KNOWN zero means the in-world window genuinely expired.
+    // While the event-cache load state is unknown (failed bulk load) the read
+    // reports NOT KNOWN and this deactivation is SKIPPED - a transient read
+    // failure must never remove a durably active bot from currentBots, clear
+    // its add marker and log it out as if the activation had expired.
+    uint32 addValue = 0;
+    bool const addKnown = TryGetEventValue(bot, "add", addValue);
+
+    if (sPlayerbotAIConfig.randomBotTimedLogout && addKnown && !addValue && !sPlayerbotAIConfig.asyncBotLogin) // RandomBotInWorldTime is expired.
         isValid = false;
     else if(!botsAllowedInWorld)                                               // Logout if all players logged out
         isValid = false;
@@ -2298,12 +2315,19 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
             sLog.outDetail("Bot #%d %s:%d <%s>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H", player->GetLevel(), player->GetName());
 
         currentBots.remove(bot);
-        SetEventValue(bot, "add", 0, 0);
+        // Half of the activation pair: if the durable clear failed, the
+        // in-memory removal above diverged from durable truth - reconcile
+        // before the vector is trusted again.
+        if (!SetEventValue(bot, "add", 0, 0))
+        {
+            currentBotsDirty = true;
+            sLog.outError("ProcessBot: clearing 'add' for bot %u not confirmed; bot list marked dirty", bot);
+        }
 
         if (!player)
         {
             return false;
-        }    
+        }
 
         LogoutPlayerBot(bot);
 
@@ -2311,8 +2335,11 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         {
             uint32 logout = GetEventValue(bot, "logout");
 
-            if (!logout)
-                SetEventValue(bot, "logout", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
+            if (!logout && !SetEventValue(bot, "logout", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
+            {
+                currentBotsDirty = true;
+                sLog.outError("ProcessBot: setting 'logout' for bot %u not confirmed; bot list marked dirty", bot);
+            }
         }
 
         return false;
@@ -2620,15 +2647,25 @@ living::RelocationAdvanceResult RandomPlayerbotMgr::AdvanceRelocation(Player* bo
             closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ(), innAreaId };
     };
 
-    ops.requestHomebindVerify = [this, botGuid]()
+    ops.requestHomebindVerify = [this, botGuid, &record]() -> bool
     {
         // SetHomebindToLocation queues an async UPDATE and returns void in
         // every pinned core; this execution-ordered query (same FIFO delay
         // thread) observes the row AFTER that write executed. Its callback
         // only parses and enqueues - the outcome is processed by
-        // PumpPendingRelocations.
-        CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandleHomebindVerify, botGuid,
+        // PumpPendingRelocations. The callback parameter is the relocation
+        // TOKEN, so a stale result from a superseded generation can never be
+        // applied to a later record. AsyncPQuery reports ENQUEUE failure via
+        // its return value in all three cores - propagated so the tracker
+        // retries instead of waiting for a result that was never queued.
+        return CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandleHomebindVerify, record.token,
             "SELECT map, zone, position_x, position_y, position_z FROM character_homebind WHERE guid = '%u'", botGuid);
+    };
+
+    ops.onHomebindGaveUp = [bot]()
+    {
+        sLog.outError("Relocation homebind for bot %s could not be verified (request budget exhausted); completing with an UNVERIFIED homebind (may revert on restart)",
+            bot->GetName());
     };
 
     ops.applyRpgCooldown = [bot]()
@@ -2659,7 +2696,7 @@ living::RelocationAdvanceResult RandomPlayerbotMgr::AdvanceRelocation(Player* bo
     return result;
 }
 
-void RandomPlayerbotMgr::HandleHomebindVerify(QueryResult* result, uint32 botGuid)
+void RandomPlayerbotMgr::HandleHomebindVerify(QueryResult* result, uint64 relocationToken)
 {
     // SQL result callback: parse the row into a typed outcome, enqueue it on
     // the tracker, return. No database work, no lifecycle decisions - those
@@ -2675,7 +2712,10 @@ void RandomPlayerbotMgr::HandleHomebindVerify(QueryResult* result, uint32 botGui
         float const z = fields[4].GetFloat();
 
         outcome = living::HomebindVerifyOutcome::Mismatch;
-        if (living::PendingRelocation const* record = relocations.Find(botGuid))
+        // Token-addressed lookup: a stale callback from a superseded or
+        // cancelled generation finds no record and its event is simply
+        // ignored by the pump.
+        if (living::PendingRelocation const* record = relocations.FindByToken(relocationToken))
         {
             // The core's homebind UPDATE serializes coordinates through "%f"
             // (6 decimals), so the readback is not bit-exact: compare with a
@@ -2693,43 +2733,59 @@ void RandomPlayerbotMgr::HandleHomebindVerify(QueryResult* result, uint32 botGui
     }
     delete result;
 
-    relocations.OnHomebindVerifyResult(botGuid, outcome);
+    relocations.OnHomebindVerifyResult(relocationToken, outcome);
 }
 
 void RandomPlayerbotMgr::PumpPendingRelocations()
 {
     // Apply drained homebind-verification callback events first (pump
-    // context: the result-queue mutex is not held here).
+    // context: the result-queue mutex is not held here). Events are
+    // token-addressed: results from superseded/cancelled generations match
+    // nothing and are dropped.
     for (living::RelocationTracker::HomebindVerifyEvent const& event : relocations.DrainHomebindVerifyEvents())
     {
-        switch (relocations.ApplyHomebindVerify(event.botGuid, event.outcome,
+        switch (relocations.ApplyHomebindVerify(event.relocationToken, event.outcome,
             living::RelocationTracker::kMaxHomebindWriteAttempts))
         {
             case living::HomebindVerifyAction::GaveUp:
-                sLog.outError("Relocation homebind for bot %u could not be durably verified after %u attempts; completing with an UNVERIFIED homebind (may revert on restart)",
-                    event.botGuid, living::RelocationTracker::kMaxHomebindWriteAttempts);
+                sLog.outError("Relocation homebind (token " UI64FMTD ") could not be durably verified after %u attempts; completing with an UNVERIFIED homebind (may revert on restart)",
+                    event.relocationToken, living::RelocationTracker::kMaxHomebindWriteAttempts);
                 break;
             case living::HomebindVerifyAction::Reissue:
-                sLog.outDetail("Relocation homebind for bot %u not confirmed; reissuing the write", event.botGuid);
+                sLog.outDetail("Relocation homebind (token " UI64FMTD ") not confirmed; reissuing the write", event.relocationToken);
                 break;
             default:
                 break;
         }
     }
 
-    // Advance every Finalizing record: owed durable writes (revive markers,
-    // homebind chain, next-teleport scheduling) retry here until confirmed,
-    // and only then is the record - and its destination reservation -
-    // released.
-    for (uint32 const botGuid : relocations.FinalizingBots())
+    // Sweep every tracked record. Finalizing records advance their owed
+    // durable writes (revive markers, homebind chain, next-teleport
+    // scheduling) until confirmed - only then is the record and its
+    // destination reservation released. STALE PendingAck records (an
+    // acknowledgement the ack hook never resolved: bot back in-world, not
+    // teleporting) are resolved through the normal acknowledgement path -
+    // an exact landing finalizes, anything else terminally mismatches - which
+    // is what makes RelocationTracker::Begin's refusal of duplicate records
+    // deadlock-free.
+    for (uint32 const botGuid : relocations.TrackedBots())
     {
         Player* bot = GetPlayerBot(botGuid);
-        if (bot && bot->IsInWorld() && bot->GetPlayerbotAI())
-            AdvanceRelocation(bot);
-        else if (!bot)
+        if (!bot)
+        {
             // The player is gone without the logout path having cancelled
             // (defensive): release the record like every other logout.
             relocations.Cancel(botGuid);
+            continue;
+        }
+
+        if (!bot->IsInWorld() || !bot->GetPlayerbotAI() || bot->IsBeingTeleported())
+            continue; // genuinely in flight (or in limbo): leave the record armed
+
+        if (relocations.IsFinalizing(botGuid))
+            AdvanceRelocation(bot);
+        else
+            FinalizeRelocation(bot);
     }
 }
 
@@ -2835,9 +2891,10 @@ namespace
         if (living::DestinationBlockedByEnemyArea(areaIsEnemy, bot->GetLevel()))
             return false;
 
-        // Active-zone requirement and destination density: mutable-coordinate
-        // policies too (jitter can cross into an inactive or over-populated
-        // zone), so they rerun on the final tuple exactly like the pre-filter.
+        // Active-zone requirement: a mutable-coordinate policy (jitter can
+        // cross into an inactive zone), rerun on the final tuple exactly like
+        // the pre-filter - but only while activeOnly; the wrappers' fallback
+        // deliberately relaxes it.
         if (activeOnly && sPlayerbotAIConfig.randomBotTeleportNearPlayer)
         {
             Map* tMap = sMapMgr.FindMap(mapId, 0);
@@ -2846,37 +2903,43 @@ namespace
 
             if (!tMap->HasActiveZone(zoneId ? zoneId : areaId))
                 return false;
+        }
 
-            if (sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount > 0 && sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius > 0.0f)
+        // Destination density is INDEPENDENT of the active-zone relaxation:
+        // the wrappers retry every rejection with activeOnly=false, and if
+        // density only ran on the first pass, the second pass would happily
+        // overfill the exact point another bot already reserved.
+        if (sPlayerbotAIConfig.randomBotTeleportNearPlayer
+            && sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount > 0
+            && sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius > 0.0f)
+        {
+            WorldPosition const destination(mapId, x, y, z);
+            uint32 botsNearTeleportPoint = 0;
+            sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* otherBot)
             {
-                WorldPosition const destination(mapId, x, y, z);
-                uint32 botsNearTeleportPoint = 0;
-                sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* otherBot)
+                // Only check the bots that are in the same zone. A bot
+                // with an in-flight relocation record is skipped here and
+                // counted through its destination reservation below, so
+                // each bot contributes exactly once.
+                if (otherBot && !otherBot->IsBeingTeleported()
+                    && !sRandomPlayerbotMgr.HasPendingRelocation(otherBot->GetGUIDLow())
+                    && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
                 {
-                    // Only check the bots that are in the same zone. A bot
-                    // with an in-flight relocation record is skipped here and
-                    // counted through its destination reservation below, so
-                    // each bot contributes exactly once.
-                    if (otherBot && !otherBot->IsBeingTeleported()
-                        && !sRandomPlayerbotMgr.HasPendingRelocation(otherBot->GetGUIDLow())
-                        && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
-                    {
-                        if (destination.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
-                            botsNearTeleportPoint++;
-                    }
-                });
+                    if (destination.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
+                        botsNearTeleportPoint++;
+                }
+            });
 
-                // In-flight reservations: bots whose accepted relocation
-                // targets this vicinity but who have not landed/completed yet
-                // (PendingAck and Finalizing stages). Without them two bots
-                // could pass admission for the same empty destination and both
-                // land, exceeding the cap. The bot's own record is excluded.
-                botsNearTeleportPoint += sRandomPlayerbotMgr.CountPendingRelocationsNear(mapId, x, y,
-                    sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius, bot->GetGUIDLow());
+            // In-flight reservations: bots whose accepted relocation
+            // targets this vicinity but who have not landed/completed yet
+            // (PendingAck and Finalizing stages). Without them two bots
+            // could pass admission for the same empty destination and both
+            // land, exceeding the cap. The bot's own record is excluded.
+            botsNearTeleportPoint += sRandomPlayerbotMgr.CountPendingRelocationsNear(mapId, x, y,
+                sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius, bot->GetGUIDLow());
 
-                if (botsNearTeleportPoint >= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount)
-                    return false;
-            }
+            if (botsNearTeleportPoint >= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount)
+                return false;
         }
 
         outArea = area;
@@ -2910,15 +2973,18 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
     if (bot->IsBeingTeleported())
         return living::RelocationOutcome::Rejected;
 
-    // A previous relocation still finalizing owed side effects (failed
-    // schedule/homebind writes retrying from the pump) blocks any new random
-    // relocation: an old expired teleport event must not trigger an immediate
-    // second teleport while the first one's completion is unconfirmed. This
-    // runs BEFORE TeleportTo so the tracker can never refuse a registration
-    // for an already-queued transfer.
-    if (relocations.IsFinalizing(bot->GetGUIDLow()))
+    // ANY tracked relocation (awaiting its acknowledgement, or finalizing
+    // owed side effects with failed schedule/homebind writes retrying from
+    // the pump) blocks a new random relocation: an old expired teleport event
+    // must not trigger an immediate second teleport while the first one is
+    // unresolved, and Begin never silently replaces an active record. Stale
+    // PendingAck records are resolved by the pump sweep (finalized or
+    // terminally mismatched), so this refusal cannot wedge the bot. This runs
+    // BEFORE TeleportTo so the tracker can never refuse a registration for an
+    // already-queued transfer.
+    if (relocations.HasPending(bot->GetGUIDLow()))
     {
-        sLog.outDetail("Random teleport skipped for bot %s: previous relocation still finalizing", bot->GetName());
+        sLog.outDetail("Random teleport skipped for bot %s: a previous relocation is still pending/finalizing", bot->GetName());
         return living::RelocationOutcome::Rejected;
     }
 
@@ -3784,7 +3850,7 @@ std::list<uint32> RandomPlayerbotMgr::GetBgBots(uint32 bracket)
     return BgBots;
 }
 
-uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
+bool RandomPlayerbotMgr::TryGetEventValue(uint32 bot, std::string const& event, uint32& value)
 {
     // Bulk-load all durable events on the first read - with an EXPLICIT load
     // state instead of the "per-bot map is empty" heuristic. That heuristic
@@ -3803,7 +3869,13 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
             "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", bot))
             count = countResult->Fetch()[0].GetUInt32();
 
+        // Rows are loaded into a FRESH map and swapped in only on success:
+        // merging into the existing map would let a stale cached sibling that
+        // is absent from durable rows survive a recovered load that then
+        // marks the cache authoritative. On failure the old map (prior KNOWN
+        // values) is preserved untouched.
         bool rowsLoaded = false;
+        std::map<std::string, CachedEvent> loaded;
         if (count && *count > 0)
         {
             auto results = CharacterDatabase.PQuery("SELECT `event`, `value`, `time`, validIn, `data` FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", bot);
@@ -3818,16 +3890,25 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
                     e.lastChangeTime = fields[2].GetUInt32();
                     e.validIn = fields[3].GetUInt32();
                     e.data = fields[4].GetString();
-                    eventCache[bot][eventName] = e;
+                    loaded[eventName] = e;
                 } while (results->NextRow());
 
                 rowsLoaded = true;
             }
         }
 
-        loadState = living::ResolveEventCacheBulkLoad(living::ClassifyCountedLoad(count, rowsLoaded));
+        living::CountedLoadOutcome const outcome = living::ClassifyCountedLoad(count, rowsLoaded);
+        loadState = living::ResolveEventCacheBulkLoad(outcome);
+        if (outcome != living::CountedLoadOutcome::QueryFailed)
+        {
+            // The load is authoritative: replace the cache (SuccessEmpty
+            // clears it) and drop any per-event dirty marks - durable truth
+            // has just been re-established for the whole bot.
+            eventCache[bot] = std::move(loaded);
+            dirtyEvents.erase(bot);
+        }
         // Log the transition once, not every retried read.
-        if (loadState == living::EventCacheLoadState::Unknown && previousState != living::EventCacheLoadState::Unknown)
+        else if (previousState != living::EventCacheLoadState::Unknown)
             sLog.outError("GetEventValue: bulk event load failed for bot %u; state stays unknown and will be retried", bot);
     }
 
@@ -3848,14 +3929,32 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
     // Plain lookup WITHOUT default-inserting: a fabricated zero entry is what
     // used to turn "load failed" into permanent confirmed absence.
     CachedEvent e;
+    bool hasCachedEntry = false;
     if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
+    {
         if (auto entry = botCache->second.find(event); entry != botCache->second.end())
+        {
             e = entry->second;
+            hasCachedEntry = true;
+        }
+    }
 
     if ((time(0) - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink" && event != "init" && event != "current_time" && event != "always" && event != "selfbot")
         e.value = 0;
 
-    return e.value;
+    value = e.value;
+
+    // Known: a cached entry (confirmed write or successful load), or a
+    // completed bulk load confirming absence. Absent + Unloaded/Unknown reads
+    // as zero but reports NOT KNOWN - destructive callers skip.
+    return living::EventValueKnown(loadState, hasCachedEntry);
+}
+
+uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
+{
+    uint32 value = 0;
+    TryGetEventValue(bot, event, value);
+    return value;
 }
 
 int32 RandomPlayerbotMgr::GetValueValidTime(uint32 bot, std::string event)
@@ -5428,8 +5527,14 @@ uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error
 
         // Durable characters PLUS pending/quarantined creation reservations:
         // a group loop selecting accounts here must not admit several
-        // creations against the same stale durable count.
-        uint32 charCount = EffectiveCharacterCount(accountId);
+        // creations against the same stale durable count. An UNKNOWN count
+        // (failed query) skips the account - fail closed, never "empty".
+        uint32 charCount = 0;
+        if (!TryGetEffectiveCharacterCount(accountId, charCount))
+        {
+            accountNumber++;
+            continue;
+        }
 
         if (charCount < maxCharsPerAccount)
         {
@@ -5456,7 +5561,11 @@ void RandomPlayerbotMgr::OnBotDeleted(uint32 botGuid, uint32 accountId)
         maxCharsPerAccount = 10;
     #endif
     
-        if (sAccountMgr.GetCharactersCount(accountId) == 0)
+        // Typed count: the cores collapse a FAILED count query to zero, and a
+        // zero here DELETES the account (and any characters it still has).
+        // Unknown occupancy must never be treated as empty.
+        uint32 remainingCharacters = 0;
+        if (TryGetDurableCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
         {
             std::ostringstream prefix;
             prefix << sPlayerbotAIConfig.randomBotAccountPrefix;

@@ -44,11 +44,17 @@ namespace living
     // Verification state of the owed homebind write. SetHomebindToLocation in
     // every pinned core queues an async UPDATE and returns void, so the write
     // is only trusted after an execution-ordered verification query (same FIFO
-    // delay thread) confirms the stored row.
+    // delay thread) confirms the stored row. Every transition is recoverable:
+    // a verification ENQUEUE failure (AsyncPQuery returns false in all three
+    // cores) keeps the record in WriteApplied for a bounded re-request, and a
+    // LOST result (dropped event, lost callback) trips the awaiting-result
+    // watchdog back to WriteApplied - a record can never be stranded in
+    // AwaitingResult holding its relocation block and density reservation.
     enum class HomebindVerifyState
     {
         NotStarted,     // write not issued yet (or owed a reissue)
-        AwaitingResult, // write issued, verification query in flight
+        WriteApplied,   // write issued; a verification request is owed
+        AwaitingResult, // verification query enqueued, result in flight
         Confirmed,      // stored row matches the written target
         GaveUp,         // bounded attempts exhausted; completed with an error
     };
@@ -80,6 +86,12 @@ namespace living
         bool homebindHandled = false;       // written+verified, nothing to write, or gave up
         HomebindVerifyState homebindVerify = HomebindVerifyState::NotStarted;
         uint32_t homebindWriteAttempts = 0;
+        // Verification-request budget for the CURRENT write (reset on each
+        // reissue): enqueue failures and watchdog re-requests consume it.
+        uint32_t homebindVerifyRequests = 0;
+        // Advances spent in AwaitingResult; the watchdog re-arms the request
+        // when a result never arrives (dropped event, lost callback).
+        uint32_t awaitingResultAdvances = 0;
         bool nextTeleportScheduled = false;
         // The homebind target actually written (setHomebind uses the landing
         // spot; bindInn resolves the closest inn at finalization time) - the
@@ -164,10 +176,15 @@ namespace living
         // write (no eligible inn) - which completes the operation.
         std::function<std::optional<HomebindWrite>()> applyHomebind;
         // Enqueues the execution-ordered homebind verification query for the
-        // stored target.
-        std::function<void()> requestHomebindVerify;
+        // stored target. Returns whether the query was actually ENQUEUED -
+        // all three pinned cores report enqueue failure via a false return,
+        // and treating that as in-flight would strand the record forever.
+        std::function<bool()> requestHomebindVerify;
         // Schedules the next teleport event (execution-confirmed write).
         std::function<bool()> scheduleNextTeleport;
+        // Observes a homebind give-up decided inside Advance (bounded
+        // request/watchdog exhaustion) so the caller can log it.
+        std::function<void()> onHomebindGaveUp;
     };
 
     // Bounded pending-relocation registry: at most one in-flight entry per bot.
@@ -189,10 +206,12 @@ namespace living
     class RelocationTracker
     {
     public:
-        // Registers (or supersedes) the bot's pending relocation and stamps a
-        // fresh token. Returns that token, or 0 when refused because the bot's
-        // previous relocation is still Finalizing (owed side effects must
-        // complete before another relocation may start).
+        // Registers the bot's pending relocation and stamps a fresh token.
+        // Returns that token, or 0 when the bot ALREADY has an active record
+        // (either stage): Begin never silently replaces an active record -
+        // callers preflight with HasPending, and stale PendingAck records are
+        // resolved by the caller's pump (a finished landing finalizes or
+        // terminally mismatches them), so refusal cannot deadlock.
         uint64_t Begin(uint32_t botGuid, PendingRelocation record);
 
         // Resolves a FINISHED acknowledgement against the pending record using
@@ -211,12 +230,17 @@ namespace living
         RelocationAdvanceResult Advance(uint32_t botGuid, RelocationAdvanceOps const& ops);
 
         // SQL-callback entry for homebind verification results: ONLY enqueues
-        // (bounded) and returns - no decisions, no database work.
-        void OnHomebindVerifyResult(uint32_t botGuid, HomebindVerifyOutcome outcome);
+        // (bounded) and returns - no decisions, no database work. Events carry
+        // the RELOCATION TOKEN of the request that issued the query, so a
+        // stale callback from a superseded/cancelled generation can never
+        // consume a later generation's retry budget. A full queue drops the
+        // event; the awaiting-result watchdog in Advance recovers by
+        // re-requesting.
+        void OnHomebindVerifyResult(uint64_t relocationToken, HomebindVerifyOutcome outcome);
 
         struct HomebindVerifyEvent
         {
-            uint32_t botGuid = 0;
+            uint64_t relocationToken = 0;
             HomebindVerifyOutcome outcome = HomebindVerifyOutcome::QueryFailed;
         };
 
@@ -226,9 +250,10 @@ namespace living
         // Applies one drained verification result to the record's ledger and
         // reports what the caller owes (Reissue re-arms the write for the next
         // Advance; GaveUp completes the operation with an error after bounded
-        // attempts).
-        HomebindVerifyAction ApplyHomebindVerify(uint32_t botGuid, HomebindVerifyOutcome outcome,
-            uint32_t maxAttempts);
+        // attempts). Results whose token does not match a live AwaitingResult
+        // record resolve to None - stale generations are ignored.
+        HomebindVerifyAction ApplyHomebindVerify(uint64_t relocationToken, HomebindVerifyOutcome outcome,
+            uint32_t maxWriteAttempts);
 
         // Drops the bot's pending record (logout/removal/relogin). Never touches
         // retry markers; a cancelled relocation is simply never finalized.
@@ -241,6 +266,15 @@ namespace living
         // Every bot with a Finalizing record (retry pump surface).
         std::vector<uint32_t> FinalizingBots() const;
 
+        // Every tracked bot, both stages: the pump also sweeps stale
+        // PendingAck records (a finished landing finalizes or terminally
+        // mismatches them), which is what makes Begin's refusal safe.
+        std::vector<uint32_t> TrackedBots() const;
+
+        // Read-only lookup of the record owning `relocationToken` (verify
+        // callbacks compare the queried tuple against the request's target).
+        PendingRelocation const* FindByToken(uint64_t relocationToken) const;
+
         // Destination reservation count for density admission: records in BOTH
         // stages targeting `mapId` within `radius` (2D, matching the same-map
         // WorldPosition::fDist metric the live density scan uses) count,
@@ -252,6 +286,13 @@ namespace living
 
         static constexpr size_t kMaxHomebindVerifyEvents = 256;
         static constexpr uint32_t kMaxHomebindWriteAttempts = 3;
+        // Verification requests per write (enqueue failures + watchdog
+        // re-requests) before giving up.
+        static constexpr uint32_t kMaxHomebindVerifyRequests = 3;
+        // Advances a record may sit in AwaitingResult before the result is
+        // considered lost and the request is re-armed. One advance per world
+        // tick: ~128 ticks is far above any real verify round trip.
+        static constexpr uint32_t kAwaitingResultTimeoutAdvances = 128;
 
     private:
         uint64_t nextToken = 1;

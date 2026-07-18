@@ -398,3 +398,33 @@ LIVING_TEST(current_bots_reconciliation_zero_rows_is_success_not_failure)
     LIVING_CHECK(!dirty);
     LIVING_CHECK(currentBots.empty());
 }
+
+LIVING_TEST(event_value_known_fails_closed_while_load_state_unknown)
+{
+    // The typed-read rule behind TryGetEventValue: a cached entry is always
+    // known (confirmed write or successful load); an ABSENT entry is
+    // confirmed absent only after a completed bulk load. Absent while
+    // Unloaded/Unknown reads as zero but is NOT knowledge - the destructive
+    // callers (timed-logout deactivation clearing `add`, removing the bot
+    // from currentBots and logging it out) skip their mutation instead of
+    // consuming a transient load failure as an expired activation.
+    LIVING_CHECK(!EventValueKnown(EventCacheLoadState::Unloaded, false));
+    LIVING_CHECK(!EventValueKnown(EventCacheLoadState::Unknown, false));
+    LIVING_CHECK(EventValueKnown(EventCacheLoadState::Loaded, false));  // confirmed absence
+    LIVING_CHECK(EventValueKnown(EventCacheLoadState::Unloaded, true)); // cached entry
+    LIVING_CHECK(EventValueKnown(EventCacheLoadState::Unknown, true));  // prior known value
+    LIVING_CHECK(EventValueKnown(EventCacheLoadState::Loaded, true));
+
+    // The failed-first-load deactivation scenario as a sequence: load fails
+    // (Unknown), `add` absent -> not known -> NO deactivation; the DB
+    // recovers, the load succeeds, and only a then-confirmed zero (Loaded +
+    // absent) may deactivate.
+    EventCacheLoadState state = ResolveEventCacheBulkLoad(ClassifyCountedLoad(std::nullopt, false));
+    LIVING_CHECK(state == EventCacheLoadState::Unknown);
+    bool deactivate = EventValueKnown(state, false); // value would read 0
+    LIVING_CHECK(!deactivate);
+
+    state = ResolveEventCacheBulkLoad(ClassifyCountedLoad(0, false)); // recovered: zero rows confirmed
+    LIVING_CHECK(state == EventCacheLoadState::Loaded);
+    LIVING_CHECK(EventValueKnown(state, false)); // now a KNOWN zero may deactivate
+}

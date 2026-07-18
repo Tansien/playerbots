@@ -4,13 +4,13 @@ namespace living
 {
     uint64_t RelocationTracker::Begin(uint32_t botGuid, PendingRelocation record)
     {
-        // A Finalizing record still owes runtime/durable side effects; a new
-        // relocation must not start until they are confirmed (or the bot logs
-        // out and Cancel drops the record). A PendingAck record is superseded
-        // as before: a bot that never acknowledges leaves a record the next
-        // attempt overwrites, so event-driven retry doubles as the timeout.
-        if (auto it = pending.find(botGuid); it != pending.end()
-            && it->second.stage == RelocationStage::Finalizing)
+        // Begin never silently replaces an active record: a Finalizing record
+        // still owes runtime/durable side effects, and even a PendingAck
+        // record represents an accepted transfer plus a density reservation.
+        // The caller's pump resolves stale PendingAck records (a finished
+        // landing either finalizes them or terminally mismatches), so this
+        // refusal cannot deadlock a bot whose acknowledgement was lost.
+        if (pending.find(botGuid) != pending.end())
             return 0;
 
         record.token = nextToken++;
@@ -97,8 +97,7 @@ namespace living
 
         if ((record.setHomebind || record.bindInn) && !record.homebindHandled)
         {
-            if (!record.homebindTargetKnown && record.homebindVerify == HomebindVerifyState::NotStarted
-                && ops.applyHomebind)
+            if (record.homebindVerify == HomebindVerifyState::NotStarted && ops.applyHomebind)
             {
                 if (std::optional<HomebindWrite> const written = ops.applyHomebind())
                 {
@@ -109,9 +108,8 @@ namespace living
                     record.homebindTargetZ = written->z;
                     record.homebindTargetArea = written->areaId;
                     ++record.homebindWriteAttempts;
-                    record.homebindVerify = HomebindVerifyState::AwaitingResult;
-                    if (ops.requestHomebindVerify)
-                        ops.requestHomebindVerify();
+                    record.homebindVerifyRequests = 0;
+                    record.homebindVerify = HomebindVerifyState::WriteApplied;
                 }
                 else
                 {
@@ -119,6 +117,39 @@ namespace living
                     // complete by absence, not by failure.
                     record.homebindHandled = true;
                 }
+            }
+
+            // The verification query enters flight only after a SUCCESSFUL
+            // enqueue - all three pinned cores report enqueue failure via a
+            // false return, and treating that as in-flight stranded the
+            // record in AwaitingResult forever. Failed requests retry on
+            // later advances within a bounded budget.
+            if (record.homebindVerify == HomebindVerifyState::WriteApplied && ops.requestHomebindVerify)
+            {
+                if (record.homebindVerifyRequests >= kMaxHomebindVerifyRequests)
+                {
+                    record.homebindVerify = HomebindVerifyState::GaveUp;
+                    if (ops.onHomebindGaveUp)
+                        ops.onHomebindGaveUp();
+                }
+                else
+                {
+                    ++record.homebindVerifyRequests;
+                    if (ops.requestHomebindVerify())
+                    {
+                        record.homebindVerify = HomebindVerifyState::AwaitingResult;
+                        record.awaitingResultAdvances = 0;
+                    }
+                }
+            }
+            else if (record.homebindVerify == HomebindVerifyState::AwaitingResult)
+            {
+                // Watchdog: a result that never arrives (event dropped by the
+                // bounded queue, callback lost) re-arms the request instead of
+                // holding the record - and its relocation block and density
+                // reservation - forever.
+                if (++record.awaitingResultAdvances > kAwaitingResultTimeoutAdvances)
+                    record.homebindVerify = HomebindVerifyState::WriteApplied;
             }
 
             if (record.homebindVerify == HomebindVerifyState::Confirmed
@@ -148,15 +179,15 @@ namespace living
         return RelocationAdvanceResult::Completed;
     }
 
-    void RelocationTracker::OnHomebindVerifyResult(uint32_t botGuid, HomebindVerifyOutcome outcome)
+    void RelocationTracker::OnHomebindVerifyResult(uint64_t relocationToken, HomebindVerifyOutcome outcome)
     {
         // SQL-callback context: enqueue only. A full queue drops the event;
-        // the record then simply stays Finalizing and a later advance's
-        // re-verification path recovers (the safe direction).
+        // the awaiting-result watchdog in Advance then re-requests, so a
+        // dropped result delays - never strands - the record.
         if (homebindVerifyEvents.size() >= kMaxHomebindVerifyEvents)
             return;
 
-        homebindVerifyEvents.push_back(HomebindVerifyEvent{ botGuid, outcome });
+        homebindVerifyEvents.push_back(HomebindVerifyEvent{ relocationToken, outcome });
     }
 
     std::vector<RelocationTracker::HomebindVerifyEvent> RelocationTracker::DrainHomebindVerifyEvents()
@@ -166,36 +197,46 @@ namespace living
         return drained;
     }
 
-    HomebindVerifyAction RelocationTracker::ApplyHomebindVerify(uint32_t botGuid, HomebindVerifyOutcome outcome,
-        uint32_t maxAttempts)
+    HomebindVerifyAction RelocationTracker::ApplyHomebindVerify(uint64_t relocationToken, HomebindVerifyOutcome outcome,
+        uint32_t maxWriteAttempts)
     {
-        auto const it = pending.find(botGuid);
-        if (it == pending.end() || it->second.homebindVerify != HomebindVerifyState::AwaitingResult)
-            return HomebindVerifyAction::None;
+        // Token-addressed lookup: a stale result from a superseded or
+        // cancelled generation matches no live AwaitingResult record and is
+        // ignored - it can never consume a later generation's retry budget.
+        PendingRelocation* record = nullptr;
+        for (auto& [guid, candidate] : pending)
+        {
+            if (candidate.token == relocationToken)
+            {
+                record = &candidate;
+                break;
+            }
+        }
 
-        PendingRelocation& record = it->second;
+        if (!record || record->homebindVerify != HomebindVerifyState::AwaitingResult)
+            return HomebindVerifyAction::None;
 
         if (outcome == HomebindVerifyOutcome::Match)
         {
-            record.homebindVerify = HomebindVerifyState::Confirmed;
+            record->homebindVerify = HomebindVerifyState::Confirmed;
             return HomebindVerifyAction::Confirmed;
         }
 
-        if (record.homebindWriteAttempts >= maxAttempts)
+        if (record->homebindWriteAttempts >= maxWriteAttempts)
         {
             // Bounded give-up: the record completes with an explicit error
             // (the caller logs it) instead of blocking the bot's relocation
             // pipeline forever on a write that keeps failing. The in-memory
             // homebind fields are set either way; only restart durability is
             // at risk, and that risk is now logged, not silent.
-            record.homebindVerify = HomebindVerifyState::GaveUp;
+            record->homebindVerify = HomebindVerifyState::GaveUp;
             return HomebindVerifyAction::GaveUp;
         }
 
         // Re-arm the write: the next advance re-issues SetHomebindToLocation
         // and a fresh verification.
-        record.homebindTargetKnown = false;
-        record.homebindVerify = HomebindVerifyState::NotStarted;
+        record->homebindTargetKnown = false;
+        record->homebindVerify = HomebindVerifyState::NotStarted;
         return HomebindVerifyAction::Reissue;
     }
 
@@ -222,6 +263,23 @@ namespace living
             if (record.stage == RelocationStage::Finalizing)
                 bots.push_back(guid);
         return bots;
+    }
+
+    std::vector<uint32_t> RelocationTracker::TrackedBots() const
+    {
+        std::vector<uint32_t> bots;
+        bots.reserve(pending.size());
+        for (auto const& [guid, record] : pending)
+            bots.push_back(guid);
+        return bots;
+    }
+
+    PendingRelocation const* RelocationTracker::FindByToken(uint64_t relocationToken) const
+    {
+        for (auto const& [guid, record] : pending)
+            if (record.token == relocationToken)
+                return &record;
+        return nullptr;
     }
 
     uint32_t RelocationTracker::CountReservedDestinationsNear(uint32_t mapId, float x, float y, float radius,

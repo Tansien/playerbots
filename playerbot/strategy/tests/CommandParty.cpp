@@ -206,6 +206,17 @@ TestResult CommandPartySpawnGroup::Execute(const std::string& params, Player* bo
                 return TestResult::IMPOSSIBLE;
             }
 
+            // Desired-size invariant, independent of the failure list: the
+            // initial run stopping early (terminal error, attempt budget)
+            // must not let a partial group report PASS.
+            if (poll.undersized)
+            {
+                message = "Group creation completed undersized: "
+                    + std::to_string(poll.preexistingMembers + poll.finalizedGuids.size())
+                    + " of " + std::to_string(poll.desiredSize) + " members";
+                return TestResult::IMPOSSIBLE;
+            }
+
             return TestResult::PASS;
         }
         default:
