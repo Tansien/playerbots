@@ -428,3 +428,167 @@ LIVING_TEST(event_value_known_fails_closed_while_load_state_unknown)
     LIVING_CHECK(state == EventCacheLoadState::Loaded);
     LIVING_CHECK(EventValueKnown(state, false)); // now a KNOWN zero may deactivate
 }
+
+// ---- Finding 1: reported-failed writes are confirmed against the COMPLETE
+// durable row (time, validIn, value, data), never the value alone. ----
+
+LIVING_TEST(event_failed_write_applied_but_reported_failed_is_confirmed)
+{
+    // The UPDATE/INSERT reported failure but actually landed: the reloaded row
+    // equals the complete requested row, so the write is confirmed and the
+    // caller (AddPlayerBot/activation) may proceed.
+    living::EventRow const requested{2, 100, 3600, "gear"};
+    LIVING_CHECK(living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/false,
+        requested, /*durable=*/requested,
+        /*priorKnown=*/true, /*priorPresent=*/true, /*prior=*/living::EventRow{1, 10, 50, ""})
+        == living::EventWriteResult::DesiredStateConfirmed);
+}
+
+LIVING_TEST(event_failed_write_same_value_different_validity_not_confirmed)
+{
+    // Same raw value 1, but a new time and validIn: the failed write did NOT
+    // apply and the reload finds the unchanged prior row. Comparing the value
+    // alone would falsely confirm; the full-row compare must not.
+    living::EventRow const prior{1, 10, 50, ""};        // unchanged durable row
+    living::EventRow const requested{1, 100, 3600, ""}; // same value, fresh lifetime
+    living::EventWriteResult const r = living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/false,
+        requested, /*durable=*/prior, /*priorKnown=*/true, /*priorPresent=*/true, prior);
+    LIVING_CHECK(r != living::EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(r == living::EventWriteResult::DefinitelyNotApplied);
+}
+
+LIVING_TEST(event_failed_write_same_value_different_data_not_confirmed)
+{
+    // Same value/time/validIn but a different data payload: still a different
+    // durable state, so a stale-data row cannot confirm the refresh.
+    living::EventRow const prior{1, 100, 3600, "old-group"};
+    living::EventRow const requested{1, 100, 3600, "new-group"};
+    living::EventWriteResult const r = living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/false,
+        requested, /*durable=*/prior, /*priorKnown=*/true, /*priorPresent=*/true, prior);
+    LIVING_CHECK(r != living::EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(r == living::EventWriteResult::DefinitelyNotApplied);
+}
+
+LIVING_TEST(event_failed_write_expired_add_refresh_not_confirmed)
+{
+    // The finding's exact repro: durable add=1 is EXPIRED (old time, short
+    // validIn); activation re-schedules add=1 with a fresh lifetime; the UPDATE
+    // reports failure and did NOT apply; the reload finds the unchanged expired
+    // raw 1. A value-only compare would confirm an expired durable activation.
+    living::EventRow const expiredAdd{1, 10, 5, ""};      // long expired
+    living::EventRow const freshAdd{1, 1000, 3600, ""};   // requested refresh
+    living::EventWriteResult const r = living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/false,
+        freshAdd, /*durable=*/expiredAdd, /*priorKnown=*/true, /*priorPresent=*/true, expiredAdd);
+    LIVING_CHECK(r != living::EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(r == living::EventWriteResult::DefinitelyNotApplied);
+}
+
+LIVING_TEST(event_failed_write_expired_teleport_refresh_not_confirmed)
+{
+    // Same shape for a teleport marker: an expired teleport=1 refreshed to the
+    // same raw value must not be accepted as freshly scheduled.
+    living::EventRow const expiredTeleport{1, 20, 5, ""};
+    living::EventRow const freshTeleport{1, 2000, 600, ""};
+    living::EventWriteResult const r = living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/false,
+        freshTeleport, /*durable=*/expiredTeleport, /*priorKnown=*/true, /*priorPresent=*/true, expiredTeleport);
+    LIVING_CHECK(r != living::EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(r == living::EventWriteResult::DefinitelyNotApplied);
+}
+
+LIVING_TEST(event_delete_confirmed_only_by_confirmed_absence)
+{
+    living::EventRow const prior{1, 10, 50, ""};
+    living::EventRow const requestedDelete{0, 100, 0, ""}; // value 0 => deletion
+    // A still-present row (even one holding value 0) never confirms a delete.
+    LIVING_CHECK(living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/true,
+        requestedDelete, /*durable=*/prior, /*priorKnown=*/true, /*priorPresent=*/true, prior)
+        == living::EventWriteResult::DefinitelyNotApplied); // prior row remained: delete did not land
+    living::EventRow const stillZero{0, 10, 50, ""};
+    LIVING_CHECK(living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/true,
+        requestedDelete, /*durable=*/stillZero, /*priorKnown=*/false, /*priorPresent=*/false, living::EventRow{})
+        != living::EventWriteResult::DesiredStateConfirmed); // present value-0 row is NOT absence
+    // Only a confirmed-absent row proves the delete landed.
+    LIVING_CHECK(living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::ConfirmedAbsent, /*isDeletion=*/true,
+        requestedDelete, /*durable=*/living::EventRow{}, /*priorKnown=*/true, /*priorPresent=*/true, prior)
+        == living::EventWriteResult::DesiredStateConfirmed);
+}
+
+LIVING_TEST(event_failed_write_untrusted_prior_stays_unknown)
+{
+    // Prior state is NOT known (e.g. the event was already dirty): a row that
+    // matches that untrusted prior cannot prove DefinitelyNotApplied, and a
+    // same-value-different-lifetime row does not match the request, so the
+    // result is StateUnknown - the caller keeps the event dirty.
+    living::EventRow const prior{1, 10, 5, ""};
+    living::EventRow const requested{1, 100, 3600, ""};
+    LIVING_CHECK(living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::Found, /*isDeletion=*/false,
+        requested, /*durable=*/prior, /*priorKnown=*/false, /*priorPresent=*/true, prior)
+        == living::EventWriteResult::StateUnknown);
+    // A failed reload is always StateUnknown regardless of prior knownness.
+    LIVING_CHECK(living::ClassifyFailedWriteReload(
+        living::EventReloadOutcome::QueryFailed, /*isDeletion=*/false,
+        requested, /*durable=*/living::EventRow{}, /*priorKnown=*/true, /*priorPresent=*/true, prior)
+        == living::EventWriteResult::StateUnknown);
+}
+
+// ---- Finding 2: a dirty event whose reload cannot reconcile reads as NOT
+// trusted, so typed mutation gates defer until reconciliation succeeds. ----
+
+LIVING_TEST(event_value_trusted_is_false_while_dirty)
+{
+    // Dirtiness overrides every otherwise-known state: a cached value or a
+    // completed load does not make a dirty entry trustworthy.
+    LIVING_CHECK(!living::EventValueTrusted(living::EventCacheLoadState::Loaded, true, /*dirty=*/true));
+    LIVING_CHECK(!living::EventValueTrusted(living::EventCacheLoadState::Unknown, true, /*dirty=*/true));
+    LIVING_CHECK(!living::EventValueTrusted(living::EventCacheLoadState::Loaded, false, /*dirty=*/true));
+    // Clean entries keep the EventValueKnown semantics unchanged.
+    LIVING_CHECK(living::EventValueTrusted(living::EventCacheLoadState::Loaded, true, /*dirty=*/false));
+    LIVING_CHECK(living::EventValueTrusted(living::EventCacheLoadState::Unknown, true, /*dirty=*/false));
+    LIVING_CHECK(living::EventValueTrusted(living::EventCacheLoadState::Loaded, false, /*dirty=*/false)); // confirmed absent
+    LIVING_CHECK(!living::EventValueTrusted(living::EventCacheLoadState::Unloaded, false, /*dirty=*/false));
+}
+
+LIVING_TEST(event_dirty_typed_read_untrusted_until_reconciled)
+{
+    // The full lifecycle from finding 2: an ambiguous write (ExecuteFailed +
+    // failed reload) marks the event dirty; the possibly-stale cached value must
+    // report NOT trusted through repeated reload failures - so no typed caller
+    // mutates - and only a successful reload restores trust.
+    living::EventCacheLoadState const loaded = living::EventCacheLoadState::Loaded;
+    bool dirty = true;      // marked dirty by the ambiguous write
+    bool reloadAvailable = false;
+
+    auto reloadAttempt = [&]() -> living::EventReloadOutcome
+    {
+        living::EventReloadOutcome const outcome = reloadAvailable
+            ? living::EventReloadOutcome::Found
+            : living::EventReloadOutcome::QueryFailed;
+        if (outcome != living::EventReloadOutcome::QueryFailed)
+            dirty = false; // successful reload clears the dirty mark
+        return outcome;
+    };
+
+    // First typed read: reload fails again -> still dirty -> NOT trusted.
+    reloadAttempt();
+    LIVING_CHECK(dirty);
+    LIVING_CHECK(!living::EventValueTrusted(loaded, /*hasCachedEntry=*/true, dirty));
+
+    // Repeated failure: still not trusted (no lifecycle mutation may proceed).
+    reloadAttempt();
+    LIVING_CHECK(!living::EventValueTrusted(loaded, true, dirty));
+
+    // Reconciliation: a successful reload clears dirty and restores knownness.
+    reloadAvailable = true;
+    reloadAttempt();
+    LIVING_CHECK(!dirty);
+    LIVING_CHECK(living::EventValueTrusted(loaded, true, dirty));
+}

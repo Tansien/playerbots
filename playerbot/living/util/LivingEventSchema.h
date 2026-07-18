@@ -108,6 +108,19 @@ namespace living
         return hasCachedEntry || state == EventCacheLoadState::Loaded;
     }
 
+    // Whether a read of ONE event yields a TRUSTED (known) value once dirtiness
+    // is folded in. An event is marked dirty when a write REPORTED failure and
+    // the follow-up reload could not confirm the durable state - the cached
+    // value may already be stale relative to a write that actually landed. Such
+    // a value must never gate a lifecycle mutation: a dirty entry reads as NOT
+    // trusted regardless of the load state or a lingering cached value (which is
+    // retained only for diagnostics) until a reload reconciles it. A confirmed
+    // write or a successful reload clears the dirty mark and restores trust.
+    inline bool EventValueTrusted(EventCacheLoadState state, bool hasCachedEntry, bool isDirty)
+    {
+        return !isDirty && EventValueKnown(state, hasCachedEntry);
+    }
+
     enum class EventPersistOutcome
     {
         // The value violates the schema; nothing was attempted.
@@ -144,6 +157,74 @@ namespace living
         // prior value).
         StateUnknown,
     };
+
+    // The complete durable state of one event row. A reported-failed write is
+    // confirmed against the WHOLE row, never the value alone: the durable row
+    // carries time, validIn, value AND data, and a same-value schedule refresh
+    // with a new expiry or payload is a DIFFERENT durable state. Two rows are
+    // equal only when every column matches.
+    struct EventRow
+    {
+        uint32_t value = 0;
+        uint32_t time = 0;
+        uint32_t validIn = 0;
+        std::string data;
+
+        bool operator==(EventRow const& other) const
+        {
+            return value == other.value
+                && time == other.time
+                && validIn == other.validIn
+                && data == other.data;
+        }
+        bool operator!=(EventRow const& other) const { return !(*this == other); }
+    };
+
+    // Classifies the durability of an event write that REPORTED failure, after
+    // its row was reloaded, RELATIVE TO THE COMPLETE requested and prior rows.
+    // A reported failure is not proof nothing mutated, so the reload is compared
+    // as a whole tuple, not by value:
+    //   - DesiredStateConfirmed : a non-deletion write whose complete durable
+    //     row equals the requested row landed despite the report. A DELETION is
+    //     confirmed ONLY by a confirmed-absent row - a still-present row (even
+    //     one holding value 0) never confirms a delete.
+    //   - DefinitelyNotApplied  : the complete KNOWN prior row remained (the
+    //     present row is byte-for-byte the prior row, or the row is confirmed
+    //     absent and the prior was known-absent).
+    //   - StateUnknown          : the reload failed, or the row matched neither
+    //     the requested nor the prior state; the caller marks the event dirty.
+    // `priorKnown` MUST be false when the prior state is not trustworthy (for
+    // example the event was already dirty before this write): an untrusted prior
+    // can never prove DefinitelyNotApplied. `requested`/`prior` are consulted
+    // only in the branches noted above.
+    inline EventWriteResult ClassifyFailedWriteReload(
+        EventReloadOutcome reload,
+        bool isDeletion,
+        EventRow const& requested,
+        EventRow const& durable,
+        bool priorKnown,
+        bool priorPresent,
+        EventRow const& prior)
+    {
+        switch (reload)
+        {
+            case EventReloadOutcome::Found:
+                if (!isDeletion && durable == requested)
+                    return EventWriteResult::DesiredStateConfirmed; // landed despite the report
+                if (priorKnown && priorPresent && durable == prior)
+                    return EventWriteResult::DefinitelyNotApplied;  // prior row remained intact
+                return EventWriteResult::StateUnknown;
+            case EventReloadOutcome::ConfirmedAbsent:
+                if (isDeletion)
+                    return EventWriteResult::DesiredStateConfirmed; // the delete landed
+                if (priorKnown && !priorPresent)
+                    return EventWriteResult::DefinitelyNotApplied;  // confirmed-absent before AND after
+                return EventWriteResult::StateUnknown;
+            case EventReloadOutcome::QueryFailed:
+            default:
+                return EventWriteResult::StateUnknown;
+        }
+    }
 
     // Drives the execution-confirmed persistence flow for one event write:
     // schema validation first, then value == 0 -> Delete; otherwise a

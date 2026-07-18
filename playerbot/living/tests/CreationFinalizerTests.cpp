@@ -31,6 +31,7 @@ namespace
         bool metadataSucceeds = true;
         bool eventDeleteSucceeds = true;
         bool verifyEnqueueSucceeds = true;
+        bool cleanupEnqueueSucceeds = true;
         bool bulkEnqueueSucceeds = true;
 
         uint32_t bulkGaveUpAccount = 0;
@@ -47,7 +48,7 @@ namespace
         {
             CreationFinalizerOps ops;
             ops.requestVerify = [this](uint32_t guid) { verifyRequests.push_back(guid); return verifyEnqueueSucceeds; };
-            ops.requestCleanupVerify = [this](uint32_t guid) { cleanupVerifyRequests.push_back(guid); return verifyEnqueueSucceeds; };
+            ops.requestCleanupVerify = [this](uint32_t guid) { cleanupVerifyRequests.push_back(guid); return cleanupEnqueueSucceeds; };
             ops.writeMetadata = [this](uint32_t guid) { metadataWrites.push_back(guid); return metadataSucceeds; };
             ops.deleteEventRows = [this](uint32_t guid) { eventDeletes.push_back(guid); return eventDeleteSucceeds; };
             ops.deleteCharacter = [this](uint32_t guid, uint32_t) { characterDeletes.push_back(guid); };
@@ -211,6 +212,78 @@ LIVING_TEST(creation_finalizer_metadata_failure_runs_confirmed_cleanup_through_p
     q.Pump(quarantineSpy.Make());
     LIVING_CHECK(q.RecordCount() == 1);
     LIVING_CHECK(q.Poll(qToken, false).status == CreationPollStatus::Quarantined);
+}
+
+LIVING_TEST(creation_finalizer_cleanup_reenqueue_failure_is_bounded_not_stranded)
+{
+    // Finding 3: while PendingCleanup, the re-issued cleanup verify can fail to
+    // ENQUEUE (or the callback is missing). The pinned cores report that via a
+    // false AsyncPQuery return. Without feeding a synthetic QueryFailed back
+    // through the mailbox no outcome ever arrives and the record - with its
+    // account reservation and one of the 64 registry slots - is stranded in
+    // PendingCleanup forever, with no terminal completion. The fix mirrors the
+    // ordinary verify/bulk paths: a missing/false enqueue synthesizes
+    // QueryFailed so the bounded lifecycle owns the record and quarantines it.
+    CreationFinalizer finalizer;
+    SpyOps spy;
+    spy.metadataSucceeds = false;
+
+    uint64_t const token = finalizer.Begin(MakeRecord(601, 1, "CleanupStrand"), spy.Make());
+    finalizer.OnCallbackResult(601, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
+    finalizer.Pump(spy.Make()); // metadata fails -> PendingCleanup + one cleanup verify requested
+    LIVING_CHECK(spy.cleanupVerifyRequests.size() == 1);
+    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Pending);
+    LIVING_CHECK(finalizer.RecordCount() == 1);
+
+    // The character keeps verifying as still present and EVERY re-enqueue fails.
+    spy.cleanupEnqueueSucceeds = false;
+    finalizer.OnCallbackResult(601, RowVerifyOutcome::Verified, CreationCallbackKind::CleanupVerify);
+    for (uint32_t i = 0; i < CreationFinalizer::kMaxCleanupAttempts + 2; ++i)
+        finalizer.Pump(spy.Make());
+
+    // Bounded, not stranded: the record reaches a real terminal (Quarantined)
+    // and no orphaned mailbox entry remains.
+    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Quarantined);
+    LIVING_CHECK(finalizer.PendingCallbackCount() == 0);
+}
+
+LIVING_TEST(creation_finalizer_cleanup_reenqueue_recovers_and_frees_the_slot)
+{
+    // The same failure window, but the async queue recovers within the bounded
+    // budget: the re-enqueue then succeeds, the real callback confirms the
+    // character absent, and the record is erased - freeing both its registry
+    // slot and its account reservation (never permanently retained).
+    CreationFinalizer finalizer;
+    SpyOps spy;
+    spy.metadataSucceeds = false;
+
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(5, 0, 9));
+    CreationFinalizer::Record record = MakeRecord(602, 5, "CleanupRecover");
+    record.holdsAccountReservation = true;
+    uint64_t const token = finalizer.Begin(std::move(record), spy.Make());
+    finalizer.OnCallbackResult(602, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
+    finalizer.Pump(spy.Make()); // -> PendingCleanup
+    LIVING_CHECK(finalizer.ReservedCount(5) == 1);
+    LIVING_CHECK(finalizer.RecordCount() == 1);
+
+    // Two failed re-enqueues keep the bounded lifecycle alive via synthetic
+    // QueryFailed (attempts stay under kMaxCleanupAttempts).
+    spy.cleanupEnqueueSucceeds = false;
+    finalizer.OnCallbackResult(602, RowVerifyOutcome::QueryFailed, CreationCallbackKind::CleanupVerify);
+    finalizer.Pump(spy.Make());
+    finalizer.Pump(spy.Make());
+    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Pending);
+
+    // Recovery: the next re-enqueue succeeds and the real callback reports the
+    // character verifiably gone.
+    spy.cleanupEnqueueSucceeds = true;
+    finalizer.Pump(spy.Make()); // consumes the last synthetic; real cleanup verify requested
+    finalizer.OnCallbackResult(602, RowVerifyOutcome::Absent, CreationCallbackKind::CleanupVerify);
+    finalizer.Pump(spy.Make());
+
+    LIVING_CHECK(finalizer.RecordCount() == 0);    // slot freed
+    LIVING_CHECK(finalizer.ReservedCount(5) == 0); // reservation released
+    LIVING_CHECK(finalizer.Poll(token, true).status == CreationPollStatus::FailedRetryable);
 }
 
 LIVING_TEST(creation_finalizer_poll_acknowledge_and_expiry_are_bounded)

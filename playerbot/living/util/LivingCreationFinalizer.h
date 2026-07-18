@@ -588,11 +588,17 @@ namespace living
                     break;
                 case CreationStage::PendingCleanup:
                     // Still present or unknown: re-issue the (idempotent)
-                    // deletion and verify again, bounded by the lifecycle.
+                    // deletion and verify again, bounded by the lifecycle. A
+                    // missing callback or a FAILED enqueue must feed a synthetic
+                    // QueryFailed back through the mailbox (mirroring
+                    // FinalizeVerified and ProcessBulkCount): otherwise no
+                    // outcome ever arrives and the record - with its account
+                    // reservation and one of the 64 registry slots - is stranded
+                    // in PendingCleanup forever with no terminal completion.
                     if (outcome == RowVerifyOutcome::Verified && ops.deleteCharacter)
                         ops.deleteCharacter(record.guid, record.accountId);
-                    if (ops.requestCleanupVerify)
-                        ops.requestCleanupVerify(record.guid);
+                    if (!ops.requestCleanupVerify || !ops.requestCleanupVerify(record.guid))
+                        StoreRecordOutcome(record.guid, RowVerifyOutcome::QueryFailed, CreationCallbackKind::CleanupVerify);
                     break;
                 case CreationStage::Quarantined:
                     PublishTerminal(record, CreationPollStatus::Quarantined,
