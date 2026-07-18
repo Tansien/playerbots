@@ -42,4 +42,27 @@ namespace living
     {
         return draw < chance;
     }
+
+    enum class QuestChatSelectorParse
+    {
+        NotSelector, // message does not start with "@quest="
+        Malformed,   // "@quest=" but the leading selector is not a valid quest id/link
+        Parsed,      // a valid leading selector; remainder is the untouched command
+    };
+
+    struct QuestChatSelector
+    {
+        uint32_t questId = 0;
+        std::string remainder; // the command after the LEADING selector ("" if none)
+        bool fromLink = false; // the selector was a full |Hquest:...|h[...]|h|r link
+    };
+
+    // Parses ONLY the leading `@quest=` selector - a bare numeric id or a single
+    // quest link - and returns the untouched command remainder. The legacy
+    // filter extracted EVERY quest link from the whole message, selected on any
+    // of them, and stripped them all, so `@quest=<A> share <B>` could select a
+    // bot that only had B and dispatch `share` with B removed. A link selector
+    // is delimited by its `|r` terminator (quest titles contain spaces), so the
+    // trailing operands - including further quest links - are preserved verbatim.
+    QuestChatSelectorParse ParseQuestChatSelector(std::string const& message, QuestChatSelector& out);
 }

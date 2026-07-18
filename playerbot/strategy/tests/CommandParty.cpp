@@ -35,6 +35,11 @@ TestResult CommandPartySpawnBot::Execute(const std::string& params, Player* bot,
         options.temporary = true; // exactly once, typed
 
         BotCreationResult result = ai->GetHolder()->CreateBot(bot, options);
+        // Any non-transient result ends this spawn's transient-retry phase, so
+        // the budget is freed for the next independent spawn (a leaked budget
+        // was what made a later spawn exhaust immediately).
+        if (result.status != living::BotCreateStatus::TransientFailure)
+            ctx.spawnTransientBudget.Reset();
         switch (result.status)
         {
             case living::BotCreateStatus::PendingPersistence:
@@ -53,8 +58,9 @@ TestResult CommandPartySpawnBot::Execute(const std::string& params, Player* bot,
             case living::BotCreateStatus::TransientFailure:
                 // Database transiently unavailable: defer with bounded
                 // tick-based backoff (the DSL re-executes PENDING commands).
-                if (++ctx.spawnTransientRetries >= 30)
+                if (ctx.spawnTransientBudget.RecordFailureExhausted(30))
                 {
+                    ctx.spawnTransientBudget.Reset(); // terminal: next spawn starts fresh
                     message = "Database unavailable for bot creation (deferred attempts exhausted)";
                     return TestResult::IMPOSSIBLE;
                 }

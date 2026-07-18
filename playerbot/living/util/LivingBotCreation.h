@@ -228,6 +228,36 @@ namespace living
         return plan;
     }
 
+    // What a group-join pass may do to its retry/backoff bookkeeping AFTER
+    // seeing the typed result of its durable `create group` write. The backoff
+    // clock and the marker consume must advance ONLY on a confirmed write - the
+    // legacy code advanced them unconditionally, so a lost/ambiguous write
+    // replayed the join work and defeated the bounded retry budget (the durable
+    // attempt count never moved).
+    struct GroupJoinPersist
+    {
+        bool advanceBackoff = false; // RetryLater confirmed: arm the normal backoff, budget advanced durably
+        bool consumed = false;       // ClearJoined/ClearTerminal confirmed: the marker is gone
+        bool holdoff = false;        // write not confirmed: leave durable state as-is, short holdoff, retry later
+    };
+
+    inline GroupJoinPersist PlanGroupJoinPersist(GroupJoinDecision decision, EventWriteResult writeResult)
+    {
+        GroupJoinPersist out;
+        bool const confirmed = writeResult == EventWriteResult::DesiredStateConfirmed;
+        if (decision == GroupJoinDecision::RetryLater)
+        {
+            out.advanceBackoff = confirmed;
+            out.holdoff = !confirmed;
+        }
+        else // ClearJoined / ClearTerminal
+        {
+            out.consumed = confirmed;
+            out.holdoff = !confirmed;
+        }
+        return out;
+    }
+
     // Consumes one unit of a role/class quota, refusing to wrap: decrementing a
     // zero quota corrupted the remaining allowance for the whole run. Returns
     // whether a unit was actually consumed.

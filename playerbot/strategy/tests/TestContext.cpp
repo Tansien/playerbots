@@ -50,5 +50,5 @@ void TestContext::Reset()
         spawnGroupBatchToken = 0;
     }
 
-    spawnTransientRetries = 0;
+    spawnTransientBudget.Reset();
 }

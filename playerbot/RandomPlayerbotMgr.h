@@ -6,6 +6,7 @@
 #include "PlayerbotMgr.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/living/util/LivingActivation.h"
+#include "playerbot/living/util/LivingCreationLifecycle.h"
 #include "playerbot/living/util/LivingEventSchema.h"
 #include "playerbot/living/util/LivingRelocation.h"
 #include "WorldPosition.h"
@@ -147,7 +148,7 @@ public:
         void PumpPendingRelocations();
         // Drops a pending relocation without finalizing it (logout/removal/
         // relogin). Retry markers are untouched.
-        void CancelPendingRelocation(uint32 botGuid);
+        void CancelPendingRelocation(uint32 botGuid, living::RelocationCancelMode mode = living::RelocationCancelMode::Ordinary);
         // In-flight relocation reservations near a destination (density
         // admission includes bots that ACCEPTED a move there but have not
         // landed/completed yet).
@@ -163,7 +164,7 @@ public:
         // rejected before persistence, so a discarded transient character
         // leaves no cache entry behind (load state included - the next read
         // reloads from durable truth).
-        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); }
+        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); oneShotMarkers.erase(bot); }
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
@@ -290,6 +291,10 @@ public:
         void PrepareTeleportCache();
         typedef std::list<std::string> (RandomPlayerbotMgr::*ConsoleCommandHandler) (std::string param);
         typedef std::list<std::string> (RandomPlayerbotMgr::*ConsolePlayerCommandHandler) (Player*);
+        // For player commands whose documented contract carries an operand
+        // (e.g. change_strategy <bot> <strategy>): the parsed operand is threaded
+        // to the handler instead of being parsed and discarded.
+        typedef std::list<std::string> (RandomPlayerbotMgr::*ConsolePlayerCommandParamHandler) (Player*, std::string const&);
 
 
         std::list<std::string> HandleHelp(std::string param);
@@ -316,7 +321,7 @@ public:
         std::list<std::string> HandleRandomTeleportForRpg(Player* bot);
         std::list<std::string> HandleRevive(Player* bot);
         std::list<std::string> HandleRandomTeleport(Player* bot);
-        std::list<std::string> HandleChangeStrategy(Player* bot);
+        std::list<std::string> HandleChangeStrategy(Player* bot, std::string const& strategySpec);
         std::list<std::string> HandleRemove(Player* bot);
 
         void MirrorAh();
@@ -341,6 +346,13 @@ public:
         // whole-map-empty reload alone cannot fix a single stale entry while
         // sibling events stay cached.
         std::map<uint32, std::set<std::string> > dirtyEvents;
+        // Per-(bot, marker) one-shot completion ledger for the post-create
+        // markers (create gear/levelup/test): the runtime effect runs EXACTLY
+        // ONCE and only the durable clear is retried, so an always-online bot
+        // no longer replays the mutation (e.g. gear=empty destroying items)
+        // every manager pass. In-memory only; a confirmed clear removes the
+        // durable marker, and ForgetEventCache drops the ledger on guid reuse.
+        std::map<uint32, std::map<std::string, living::OneShotMarker> > oneShotMarkers;
         // True after an activation pair (add/logout) whose durable state could
         // not be established: GetBots must reconcile from durable truth before
         // trusting the in-memory vector again.

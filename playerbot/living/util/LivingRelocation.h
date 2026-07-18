@@ -41,6 +41,19 @@ namespace living
         Finalizing,
     };
 
+    // How a Cancel request treats a record. An ORDINARY cancel (logout, disable,
+    // relogin, temporary absence) must NOT discard a Finalizing record - its
+    // owed durable work (homebind verify, marker clear, next-teleport schedule)
+    // is retained and resumed when the bot returns. Only a FORCE cancel (an
+    // explicit `.bot remove` / character deletion) drops a Finalizing record,
+    // because the bot is gone for good. A PendingAck record (nothing durable
+    // owed yet) is dropped by either mode.
+    enum class RelocationCancelMode
+    {
+        Ordinary,
+        Force,
+    };
+
     // Verification state of the owed homebind write. SetHomebindToLocation in
     // every pinned core queues an async UPDATE and returns void, so the write
     // is only trusted after an execution-ordered verification query (same FIFO
@@ -93,6 +106,11 @@ namespace living
         // when a result never arrives (dropped event, lost callback).
         uint32_t awaitingResultAdvances = 0;
         bool nextTeleportScheduled = false;
+        // Consecutive pump sweeps observing the bot absent while this record is
+        // Finalizing. A present-and-advancing sweep resets it; exceeding the
+        // bound drops the record so an owed relocation can never be retained
+        // forever for a bot that never returns.
+        uint32_t offlineSweeps = 0;
         // The homebind target actually written (setHomebind uses the landing
         // spot; bindInn resolves the closest inn at finalization time) - the
         // verification query compares against exactly this.
@@ -255,9 +273,19 @@ namespace living
         HomebindVerifyAction ApplyHomebindVerify(uint64_t relocationToken, HomebindVerifyOutcome outcome,
             uint32_t maxWriteAttempts);
 
-        // Drops the bot's pending record (logout/removal/relogin). Never touches
-        // retry markers; a cancelled relocation is simply never finalized.
-        void Cancel(uint32_t botGuid);
+        // Cancels the bot's pending record. An ORDINARY cancel drops a PendingAck
+        // record (no durable work owed yet) but RETAINS a Finalizing record so
+        // its owed durable work resumes when the bot returns; a FORCE cancel
+        // drops either stage (explicit removal/deletion). Never touches retry
+        // markers. Returns whether a record was actually erased.
+        bool Cancel(uint32_t botGuid, RelocationCancelMode mode);
+
+        // Ordinary "bot is temporarily absent this sweep" tick for the retry
+        // pump: drops a PendingAck record, and drops a Finalizing record only
+        // after kMaxOfflineSweeps consecutive absent sweeps (the bounded
+        // watchdog) so owed work is retained across a normal relogin gap but a
+        // never-returning bot is not held forever. Returns whether it erased.
+        bool NoteBotAbsent(uint32_t botGuid);
 
         bool HasPending(uint32_t botGuid) const;
         bool IsFinalizing(uint32_t botGuid) const;
@@ -293,6 +321,11 @@ namespace living
         // considered lost and the request is re-armed. One advance per world
         // tick: ~128 ticks is far above any real verify round trip.
         static constexpr uint32_t kAwaitingResultTimeoutAdvances = 128;
+        // Consecutive absent pump sweeps a Finalizing record is retained across
+        // before the offline watchdog drops it. One sweep per world tick, so
+        // this is far above any real logout/relogin gap yet still terminal for a
+        // bot that never comes back.
+        static constexpr uint32_t kMaxOfflineSweeps = 20000;
 
     private:
         uint64_t nextToken = 1;

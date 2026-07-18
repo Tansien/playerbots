@@ -4,6 +4,7 @@
 #include "playerbot/living/util/LivingBotCreation.h"
 #include "playerbot/living/util/LivingCommandSplit.h"
 #include "playerbot/living/util/LivingEventSchema.h"
+#include "playerbot/living/util/LivingStrategyCommand.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "Maps/MapManager.h"
@@ -915,13 +916,38 @@ void RandomPlayerbotMgr::LoginFreeBots()
             }
             else if (!bot->IsBeingTeleported())
             {
-                if (sRandomPlayerbotMgr.GetValue(botGuid, "create levelup"))
+                // One-shot post-create markers: run the runtime effect EXACTLY
+                // ONCE, then retry only the durable clear. An always-online bot
+                // reprocessed every pass must never replay the mutation (e.g.
+                // gear=empty destroying newly equipped items) just because a
+                // clear failed or was ambiguous.
+                auto consumeOneShot = [&](char const* marker, auto&& applyEffect)
+                {
+                    living::OneShotMarker& oneShot = oneShotMarkers[botGuid][marker];
+                    living::MarkerConsumeStep const step =
+                        oneShot.Plan(sRandomPlayerbotMgr.GetValue(botGuid, marker) != 0);
+                    if (step == living::MarkerConsumeStep::ApplyThenClear)
+                    {
+                        applyEffect();
+                        oneShot.OnEffectApplied();
+                    }
+                    if (step != living::MarkerConsumeStep::Idle)
+                    {
+                        // SetValue preserves the marker's durability semantics;
+                        // its bool maps to the typed clear result, so an
+                        // unconfirmed clear retries ONLY the clear, never the effect.
+                        bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
+                        if (oneShot.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
+                                                          : living::EventWriteResult::StateUnknown))
+                            oneShotMarkers[botGuid].erase(marker);
+                    }
+                };
+
+                consumeOneShot("create levelup", [&]()
                 {
                     PlayerbotFactory factory(bot, bot->GetLevel());
                     factory.Randomize(true, false);
-
-                    sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 0);
-                }
+                });
 
                 Player* master = nullptr;
 
@@ -980,10 +1006,22 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         existence, target != nullptr, membershipVerified,
                         joinAttempts - 1, /*maxAttempts*/ 10, /*baseDelaySeconds*/ 30);
 
+                    // Advance the retry/backoff bookkeeping ONLY when the durable
+                    // write is confirmed: a lost/ambiguous write used to advance
+                    // the in-memory backoff while the durable attempt count never
+                    // moved, replaying the join work and unbounding the budget.
+                    // SetValue's bool maps to the typed result the persist gate
+                    // consumes (unconfirmed collapses to a short holdoff).
+                    auto persistResult = [](bool confirmed)
+                    {
+                        return confirmed ? living::EventWriteResult::DesiredStateConfirmed
+                                         : living::EventWriteResult::StateUnknown;
+                    };
                     if (plan.decision == living::GroupJoinDecision::RetryLater)
                     {
-                        sRandomPlayerbotMgr.SetValue(botGuid, "create group", plan.attemptNumber + 1, groupWith);
-                        groupJoinBackoffUntil[botGuid] = time(0) + plan.retryDelaySeconds;
+                        bool const confirmed = sRandomPlayerbotMgr.SetValue(botGuid, "create group", plan.attemptNumber + 1, groupWith);
+                        living::GroupJoinPersist const persist = living::PlanGroupJoinPersist(plan.decision, persistResult(confirmed));
+                        groupJoinBackoffUntil[botGuid] = time(0) + (persist.advanceBackoff ? plan.retryDelaySeconds : 30u);
                     }
                     else
                     {
@@ -991,12 +1029,16 @@ void RandomPlayerbotMgr::LoginFreeBots()
                             sLog.outDetail("Bot %s: giving up on group target '%s' (%s)", bot->GetName(), groupWith.c_str(),
                                 existence == living::TargetExistence::ConfirmedMissing ? "target deleted" : "retry budget exhausted");
 
-                        sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
-                        groupJoinBackoffUntil.erase(botGuid);
+                        bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
+                        living::GroupJoinPersist const persist = living::PlanGroupJoinPersist(plan.decision, persistResult(cleared));
+                        if (persist.consumed)
+                            groupJoinBackoffUntil.erase(botGuid);
+                        else
+                            groupJoinBackoffUntil[botGuid] = time(0) + 30; // clear not confirmed: retry it, keep the marker
                     }
                 }
 
-                if (sRandomPlayerbotMgr.GetValue(botGuid, "create gear"))
+                consumeOneShot("create gear", [&]()
                 {
                     std::string gear = sRandomPlayerbotMgr.GetData(botGuid, "create gear");
                     if (gear == "empty")
@@ -1047,20 +1089,19 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         PlayerbotFactory factory(bot, bot->GetLevel());
                         factory.EquipGear();
                     }
-                }
+                });
 
-                if (GetEventValue(botGuid, "test"))
+                consumeOneShot("test", [&]()
                 {
                     PlayerbotAI* ai = bot->GetPlayerbotAI();
                     AiObjectContext* context = ai->GetAiObjectContext();
+                    (void)context;
                     std::string testName = GetEventData(botGuid, "test");
                     testName = std::regex_replace(testName, std::regex("\\'"), "'");
                     std::string strategyName = "test::" + testName;
                     ai->ChangeStrategy("+" + strategyName, BotState::BOT_STATE_NON_COMBAT);
                     SET_AI_VALUE2(bool, "manual bool", "is running test", true);
-
-                    sRandomPlayerbotMgr.SetValue(botGuid, "test", 0);
-                }
+                });
 
                 if (!IsRandomBot(bot) && GetPlayerBot(guid)) //Place bot in player manager.
                 {
@@ -2844,9 +2885,11 @@ void RandomPlayerbotMgr::PumpPendingRelocations()
         Player* bot = GetPlayerBot(botGuid);
         if (!bot)
         {
-            // The player is gone without the logout path having cancelled
-            // (defensive): release the record like every other logout.
-            relocations.Cancel(botGuid);
+            // The player is temporarily absent (logging out/in): a PendingAck
+            // record is released, but a Finalizing record's owed durable work is
+            // RETAINED across the gap and only dropped once the bounded offline
+            // watchdog expires, so a relogin resumes it exactly once.
+            relocations.NoteBotAbsent(botGuid);
             continue;
         }
 
@@ -2860,9 +2903,9 @@ void RandomPlayerbotMgr::PumpPendingRelocations()
     }
 }
 
-void RandomPlayerbotMgr::CancelPendingRelocation(uint32 botGuid)
+void RandomPlayerbotMgr::CancelPendingRelocation(uint32 botGuid, living::RelocationCancelMode mode)
 {
-    relocations.Cancel(botGuid);
+    relocations.Cancel(botGuid, mode);
 }
 
 // Returns Rejected when no candidate was accepted (nothing mutated) and Pending
@@ -4415,6 +4458,10 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
         ConsolePlayerCommandHandler handler;
         living::CommandTargetMode mode;
         bool acceptsParams;
+        // Set for commands whose operand is threaded to a param-aware handler
+        // (change_strategy). When present, `handler` is unused and this is
+        // invoked with the parsed operand instead.
+        ConsolePlayerCommandParamHandler paramHandler = nullptr;
     };
 
     std::map<std::string, PlayerCommandSpec> playerHandlers;
@@ -4425,7 +4472,7 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
     playerHandlers["rpg"] = { &RandomPlayerbotMgr::HandleRandomTeleportForRpg, living::CommandTargetMode::BulkAll, false };
     playerHandlers["revive"] = { &RandomPlayerbotMgr::HandleRevive, living::CommandTargetMode::BulkAll, false };
     playerHandlers["grind"] = { &RandomPlayerbotMgr::HandleRandomTeleport, living::CommandTargetMode::BulkAll, false };
-    playerHandlers["change_strategy"] = { &RandomPlayerbotMgr::HandleChangeStrategy, living::CommandTargetMode::ExactOne, true };
+    playerHandlers["change_strategy"] = { nullptr, living::CommandTargetMode::ExactOne, true, &RandomPlayerbotMgr::HandleChangeStrategy };
     playerHandlers["remove"] = { &RandomPlayerbotMgr::HandleRemove, living::CommandTargetMode::ExactOne, false };
 
     for (auto& [prefix, spec] : playerHandlers)
@@ -4505,7 +4552,9 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
             if (!bot)
                 continue;
 
-            std::list<std::string> messages = (sRandomPlayerbotMgr.*spec.handler)(bot);
+            std::list<std::string> messages = spec.paramHandler
+                ? (sRandomPlayerbotMgr.*spec.paramHandler)(bot, params)
+                : (sRandomPlayerbotMgr.*spec.handler)(bot);
             for (auto& msg : messages)
                 emit(msg);
         }
@@ -5062,7 +5111,9 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, 
 void RandomPlayerbotMgr::Remove(Player* bot)
 {
     uint32 owner = bot->GetGUIDLow();
-    CancelPendingRelocation(owner);
+    // Explicit removal (rows are about to be deleted): FORCE-cancel so even a
+    // Finalizing record's owed durable work is abandoned - the bot is gone.
+    CancelPendingRelocation(owner, living::RelocationCancelMode::Force);
 
     // Execution-confirmed delete: the cache is cleared only after the rows are
     // actually gone (a queued PExecute is not durable success, and clearing
@@ -5493,16 +5544,45 @@ std::list<std::string> RandomPlayerbotMgr::HandleRandomTeleport(Player* bot)
     return messages;
 }
 
-std::list<std::string> RandomPlayerbotMgr::HandleChangeStrategy(Player* bot)
+std::list<std::string> RandomPlayerbotMgr::HandleChangeStrategy(Player* bot, std::string const& strategySpec)
 {
+    // Apply the REQUESTED strategy. The command used to parse the operand and
+    // then discard it, calling RandomPlayerbotMgr::ChangeStrategy (a RANDOM
+    // grind/inn relocation - not a strategy change at all). Now the operand is
+    // validated against the bot's strategy registry (Engine::addStrategy
+    // silently no-ops an unknown name) and applied to its non-combat engine.
     std::list<std::string> messages;
-    if (!bot)
+    if (!bot || !bot->GetPlayerbotAI())
     {
         messages.push_back("Bot not found");
         return messages;
     }
-    ChangeStrategy(bot);
-    messages.push_back("change_strategy applied to " + std::string(bot->GetName()));
+
+    living::StrategyDirective directive;
+    switch (living::ParseStrategyDirective(strategySpec, directive))
+    {
+        case living::StrategyDirectiveParse::Empty:
+            messages.push_back(GetCommandTexts("change_strategy"));
+            return messages;
+        case living::StrategyDirectiveParse::Malformed:
+            messages.push_back("Invalid strategy '" + strategySpec + "'");
+            return messages;
+        case living::StrategyDirectiveParse::Parsed:
+            break;
+    }
+
+    PlayerbotAI* ai = bot->GetPlayerbotAI();
+    for (std::string const& name : directive.addedNames)
+    {
+        if (!ai->GetAiObjectContext()->GetStrategy(name))
+        {
+            messages.push_back("Unknown strategy '" + name + "'");
+            return messages;
+        }
+    }
+
+    ai->ChangeStrategy(directive.normalized, BotState::BOT_STATE_NON_COMBAT);
+    messages.push_back("change_strategy applied '" + directive.normalized + "' to " + std::string(bot->GetName()));
     return messages;
 }
 

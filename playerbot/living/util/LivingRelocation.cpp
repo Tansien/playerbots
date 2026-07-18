@@ -60,6 +60,10 @@ namespace living
 
         PendingRelocation& record = it->second;
 
+        // The bot is present and advancing this sweep: reset the offline
+        // watchdog so a later absence starts its bounded count fresh.
+        record.offlineSweeps = 0;
+
         // Runtime operations run exactly once; they are in-memory and cannot
         // fail, so their flags flip unconditionally.
         if (!record.runtimeResetDone)
@@ -240,9 +244,47 @@ namespace living
         return HomebindVerifyAction::Reissue;
     }
 
-    void RelocationTracker::Cancel(uint32_t botGuid)
+    bool RelocationTracker::Cancel(uint32_t botGuid, RelocationCancelMode mode)
     {
-        pending.erase(botGuid);
+        auto const it = pending.find(botGuid);
+        if (it == pending.end())
+            return false;
+
+        // Force, or a PendingAck record (nothing durable owed yet): drop it.
+        // Ordinary cancel of a Finalizing record RETAINS the ledger so its owed
+        // durable work resumes when the bot returns.
+        if (mode == RelocationCancelMode::Force || it->second.stage != RelocationStage::Finalizing)
+        {
+            pending.erase(it);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool RelocationTracker::NoteBotAbsent(uint32_t botGuid)
+    {
+        auto const it = pending.find(botGuid);
+        if (it == pending.end())
+            return false;
+
+        // A PendingAck record has no durable debt: drop it as soon as the bot is
+        // absent (event-driven retry markers own re-attempting). A Finalizing
+        // record is retained across the absence and only dropped once the
+        // bounded offline watchdog expires.
+        if (it->second.stage != RelocationStage::Finalizing)
+        {
+            pending.erase(it);
+            return true;
+        }
+
+        if (++it->second.offlineSweeps > kMaxOfflineSweeps)
+        {
+            pending.erase(it);
+            return true;
+        }
+
+        return false;
     }
 
     bool RelocationTracker::HasPending(uint32_t botGuid) const

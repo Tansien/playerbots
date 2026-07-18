@@ -542,3 +542,45 @@ LIVING_TEST(always_toggle_applies_only_on_confirmed_write)
     LIVING_CHECK(AlwaysToggleMayApply(true));   // confirmed -> apply runtime side effects
     LIVING_CHECK(!AlwaysToggleMayApply(false)); // unconfirmed -> leave runtime unchanged, report failure
 }
+
+LIVING_TEST(group_join_persist_advances_state_only_when_confirmed)
+{
+    // Finding N2: the group-join backoff/consume bookkeeping advances ONLY on a
+    // confirmed durable write; an unconfirmed write holds off and changes nothing.
+    auto ok = PlanGroupJoinPersist(GroupJoinDecision::RetryLater, EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(ok.advanceBackoff && !ok.consumed && !ok.holdoff);
+
+    auto notApplied = PlanGroupJoinPersist(GroupJoinDecision::RetryLater, EventWriteResult::DefinitelyNotApplied);
+    LIVING_CHECK(!notApplied.advanceBackoff && notApplied.holdoff);
+
+    auto unknown = PlanGroupJoinPersist(GroupJoinDecision::RetryLater, EventWriteResult::StateUnknown);
+    LIVING_CHECK(!unknown.advanceBackoff && unknown.holdoff);
+
+    for (GroupJoinDecision term : { GroupJoinDecision::ClearJoined, GroupJoinDecision::ClearTerminal })
+    {
+        LIVING_CHECK(PlanGroupJoinPersist(term, EventWriteResult::DesiredStateConfirmed).consumed);
+        LIVING_CHECK(!PlanGroupJoinPersist(term, EventWriteResult::DesiredStateConfirmed).holdoff);
+        LIVING_CHECK(PlanGroupJoinPersist(term, EventWriteResult::StateUnknown).holdoff);
+        LIVING_CHECK(!PlanGroupJoinPersist(term, EventWriteResult::StateUnknown).consumed);
+    }
+}
+
+LIVING_TEST(group_join_attempt_count_advances_only_on_confirmed_persist)
+{
+    // The durable attempt count (F8's bounded budget) may only advance when its
+    // increment write is confirmed; a lost/ambiguous write leaves it, so the
+    // budget cannot be silently unbounded by replayed login passes.
+    uint32_t durable = 1;
+    auto onePass = [&](EventWriteResult w) -> uint32_t
+    {
+        auto plan = PlanGroupJoinAttempt(TargetExistence::Found, true, false, durable - 1, 10, 30);
+        LIVING_CHECK(plan.decision == GroupJoinDecision::RetryLater);
+        if (PlanGroupJoinPersist(plan.decision, w).advanceBackoff)
+            durable = plan.attemptNumber + 1;
+        return plan.attemptNumber;
+    };
+    LIVING_CHECK(onePass(EventWriteResult::DefinitelyNotApplied) == 1 && durable == 1); // stuck: budget honored
+    LIVING_CHECK(onePass(EventWriteResult::StateUnknown)         == 1 && durable == 1);
+    LIVING_CHECK(onePass(EventWriteResult::DesiredStateConfirmed) == 1 && durable == 2); // advances only now
+    LIVING_CHECK(onePass(EventWriteResult::DesiredStateConfirmed) == 2 && durable == 3);
+}

@@ -6,6 +6,7 @@
 #include "Globals/ObjectMgr.h"
 #include "playerbot/GuidPosition.h"
 #include "playerbot/WorldPosition.h"
+#include "playerbot/living/util/LivingRetryBudget.h"
 
 class ObjectGuid;
 
@@ -40,9 +41,11 @@ namespace ai
         uint64_t spawnBotToken = 0;
         // Outstanding asynchronous batch for the `mgroup` command.
         uint64_t spawnGroupBatchToken = 0;
-        // Bounded deferrals for transient database unavailability during
-        // spawn (the DSL re-executes PENDING commands each tick).
-        uint8_t spawnTransientRetries = 0;
+        // Bounded deferrals for transient database unavailability during ONE
+        // spawn command (the DSL re-executes PENDING commands each tick). Reset
+        // on every terminal outcome and when a new spawn begins so an
+        // independent later spawn never inherits a previous spawn's spent budget.
+        living::TransientRetryBudget spawnTransientBudget;
         std::vector<std::string> monitors;
         std::vector<std::string> deferredCleanups;
         size_t cleanupPc;

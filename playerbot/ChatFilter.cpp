@@ -1166,97 +1166,35 @@ public:
     }
 #endif
 
-    inline std::string toLower(const std::string& str) {
-        std::string lowerStr = str;
-        std::transform(lowerStr.begin(), lowerStr.end(), lowerStr.begin(), ::tolower);
-        return lowerStr;
-    }
-
-    inline void replaceCaseInsensitive(std::string& str, const std::string& from, const std::string& to) {
-        std::string lowerStr = toLower(str);
-        std::string lowerFrom = toLower(from);
-
-        size_t pos = lowerStr.find(lowerFrom);
-        while (pos != std::string::npos) {
-            str.replace(pos, from.length(), to);
-            lowerStr.replace(pos, from.length(), toLower(to)); // Keep track of lowercase version for further searching
-            pos = lowerStr.find(lowerFrom, pos + to.length()); // Find next occurrence
-        }
-    }
-
     virtual std::string Filter(std::string message) override
     {
-        if (message.find("@quest=") == 0)
+        // Parse ONLY the leading @quest= selector. The legacy filter extracted
+        // every quest link from the whole message, selected on ANY of them, and
+        // stripped them all, so "@quest=<A> share <B>" could select a bot with
+        // only B and dispatch `share` with B removed. Inbound chat has no
+        // exception boundary, so the checked parser also rejects a lone "+" or an
+        // overflowing id without throwing.
+        living::QuestChatSelector selector;
+        switch (living::ParseQuestChatSelector(message, selector))
         {
-            std::string questString = message.substr(message.find("=") + 1);
-
-            std::set<uint32> questIds = ChatHelper::ExtractAllQuestIds(questString);
-
-            // The bare numeric form carries the ID in the FIRST token only, with
-            // the command after it ("@quest=523 status"). Inbound chat has no
-            // exception boundary: the old isValidNumberString + stoi pair accepted
-            // a lone "+" and threw on overflow ("@quest=9999999999").
-            bool bareForm = false;
-            std::string bareRemainder;
-            if (questIds.empty())
-            {
-                size_t const spacePos = questString.find(' ');
-                std::string const token = spacePos == std::string::npos ? questString : questString.substr(0, spacePos);
-
-                uint32 bareQuestId = 0;
-                if (!living::TryParseUInt32(token, bareQuestId))
-                    return ""; // malformed selector: never dispatch the trailing command
-
-                questIds.insert(bareQuestId);
-                bareForm = true;
-                if (spacePos != std::string::npos)
-                    bareRemainder = questString.substr(spacePos + 1);
-            }
-
-            // The help text promises bots that "have the quest and have yet
-            // finished it": match through the repaired incomplete-quest API, which
-            // requires the ID to be in the log, an INCOMPLETE/NONE status (a
-            // completed quest no longer selects), and a live template (a
-            // quarantined orphan slot occupies the log for capacity but is not a
-            // live quest and must not select this bot).
-            Player* bot = ai->GetBot();
-
-            bool matched = false;
-            for (auto questId : questIds)
-            {
-                if (bot->GetPlayerbotAI()->HasCurrentIncompleteQuestWithId(questId))
-                {
-                    matched = true;
-                    break;
-                }
-            }
-
-            // Strip the selector only AFTER a match, so an unmatched bot's message
-            // is returned untouched.
-            if (!matched)
+            case living::QuestChatSelectorParse::NotSelector:
                 return message;
-
-            if (bareForm)
-                return bareRemainder;
-
-            for (auto& questId : questIds)
-            {
-                Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
-                if (!questTemplate)
-                    continue;
-
-                replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
-                replaceCaseInsensitive(message, ChatHelper::formatQuest(questTemplate), "");
-            }
-
-            // Only the selector remains: matched, but nothing to dispatch.
-            if (message.find(' ') == std::string::npos)
-                return "";
-
-            return ChatFilter::Filter(message);
+            case living::QuestChatSelectorParse::Malformed:
+                return ""; // malformed selector: never dispatch a trailing command
+            case living::QuestChatSelectorParse::Parsed:
+                break;
         }
 
-        return message;
+        // The help text promises bots that "have the quest and have yet finished
+        // it": match through the incomplete-quest API (id present in the log,
+        // INCOMPLETE/NONE, backing a live template). Only the LEADING selector's
+        // id is consulted; an unmatched bot's message is returned untouched.
+        if (!ai->GetBot()->GetPlayerbotAI()->HasCurrentIncompleteQuestWithId(selector.questId))
+            return message;
+
+        // Matched: the leading selector is consumed exactly once; the command
+        // remainder (including any trailing quest-link operands) is preserved.
+        return selector.remainder;
     }
 };
 
