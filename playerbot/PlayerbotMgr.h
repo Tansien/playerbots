@@ -31,6 +31,17 @@ enum class AccountSelectOutcome
     AccountCreationFailed,
 };
 
+// Typed account-existence lookup. A failed query is NOT a missing account:
+// only a confirmed Missing may trigger account creation - creating (or
+// scanning past) an account because the lookup query failed duplicates
+// accounts and amplifies the outage.
+enum class AccountLookupOutcome
+{
+    Found,
+    Missing,
+    DatabaseUnavailable,
+};
+
 // Typed outcome of PlayerbotHolder::CreateBot. Callers must branch on `status`
 // (and use `guid` for the created character); `messages` is display text only
 // and must never be parsed to infer success. `createdClass`/`createdRole` are
@@ -159,11 +170,16 @@ public:
     static living::SlotReservationOutcome TryReserveCharacterSlot(uint32 accountId, uint32 durableCount);
     // Releases one reservation that never queued a save (pre-save failure).
     static void ReleaseCharacterSlot(uint32 accountId);
-    // Registers the execution-ordered bulk-reservation readback for one
-    // account (issued after the bulk saves were queued on the same FIFO
-    // thread); the pump releases the account's bulk reservations when it
-    // returns, keeps them on bounded failure.
+    // Registers one GENERATION-scoped execution-ordered bulk-reservation
+    // readback (issued after that generation's saves were queued on the same
+    // FIFO thread); the pump releases exactly that generation's reservations
+    // when its own barrier returns, keeps them on bounded failure. Never
+    // merges with earlier in-flight generations.
     static void BeginBulkReservationVerify(uint32 accountId, uint32 reservedSlots);
+    // Typed account-existence lookup by name (COUNT + MIN aggregate: a
+    // missing account is distinguishable from a failed query; the name is
+    // escaped here, once).
+    static AccountLookupOutcome TryLookupAccountId(std::string const& accountName, uint32& accountId);
     static uint32 MaxCharsPerAccount();
 
     std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security);
@@ -216,6 +232,10 @@ private:
         // Transient database-unavailability deferrals (bounded tick-based
         // backoff, separate from the creation retry budget).
         uint8 transientRetries = 0;
+        // Update passes to skip before the next attempt (paces the capacity
+        // precheck and creation retries instead of issuing a synchronous
+        // count every update tick during an outage).
+        uint8 transientBackoff = 0;
     };
 
     void UpdatePendingTests(uint32 elapsed);

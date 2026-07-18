@@ -1,5 +1,6 @@
 #pragma once
 
+#include "LivingBotCreation.h"
 #include "LivingCreationFinalizer.h"
 
 #include <cstddef>
@@ -12,46 +13,54 @@ namespace living
 {
     // Asynchronous completion propagation for group/test creation runs.
     //
-    // HandleGroup (and the mgroup test command) enqueue several creations
-    // whose durability is confirmed later by the creation finalizer. Without a
-    // batch record the per-run ledger died with the call: a member whose save
-    // rolled back or whose metadata failed was only ever logged, the requested
-    // group stayed silently undersized, and the test DSL had nothing to poll.
+    // HandleGroup (and the mgroup test command) plan several member slots
+    // whose creations are confirmed later by the creation finalizer. Exactly
+    // ONE batch owns a target group's deficit at a time: a repeated group
+    // command extends/coalesces onto the initiator's existing batch (or is
+    // refused when its options are incompatible) - it never creates an
+    // independent residual batch that could report success using members
+    // owned by an older batch that later fails.
     //
-    // A CreationBatch tracks every pending member token of one run. The
-    // finalizer's terminal completions are fed to OnCreationTerminal BEFORE
-    // the finalizer removes the creation record; a retryable member failure
-    // returns a replacement plan (bounded by the batch retry budget) carrying
-    // the reserved role/class of the failed slot, and terminal failures are
-    // recorded for the initiator/test surface instead of vanishing.
+    // Each planned slot is a stateful member:
+    //   AwaitingAttempt    - planned slot, no creation token yet (initial
+    //                        transient shortfall, or a replacement); retried
+    //                        with bounded tick-based pacing;
+    //   PendingPersistence - a creation token is outstanding;
+    //   Finalized          - the character exists; the slot stays OWNED until
+    //                        its verified group join (or batch expiry, the
+    //                        bounded terminal path for joins that never
+    //                        happen);
+    //   TerminalFailure    - recorded, surfaced, never silently shrunk away.
+    //
+    // Transient database unavailability keeps the slot in AwaitingAttempt and
+    // consumes its own bounded transient budget - never the semantic
+    // replacement budget, and never a terminal record until that budget is
+    // exhausted.
+
+    enum class BatchMemberState
+    {
+        AwaitingAttempt,
+        PendingPersistence,
+        Finalized,
+        TerminalFailure,
+    };
 
     struct CreationBatchMember
     {
-        uint64_t creationToken = 0;
-        uint8_t cls = 0;  // planned class of the reserved composition slot
-        uint8_t role = 0; // planned role (ai::BotRoles) of the reserved slot
-    };
-
-    // What the production caller owes after feeding one terminal completion.
-    struct BatchMemberResolution
-    {
-        uint64_t batchToken = 0;
-        // Set when the failed member should be replaced: the freed slot's
-        // planned role/class travel back so the replacement targets the SAME
-        // composition slot instead of rerolling the whole plan.
-        bool enqueueReplacement = false;
-        uint8_t cls = 0;
-        uint8_t role = 0;
-        // Human-readable failure to surface to the initiator/test queue
-        // (empty for successful members).
-        std::string failure;
+        uint64_t creationToken = 0; // nonzero only while PendingPersistence
+        uint8_t cls = 0;  // planned class (0 = drawn at attempt time)
+        uint8_t role = 0; // planned role (ai::BotRoles; 0 = drawn at attempt time)
+        BatchMemberState state = BatchMemberState::PendingPersistence;
+        uint32_t finalizedGuid = 0;  // set when Finalized
+        uint32_t transientRetries = 0;
+        uint64_t nextAttemptTick = 0; // pump tick pacing while AwaitingAttempt
     };
 
     enum class BatchPollStatus
     {
         Unknown,  // token never issued or already acknowledged/expired
-        Pending,  // members still awaiting terminal creation results
-        Complete, // every member reached a terminal result
+        Pending,  // members still awaiting attempts or terminal results
+        Complete, // every member is Finalized or TerminalFailure
     };
 
     struct BatchPollResult
@@ -63,11 +72,19 @@ namespace living
         std::vector<std::string> failures;
         // Desired-size invariant, computed at poll time for COMPLETE batches:
         // preexisting + finalized members fell short of the requested size.
-        // This catches shortfalls the failure list alone can miss (the
-        // initial run stopping on a terminal error or maxTries exhaustion
-        // before enough members were even queued) - a partial group must
-        // never report success.
+        // This catches shortfalls the failure list alone can miss - a partial
+        // group must never report success.
         bool undersized = false;
+    };
+
+    // A creation attempt the production pump owes for one AwaitingAttempt
+    // member whose pacing delay elapsed.
+    struct DueAttempt
+    {
+        uint64_t batchToken = 0;
+        size_t memberIndex = 0;
+        uint8_t cls = 0;
+        uint8_t role = 0;
     };
 
     class CreationBatchRegistry
@@ -79,20 +96,18 @@ namespace living
             std::string initiatorName; // master name or test identity
             uint32_t initiatorGuid = 0; // 0 for console/test batches
             uint32_t desiredSize = 0;
-            uint32_t preexistingMembers = 0;
-            std::vector<CreationBatchMember> pending;
-            std::vector<uint32_t> finalizedGuids;
+            uint32_t preexistingMembers = 0; // LIVE members when the batch began
+            std::vector<CreationBatchMember> members;
             uint32_t replacementBudget = 0;
             std::vector<std::string> failures;
-            // Creation parameters replacements must reuse (a replacement joins
-            // the SAME run, not a fresh default one).
+            // Creation parameters every attempt of this batch must reuse (a
+            // replacement or extension joins the SAME run, not a fresh one).
             std::string memberGear;
             bool memberAutoAdd = false;
             bool memberTemporary = false;
-            // Allocation mode of the ORIGINAL run: replacements must allocate
-            // on the same holder (random-account manager vs the initiator's
-            // personal manager) - a retry must never silently move a random
-            // group member onto the master's personal account.
+            // Allocation mode of the ORIGINAL run: attempts must allocate on
+            // the same holder (random-account manager vs the initiator's
+            // personal manager).
             bool useRandomAccounts = false;
             // Set once the completion summary has been surfaced.
             bool completionReported = false;
@@ -100,8 +115,12 @@ namespace living
 
         static constexpr size_t kMaxBatches = 16;
         // Completed batches are retained this many pumps for pollers that
-        // never acknowledge.
+        // never acknowledge; expiry is also the bounded terminal path for
+        // finalized members whose group join never completes.
         static constexpr uint64_t kRetentionPumps = 4096;
+        // Bounded transient-unavailability budget per member slot, paced.
+        static constexpr uint32_t kMaxTransientAttempts = 60;
+        static constexpr uint64_t kTransientBackoffPumps = 100; // ~5s of ticks
 
         // Registers a batch. Returns 0 when the bounded registry is full (the
         // caller reports the run as unmonitored rather than dropping members
@@ -117,71 +136,185 @@ namespace living
             return token;
         }
 
-        // Adds a (replacement) pending member to a live batch.
+        // Adds a pending-persistence member (initial run and extensions).
         bool AddPendingMember(uint64_t batchToken, CreationBatchMember member)
         {
             auto it = batches.find(batchToken);
             if (it == batches.end())
                 return false;
 
-            it->second.pending.push_back(member);
+            member.state = BatchMemberState::PendingPersistence;
+            it->second.members.push_back(member);
             return true;
         }
 
-        // Feeds one finalizer terminal completion. Returns the owed
-        // resolution when the token belonged to a live batch.
-        std::optional<BatchMemberResolution> OnCreationTerminal(CreationCompletion const& completion)
+        // Adds `count` planned-but-unattempted slots (initial run stopped on
+        // a transient failure, or an extension's residual deficit while the
+        // database is unavailable). They are attempted from the pump with
+        // pacing.
+        bool AddPlannedSlots(uint64_t batchToken, uint32_t count, uint64_t pumpCount)
+        {
+            auto it = batches.find(batchToken);
+            if (it == batches.end())
+                return false;
+
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                CreationBatchMember slot;
+                slot.state = BatchMemberState::AwaitingAttempt;
+                slot.nextAttemptTick = pumpCount + kTransientBackoffPumps;
+                it->second.members.push_back(slot);
+            }
+
+            return true;
+        }
+
+        // Raises the batch's target size (a compatible repeated request
+        // extends the EXISTING batch; it never shrinks).
+        bool ExtendDesiredSize(uint64_t batchToken, uint32_t desiredSize)
+        {
+            auto it = batches.find(batchToken);
+            if (it == batches.end())
+                return false;
+
+            if (desiredSize > it->second.desiredSize)
+                it->second.desiredSize = desiredSize;
+            return true;
+        }
+
+        // Feeds one finalizer terminal completion. The member transitions in
+        // place: Created -> Finalized (slot stays owned until verified join);
+        // FailedRetryable -> back to AwaitingAttempt within the replacement
+        // budget (the slot's planned class/role are retained), else a
+        // recorded terminal failure; terminal/quarantined -> recorded
+        // failure. Returns whether a batch consumed the completion.
+        bool OnCreationTerminal(CreationCompletion const& completion, uint64_t pumpCount)
         {
             for (auto& [token, batch] : batches)
             {
-                for (auto memberIt = batch.pending.begin(); memberIt != batch.pending.end(); ++memberIt)
+                for (CreationBatchMember& member : batch.members)
                 {
-                    if (memberIt->creationToken != completion.token)
+                    if (member.state != BatchMemberState::PendingPersistence
+                        || member.creationToken != completion.token)
                         continue;
 
-                    BatchMemberResolution resolution;
-                    resolution.batchToken = token;
-                    resolution.cls = memberIt->cls;
-                    resolution.role = memberIt->role;
-                    batch.pending.erase(memberIt);
-
+                    member.creationToken = 0;
                     switch (completion.status)
                     {
                         case CreationPollStatus::Created:
-                            batch.finalizedGuids.push_back(completion.guid);
+                            member.state = BatchMemberState::Finalized;
+                            member.finalizedGuid = completion.guid;
                             break;
                         case CreationPollStatus::FailedRetryable:
-                            // The planned slot is released; replace it while
-                            // the bounded budget lasts, otherwise record the
-                            // shortfall for the initiator.
                             if (batch.replacementBudget > 0)
                             {
                                 --batch.replacementBudget;
-                                resolution.enqueueReplacement = true;
+                                member.state = BatchMemberState::AwaitingAttempt;
+                                member.nextAttemptTick = pumpCount + 1;
                             }
                             else
+                            {
+                                member.state = BatchMemberState::TerminalFailure;
                                 batch.failures.push_back("member '" + completion.name
                                     + "' failed retryably and the replacement budget is exhausted: " + completion.message);
+                            }
                             break;
                         default:
+                            member.state = BatchMemberState::TerminalFailure;
                             batch.failures.push_back("member '" + completion.name
                                 + "' failed terminally: " + completion.message);
                             break;
                     }
 
-                    resolution.failure = resolution.enqueueReplacement || completion.status == CreationPollStatus::Created
-                        ? "" : batch.failures.back();
-                    return resolution;
+                    return true;
                 }
             }
 
-            return std::nullopt;
+            return false;
         }
 
-        // A batch is complete when no member is pending. (A replacement owed
-        // by a just-fed resolution must be enqueued - AddPendingMember - before
-        // the next completeness check; OnCreationTerminal and the replacement
-        // run in the same pump step.)
+        // Members whose paced attempt is due this pump. The caller performs
+        // each attempt synchronously and reports through OnAttemptResult.
+        std::vector<DueAttempt> TakeDueAttempts(uint64_t pumpCount)
+        {
+            std::vector<DueAttempt> due;
+            for (auto& [token, batch] : batches)
+            {
+                for (size_t i = 0; i < batch.members.size(); ++i)
+                {
+                    CreationBatchMember& member = batch.members[i];
+                    if (member.state != BatchMemberState::AwaitingAttempt || member.nextAttemptTick > pumpCount)
+                        continue;
+
+                    // Re-armed by OnAttemptResult; prevents double dispatch if
+                    // the caller skips an attempt.
+                    member.nextAttemptTick = pumpCount + kTransientBackoffPumps;
+                    due.push_back(DueAttempt{ token, i, member.cls, member.role });
+                }
+            }
+
+            return due;
+        }
+
+        // Reports one attempt's typed creation result for an AwaitingAttempt
+        // member. Transient failures keep the slot with paced, bounded
+        // retries and never consume the replacement budget; retryable
+        // failures consume it; terminal failures are recorded.
+        void OnAttemptResult(uint64_t batchToken, size_t memberIndex, BotCreateStatus status,
+            uint64_t creationToken, uint8_t actualClass, uint64_t pumpCount)
+        {
+            auto it = batches.find(batchToken);
+            if (it == batches.end() || memberIndex >= it->second.members.size())
+                return;
+
+            Batch& batch = it->second;
+            CreationBatchMember& member = batch.members[memberIndex];
+            if (member.state != BatchMemberState::AwaitingAttempt)
+                return;
+
+            switch (status)
+            {
+                case BotCreateStatus::PendingPersistence:
+                    member.state = BatchMemberState::PendingPersistence;
+                    member.creationToken = creationToken;
+                    member.cls = actualClass;
+                    member.transientRetries = 0;
+                    break;
+                case BotCreateStatus::TransientFailure:
+                    if (++member.transientRetries >= kMaxTransientAttempts)
+                    {
+                        member.state = BatchMemberState::TerminalFailure;
+                        batch.failures.push_back("member slot abandoned: database unavailable through the bounded retry budget");
+                    }
+                    else
+                        member.nextAttemptTick = pumpCount + kTransientBackoffPumps;
+                    break;
+                case BotCreateStatus::RetryableFailure:
+                    if (batch.replacementBudget > 0)
+                    {
+                        --batch.replacementBudget;
+                        member.nextAttemptTick = pumpCount + 1;
+                    }
+                    else
+                    {
+                        member.state = BatchMemberState::TerminalFailure;
+                        batch.failures.push_back("member slot failed retryably and the replacement budget is exhausted");
+                    }
+                    break;
+                case BotCreateStatus::Created: // defensive: creation is normally async
+                    member.state = BatchMemberState::Finalized;
+                    break;
+                case BotCreateStatus::TerminalFailure:
+                default:
+                    member.state = BatchMemberState::TerminalFailure;
+                    batch.failures.push_back("member slot failed terminally at creation");
+                    break;
+            }
+        }
+
+        // A batch is complete when no member awaits an attempt or a terminal
+        // creation result. (Finalized members may still owe their group join;
+        // the OUTSTANDING accounting below keeps owning those slots.)
         BatchPollResult Poll(uint64_t batchToken, bool acknowledgeComplete)
         {
             BatchPollResult result;
@@ -190,13 +323,22 @@ namespace living
                 return result;
 
             Batch const& batch = it->second;
-            result.status = batch.pending.empty() ? BatchPollStatus::Complete : BatchPollStatus::Pending;
+            bool anyOutstanding = false;
+            for (CreationBatchMember const& member : batch.members)
+            {
+                if (member.state == BatchMemberState::AwaitingAttempt
+                    || member.state == BatchMemberState::PendingPersistence)
+                    anyOutstanding = true;
+                else if (member.state == BatchMemberState::Finalized)
+                    result.finalizedGuids.push_back(member.finalizedGuid);
+            }
+
+            result.status = anyOutstanding ? BatchPollStatus::Pending : BatchPollStatus::Complete;
             result.desiredSize = batch.desiredSize;
             result.preexistingMembers = batch.preexistingMembers;
-            result.finalizedGuids = batch.finalizedGuids;
             result.failures = batch.failures;
             result.undersized = result.status == BatchPollStatus::Complete
-                && batch.preexistingMembers + batch.finalizedGuids.size() < batch.desiredSize;
+                && batch.preexistingMembers + result.finalizedGuids.size() < batch.desiredSize;
 
             if (result.status == BatchPollStatus::Complete && acknowledgeComplete)
                 batches.erase(it);
@@ -211,43 +353,6 @@ namespace living
             return it == batches.end() ? nullptr : &it->second;
         }
 
-        // Outstanding group slots already owned by this initiator's batches:
-        // pending creations PLUS finalized members that have not yet joined
-        // the group (`isJoined(guid)` decides). A repeated group command must
-        // count these as effective membership - a finalized-but-not-joined
-        // member still occupies its slot, and only verified membership (or
-        // batch expiry, the bounded terminal path for joins that never
-        // happen) releases it.
-        template <typename JoinedFn>
-        uint32_t OutstandingSlotsForInitiator(uint32_t initiatorGuid, JoinedFn&& isJoined) const
-        {
-            uint32_t outstanding = 0;
-            for (auto const& [token, batch] : batches)
-            {
-                if (batch.initiatorGuid != initiatorGuid || initiatorGuid == 0)
-                    continue;
-
-                outstanding += static_cast<uint32_t>(batch.pending.size());
-                for (uint32_t const guid : batch.finalizedGuids)
-                    if (!isJoined(guid))
-                        ++outstanding;
-            }
-
-            return outstanding;
-        }
-
-        // The initiator's most recent still-tracked batch (0 when none): a
-        // repeated command coalesces onto it instead of enqueueing a second
-        // deficit.
-        uint64_t FindBatchTokenForInitiator(uint32_t initiatorGuid) const
-        {
-            uint64_t newest = 0;
-            for (auto const& [token, batch] : batches)
-                if (initiatorGuid != 0 && batch.initiatorGuid == initiatorGuid && token > newest)
-                    newest = token;
-            return newest;
-        }
-
         // Records a failure produced OUTSIDE the finalizer (immediate
         // replacement-creation failure, initiator offline).
         bool RecordFailure(uint64_t batchToken, std::string failure)
@@ -260,15 +365,82 @@ namespace living
             return true;
         }
 
-        // Batches whose members all reached terminal results and whose
-        // completion has not been surfaced yet. Each batch is returned exactly
-        // once; the requested group is never left silently undersized.
+        // Outstanding group slots already owned by this initiator's batches:
+        // planned/pending creations PLUS finalized members that have not yet
+        // joined the group (`isJoined(guid)` decides). A repeated group
+        // command must count these as effective membership; only verified
+        // membership (or batch expiry) releases a slot.
+        template <typename JoinedFn>
+        uint32_t OutstandingSlotsForInitiator(uint32_t initiatorGuid, JoinedFn&& isJoined) const
+        {
+            uint32_t outstanding = 0;
+            ForEachOutstandingMember(initiatorGuid, isJoined,
+                [&outstanding](CreationBatchMember const&) { ++outstanding; });
+            return outstanding;
+        }
+
+        // Visits every outstanding member slot (planned, pending, or
+        // finalized-but-not-joined) the initiator's batches own - extension
+        // runs subtract their classes/roles from the composition quotas so
+        // older allocations constrain newer selections.
+        template <typename JoinedFn, typename MemberFn>
+        void ForEachOutstandingMember(uint32_t initiatorGuid, JoinedFn&& isJoined, MemberFn&& fn) const
+        {
+            if (initiatorGuid == 0)
+                return;
+
+            for (auto const& [token, batch] : batches)
+            {
+                if (batch.initiatorGuid != initiatorGuid)
+                    continue;
+
+                for (CreationBatchMember const& member : batch.members)
+                {
+                    switch (member.state)
+                    {
+                        case BatchMemberState::AwaitingAttempt:
+                        case BatchMemberState::PendingPersistence:
+                            fn(member);
+                            break;
+                        case BatchMemberState::Finalized:
+                            if (!isJoined(member.finalizedGuid))
+                                fn(member);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+
+        // The initiator's most recent still-tracked batch (0 when none): the
+        // single owner of that group's deficit; a repeated command extends it
+        // instead of enqueueing a second one.
+        uint64_t FindBatchTokenForInitiator(uint32_t initiatorGuid) const
+        {
+            uint64_t newest = 0;
+            for (auto const& [token, batch] : batches)
+                if (initiatorGuid != 0 && batch.initiatorGuid == initiatorGuid && token > newest)
+                    newest = token;
+            return newest;
+        }
+
+        // Batches whose members all reached terminal creation results and
+        // whose completion has not been surfaced yet. Each batch is returned
+        // exactly once; the requested group is never left silently
+        // undersized.
         std::vector<Batch const*> TakeNewlyCompleted()
         {
             std::vector<Batch const*> completed;
             for (auto& [token, batch] : batches)
             {
-                if (batch.pending.empty() && !batch.completionReported)
+                bool anyOutstanding = false;
+                for (CreationBatchMember const& member : batch.members)
+                    if (member.state == BatchMemberState::AwaitingAttempt
+                        || member.state == BatchMemberState::PendingPersistence)
+                        anyOutstanding = true;
+
+                if (!anyOutstanding && !batch.completionReported)
                 {
                     batch.completionReported = true;
                     completed.push_back(&batch);
@@ -284,7 +456,13 @@ namespace living
             for (auto it = batches.begin(); it != batches.end();)
             {
                 Batch& batch = it->second;
-                if (batch.pending.empty())
+                bool anyOutstanding = false;
+                for (CreationBatchMember const& member : batch.members)
+                    if (member.state == BatchMemberState::AwaitingAttempt
+                        || member.state == BatchMemberState::PendingPersistence)
+                        anyOutstanding = true;
+
+                if (!anyOutstanding)
                 {
                     if (completedAtPump.find(it->first) == completedAtPump.end())
                         completedAtPump[it->first] = pumpCount;

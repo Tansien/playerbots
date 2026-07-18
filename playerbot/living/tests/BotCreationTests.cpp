@@ -283,80 +283,148 @@ LIVING_TEST(bounded_draw_rejection_sampling_is_unbiased)
 
 LIVING_TEST(activation_plan_confirms_all_writes_before_reporting_success)
 {
-    // The durable activation boundary: the complete plan (add, logout, login,
-    // update) must be execution-confirmed BEFORE any login starts. Each write
-    // failing independently compensates the already-written prefix back to
-    // the known priors; only an uncertain compensation reports the dirty
-    // outcome. A failure never leaves a partial plan in place.
+    // The durable activation boundary consumes TYPED write results: a write
+    // reporting failure may still have applied (StateUnknown), so
+    // compensation restores the failed index itself in that case - the old
+    // bool contract silently assumed a failed writer never mutated.
     auto makePlan = []()
     {
         return std::vector<PlannedEventWrite>{
             { "add", 1, 600, 0, 0 },
             { "logout", 0, 0, 0, 0 },
             { "login", 1, 4294967295u, 0, 0 },
-            { "update", 1, 120, 0, 0 },
+            { "update", 1, 120, 7, 55 }, // a KNOWN nonzero prior
         };
     };
 
-    // All writes succeed: Persisted, in plan order, no compensation.
+    // All writes confirmed: Persisted, in plan order, no compensation.
     {
         std::vector<std::string> writes;
         auto outcome = ExecuteActivationPlan(makePlan(),
-            [&](std::string const& event, uint32_t value, uint32_t) { writes.push_back(event + "=" + std::to_string(value)); return true; });
+            [&](std::string const& event, uint32_t value, uint32_t)
+            {
+                writes.push_back(event + "=" + std::to_string(value));
+                return EventWriteResult::DesiredStateConfirmed;
+            });
         LIVING_CHECK(outcome == ActivationOutcome::Persisted);
         LIVING_CHECK(writes.size() == 4);
         LIVING_CHECK(writes[0] == "add=1" && writes[3] == "update=1");
     }
 
-    // Independent failure of EACH of the four writes: the written prefix is
-    // compensated in reverse order, and the outcome is FailedCompensated.
-    for (size_t failAt = 0; failAt < 4; ++failAt)
+    // DefinitelyNotApplied at index 0: provably untouched - NO compensation
+    // is owed at all.
+    {
+        size_t calls = 0;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const&, uint32_t, uint32_t)
+            {
+                ++calls;
+                return EventWriteResult::DefinitelyNotApplied;
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
+        LIVING_CHECK(calls == 1);
+    }
+
+    // StateUnknown at index 0: the write MAY have applied despite the
+    // report - the failed index ITSELF is restored (this is the case the old
+    // bool contract got wrong: `add=1` landing while reporting failure left
+    // a durable activation memory considered absent).
     {
         std::vector<std::string> writes;
-        size_t attempt = 0;
+        size_t calls = 0;
         auto outcome = ExecuteActivationPlan(makePlan(),
             [&](std::string const& event, uint32_t value, uint32_t)
             {
                 writes.push_back(event + "=" + std::to_string(value));
-                return attempt++ != failAt; // the failAt-th write fails
+                return calls++ == 0 ? EventWriteResult::StateUnknown
+                                    : EventWriteResult::DesiredStateConfirmed;
             });
         LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
-        // failAt writes succeeded, one failed, failAt compensations followed.
-        LIVING_CHECK(writes.size() == failAt + 1 + failAt);
-        if (failAt > 0)
-        {
-            // The LAST compensation restores the FIRST written event (reverse
-            // order), back to its prior value.
-            LIVING_CHECK(writes.back() == "add=0");
-        }
+        LIVING_CHECK(writes.size() == 2);
+        LIVING_CHECK(writes[1] == "add=0"); // the ambiguous index restored to prior
     }
 
-    // Compensation itself failing: the dirty outcome - the caller must mark
-    // its in-memory view for reconciliation, and still must not start.
+    // StateUnknown at a LATER index: the failed index AND every confirmed
+    // earlier write are restored, in reverse order, to their priors.
     {
-        size_t attempt = 0;
+        std::vector<std::string> writes;
+        size_t calls = 0;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const& event, uint32_t value, uint32_t validIn)
+            {
+                writes.push_back(event + "=" + std::to_string(value) + "/" + std::to_string(validIn));
+                return calls++ == 3 ? EventWriteResult::StateUnknown
+                                    : EventWriteResult::DesiredStateConfirmed;
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
+        // 4 plan writes + 4 restores (update itself, then login, logout, add).
+        LIVING_CHECK(writes.size() == 8);
+        LIVING_CHECK(writes[4] == "update=7/55"); // failed index restored FIRST, to its PRIOR
+        LIVING_CHECK(writes[7] == "add=0/0");
+    }
+
+    // DefinitelyNotApplied at a later index: only the confirmed prefix is
+    // restored - the failed write provably left its own event untouched.
+    {
+        std::vector<std::string> writes;
+        size_t calls = 0;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const& event, uint32_t value, uint32_t)
+            {
+                writes.push_back(event + "=" + std::to_string(value));
+                return calls++ == 1 ? EventWriteResult::DefinitelyNotApplied
+                                    : EventWriteResult::DesiredStateConfirmed;
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
+        LIVING_CHECK(writes.size() == 3); // 2 writes + 1 restore (index 0 only)
+        LIVING_CHECK(writes.back() == "add=0");
+    }
+
+    // A restore counts ONLY when the prior state is CONFIRMED: an unknown
+    // restore of the failed index reports uncertain compensation, forcing
+    // the caller's dirty/reconciliation path.
+    {
+        size_t calls = 0;
         auto outcome = ExecuteActivationPlan(makePlan(),
             [&](std::string const&, uint32_t, uint32_t)
             {
-                ++attempt;
-                return attempt == 1; // first write ok, everything after fails
+                ++calls;
+                if (calls == 1) return EventWriteResult::StateUnknown;      // plan write fails ambiguously
+                return EventWriteResult::StateUnknown;                       // its restore is ALSO unknown
             });
         LIVING_CHECK(outcome == ActivationOutcome::FailedCompensationUncertain);
     }
 
-    // Priors are restored as PRIOR values, not blindly zero: a plan over a
-    // previously-active event compensates back to that active value.
+    // Prefix restoration failure: earlier confirmed writes that cannot be
+    // confirmed restored are uncertain too.
     {
-        std::vector<PlannedEventWrite> plan = { { "update", 1, 120, /*prior*/ 7, /*priorValidIn*/ 55 }, { "login", 1, 1, 0, 0 } };
-        std::vector<std::string> writes;
-        size_t attempt = 0;
-        auto outcome = ExecuteActivationPlan(plan,
-            [&](std::string const& event, uint32_t value, uint32_t validIn)
+        size_t calls = 0;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const&, uint32_t, uint32_t)
             {
-                writes.push_back(event + "=" + std::to_string(value) + "/" + std::to_string(validIn));
-                return attempt++ != 1; // only the second plan write fails
+                ++calls;
+                if (calls == 1) return EventWriteResult::DesiredStateConfirmed; // add applied
+                if (calls == 2) return EventWriteResult::DefinitelyNotApplied;  // logout provably untouched
+                return EventWriteResult::StateUnknown;                          // restoring add: unknown
             });
-        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
-        LIVING_CHECK(writes.back() == "update=7/55");
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensationUncertain);
+    }
+
+    // A restore that lands as DefinitelyNotApplied (failed before mutating,
+    // prior unchanged) is NOT a confirmed restore of the requested prior
+    // unless the prior already matched - the executor requires
+    // DesiredStateConfirmed. Here the failed-index restore reports
+    // DefinitelyNotApplied against a NONZERO prior: uncertain.
+    {
+        std::vector<PlannedEventWrite> plan = { { "update", 1, 120, /*prior*/ 7, 55 } };
+        size_t calls = 0;
+        auto outcome = ExecuteActivationPlan(plan,
+            [&](std::string const&, uint32_t, uint32_t)
+            {
+                ++calls;
+                if (calls == 1) return EventWriteResult::StateUnknown;
+                return EventWriteResult::DefinitelyNotApplied; // restore did not run either
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensationUncertain);
     }
 }

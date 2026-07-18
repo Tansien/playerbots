@@ -2972,15 +2972,19 @@ namespace
             uint32 botsNearTeleportPoint = 0;
             sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* otherBot)
             {
-                // Only check the bots that are in the same zone. The
-                // RELOCATING bot itself never counts against its own
-                // destination (it leaves its current spot by moving there);
-                // a bot with an in-flight relocation record is skipped here
-                // and counted through its destination reservation below, so
-                // each bot contributes exactly once.
+                // ONE spatial predicate for live occupants and reservations:
+                // same map + configured 2D radius, self excluded - the
+                // reservation scan uses exactly this, so an identical
+                // placement counts the same before and after finalization
+                // (the old zone-equality gate made a bot across a zone
+                // boundary count while pending and vanish once finalized).
+                // The RELOCATING bot itself never counts against its own
+                // destination; a bot with an in-flight relocation record is
+                // skipped here and counted through its destination
+                // reservation below, so each bot contributes exactly once.
                 if (otherBot && otherBot != bot && !otherBot->IsBeingTeleported()
                     && !sRandomPlayerbotMgr.HasPendingRelocation(otherBot->GetGUIDLow())
-                    && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
+                    && otherBot->GetMapId() == mapId)
                 {
                     if (destination.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
                         botsNearTeleportPoint++;
@@ -4034,7 +4038,11 @@ bool RandomPlayerbotMgr::RunActivationPlan(uint32 bot, std::vector<living::Plann
     switch (living::ExecuteActivationPlan(plan,
         [this, bot](std::string const& event, uint32 value, uint32 validIn)
         {
-            return SetEventValue(bot, event, value, validIn);
+            // TYPED durability result: the plan executor must distinguish "the
+            // failed write provably did not mutate" from "it may have applied
+            // despite reporting failure" - the latter restores the failed
+            // event itself during compensation.
+            return SetEventValueEx(bot, event, value, validIn);
         }))
     {
         case living::ActivationOutcome::Persisted:
@@ -4076,6 +4084,11 @@ std::string RandomPlayerbotMgr::GetEventData(uint32 bot, std::string event)
 
 bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data)
 {
+    return SetEventValueEx(bot, event, value, validIn, data) == living::EventWriteResult::DesiredStateConfirmed;
+}
+
+living::EventWriteResult RandomPlayerbotMgr::SetEventValueEx(uint32 bot, std::string const& event, uint32 value, uint32 validIn, std::string const& data)
+{
     // This is the shared persistence boundary for event metadata, and callers
     // legitimately pass user-influenced strings (e.g. CreateBot's gear/group
     // values).
@@ -4088,8 +4101,28 @@ bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 val
     {
         sLog.outError("SetEventValue rejected for bot %u: event '%s' (%zu bytes, max %zu) or data (%zu bytes, max %zu) exceeds the schema",
             bot, event.c_str(), event.size(), living::EVENT_NAME_MAX_BYTES, data.size(), living::EVENT_DATA_MAX_BYTES);
-        return false;
+        return living::EventWriteResult::DefinitelyNotApplied;
     }
+
+    // Capture the KNOWN prior state (raw cached value, expiry not applied)
+    // BEFORE any statement: a reported execution failure is classified
+    // against it - "the prior value remained" is DefinitelyNotApplied, "the
+    // requested value landed anyway" is DesiredStateConfirmed, anything else
+    // is StateUnknown.
+    uint32 priorRawValue = 0;
+    bool priorPresent = false;
+    if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
+    {
+        if (auto entry = botCache->second.find(event); entry != botCache->second.end())
+        {
+            priorRawValue = entry->second.value;
+            priorPresent = true;
+        }
+    }
+    living::EventCacheLoadState priorLoadState = living::EventCacheLoadState::Unloaded;
+    if (auto stateIt = eventCacheLoadState.find(bot); stateIt != eventCacheLoadState.end())
+        priorLoadState = stateIt->second;
+    bool const priorKnown = living::EventValueKnown(priorLoadState, priorPresent);
 
     // Escape here, once: an unescaped quote used to delete the prior row, fail
     // the INSERT, and leave the in-memory cache diverged from the DB. The
@@ -4145,22 +4178,48 @@ bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 val
 
     if (outcome == living::EventPersistOutcome::Rejected || outcome == living::EventPersistOutcome::ProbeFailed)
     {
+        // Both happen BEFORE any mutating statement: prior state is
+        // confirmed unchanged.
         sLog.outError("SetEventValue could not persist event '%s' for bot %u (%s); cache left unchanged",
             event.c_str(), bot, outcome == living::EventPersistOutcome::Rejected ? "schema" : "probe failed");
-        return false;
+        return living::EventWriteResult::DefinitelyNotApplied;
     }
 
     if (outcome == living::EventPersistOutcome::ExecuteFailed)
     {
-        // The statement failed after the probe: durable state is uncertain, so
-        // reload it instead of publishing the intended value optimistically. A
-        // failed reload NEVER becomes confirmed absence: the prior known value
-        // stays cached and the entry is marked dirty for a later retry.
+        // The statement REPORTED failure after the probe - which is not proof
+        // it did not mutate. Reload and classify against the requested and
+        // prior states; a failed reload NEVER becomes confirmed absence: the
+        // prior known value stays cached, the entry is marked dirty, and the
+        // result is StateUnknown so compensating callers restore this event
+        // too.
         sLog.outError("SetEventValue failed to persist event '%s' for bot %u; reloading durable value", event.c_str(), bot);
-        if (ReloadEventRow(bot, event) == living::EventReloadOutcome::QueryFailed)
-            dirtyEvents[bot].insert(event);
+        switch (ReloadEventRow(bot, event))
+        {
+            case living::EventReloadOutcome::Found:
+            {
+                uint32 durableValue = 0;
+                if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
+                    if (auto entry = botCache->second.find(event); entry != botCache->second.end())
+                        durableValue = entry->second.value;
 
-        return false;
+                if (durableValue == value)
+                    return living::EventWriteResult::DesiredStateConfirmed; // landed despite the report
+                if (priorKnown && priorPresent && durableValue == priorRawValue)
+                    return living::EventWriteResult::DefinitelyNotApplied;  // prior state remained
+                return living::EventWriteResult::StateUnknown;
+            }
+            case living::EventReloadOutcome::ConfirmedAbsent:
+                if (value == 0)
+                    return living::EventWriteResult::DesiredStateConfirmed; // the delete landed
+                if (priorKnown && !priorPresent)
+                    return living::EventWriteResult::DefinitelyNotApplied;  // confirmed-absent before AND after
+                return living::EventWriteResult::StateUnknown;
+            case living::EventReloadOutcome::QueryFailed:
+            default:
+                dirtyEvents[bot].insert(event);
+                return living::EventWriteResult::StateUnknown;
+        }
     }
 
     CachedEvent e(value, now, validIn, data);
@@ -4174,7 +4233,7 @@ bool RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string event, uint32 val
             dirtyEvents.erase(botDirty);
     }
 
-    return true;
+    return living::EventWriteResult::DesiredStateConfirmed;
 }
 
 living::EventReloadOutcome RandomPlayerbotMgr::ReloadEventRow(uint32 bot, std::string const& event)
@@ -5591,41 +5650,58 @@ AccountSelectOutcome RandomPlayerbotMgr::GetOrCreateAccount(Player* master, uint
         accountNameStr << sPlayerbotAIConfig.randomBotAccountPrefix << accountNumber;
         std::string accountName = accountNameStr.str();
 
-        uint32 candidateId = sAccountMgr.GetId(accountName);
-
-        if (!candidateId)
+        // Typed existence lookup: only a CONFIRMED Missing may create an
+        // account. A failed lookup (the cores' GetId collapses it to 0) used
+        // to launch account creation as a side effect of a database outage.
+        uint32 candidateId = 0;
+        switch (TryLookupAccountId(accountName, candidateId))
         {
-            std::string password;
-            if (sPlayerbotAIConfig.randomBotRandomPassword)
+            case AccountLookupOutcome::Found:
+                break; // capacity check below
+            case AccountLookupOutcome::DatabaseUnavailable:
+                error = "Database unavailable while looking up bot account";
+                return AccountSelectOutcome::DatabaseUnavailable; // abort the scan
+            case AccountLookupOutcome::Missing:
             {
-                for (int i = 0; i < 10; i++)
-                    password += (char)urand('!', 'z');
-            }
-            else
-                password = accountName;
-
-            LoginDatabase.BeginTransaction();
-#ifndef MANGOSBOT_ZERO
-            uint8 max_expansion = MAX_EXPANSION;
-            AccountOpResult result = sAccountMgr.CreateAccount(accountName, password, max_expansion);
-#else
-            AccountOpResult result = sAccountMgr.CreateAccount(accountName, password);
-#endif
-            LoginDatabase.CommitTransactionDirect();
-
-            if (result == AOR_OK)
-            {
-                uint32 createdId = sAccountMgr.GetId(accountName);
-                if (createdId)
+                std::string password;
+                if (sPlayerbotAIConfig.randomBotRandomPassword)
                 {
-                    sPlayerbotAIConfig.randomBotAccounts.push_back(createdId);
-                    accountId = createdId;
-                    return AccountSelectOutcome::Found;
+                    for (int i = 0; i < 10; i++)
+                        password += (char)urand('!', 'z');
                 }
-            }
+                else
+                    password = accountName;
 
-            error = "Failed to create account";
-            return AccountSelectOutcome::AccountCreationFailed;
+                LoginDatabase.BeginTransaction();
+#ifndef MANGOSBOT_ZERO
+                uint8 max_expansion = MAX_EXPANSION;
+                AccountOpResult result = sAccountMgr.CreateAccount(accountName, password, max_expansion);
+#else
+                AccountOpResult result = sAccountMgr.CreateAccount(accountName, password);
+#endif
+                LoginDatabase.CommitTransactionDirect();
+
+                if (result == AOR_OK)
+                {
+                    // Verify the created account through the SAME typed path.
+                    uint32 createdId = 0;
+                    switch (TryLookupAccountId(accountName, createdId))
+                    {
+                        case AccountLookupOutcome::Found:
+                            sPlayerbotAIConfig.randomBotAccounts.push_back(createdId);
+                            accountId = createdId;
+                            return AccountSelectOutcome::Found;
+                        case AccountLookupOutcome::DatabaseUnavailable:
+                            error = "Database unavailable while verifying the created bot account";
+                            return AccountSelectOutcome::DatabaseUnavailable;
+                        case AccountLookupOutcome::Missing:
+                            break; // creation claimed success but the account is confirmed absent
+                    }
+                }
+
+                error = "Failed to create account";
+                return AccountSelectOutcome::AccountCreationFailed;
+            }
         }
 
         // Durable characters PLUS pending/quarantined creation reservations:

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LivingEventSchema.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -17,6 +19,12 @@ namespace living
     // any login starts or any in-memory list changes; a partial plan is
     // compensated back to the known prior values, and only an UNCERTAIN
     // compensation forces the dirty-reconciliation path.
+    //
+    // Writes report the typed EventWriteResult, never a bool: a write that
+    // REPORTS failure may still have applied durably (the setter reloads and
+    // classifies), so compensation must also restore the FAILED index itself
+    // whenever its durable state is unknown - the old bool contract silently
+    // assumed a failed writer never mutated.
 
     // One planned event write plus the KNOWN prior state to restore on
     // compensation (value 0 deletes the row, matching SetEventValue).
@@ -31,39 +39,60 @@ namespace living
 
     enum class ActivationOutcome
     {
-        // Every write execution-confirmed: the caller may start the login and
-        // mutate its in-memory state.
+        // Every write confirmed at the requested state: the caller may start
+        // the login and mutate its in-memory state.
         Persisted,
-        // A write failed and every already-written value was restored to its
-        // known prior state: nothing durable changed, nothing may start.
+        // A write failed and every value that may have changed - including
+        // the failed write itself when its durable state was unknown - was
+        // CONFIRMED restored to its known prior state: nothing durable
+        // changed, nothing may start.
         FailedCompensated,
-        // A write failed AND compensation failed: durable state is uncertain -
-        // the caller must mark its in-memory view dirty and reconcile before
-        // trusting it again. Nothing may start.
+        // A write failed AND at least one restore could not be CONFIRMED at
+        // the prior state: durable state is uncertain - the caller must mark
+        // its in-memory view dirty and reconcile before trusting it again.
+        // Nothing may start.
         FailedCompensationUncertain,
     };
 
     // Executes the plan in order through `write(event, value, validIn) ->
-    // bool` (an execution-confirmed setter). On the first failure the
-    // already-written prefix is restored in reverse order.
+    // EventWriteResult`. On the first non-confirmed write, restores in
+    // reverse order: the failed index itself is restored too when its result
+    // was StateUnknown (it may have mutated despite reporting failure); a
+    // DefinitelyNotApplied failure provably left its own event untouched, so
+    // only the confirmed earlier writes are restored. A restore counts only
+    // when the prior state is CONFIRMED - anything else is uncertain.
     template <typename WriteFn>
     ActivationOutcome ExecuteActivationPlan(std::vector<PlannedEventWrite> const& plan, WriteFn&& write)
     {
-        size_t written = 0;
-        for (; written < plan.size(); ++written)
+        size_t failedIndex = plan.size();
+        EventWriteResult failure = EventWriteResult::DefinitelyNotApplied;
+        for (size_t i = 0; i < plan.size(); ++i)
         {
-            if (!write(plan[written].event, plan[written].value, plan[written].validIn))
-                break;
+            EventWriteResult const result = write(plan[i].event, plan[i].value, plan[i].validIn);
+            if (result == EventWriteResult::DesiredStateConfirmed)
+                continue;
+
+            failedIndex = i;
+            failure = result;
+            break;
         }
 
-        if (written == plan.size())
+        if (failedIndex == plan.size())
             return ActivationOutcome::Persisted;
 
-        bool compensated = true;
-        for (size_t i = written; i-- > 0;)
-            compensated = write(plan[i].event, plan[i].priorValue, plan[i].priorValidIn) && compensated;
+        // StateUnknown: the failed write may have applied - restore it too.
+        // DefinitelyNotApplied: provably untouched - restore only the prefix.
+        size_t const restoreFrom = failure == EventWriteResult::StateUnknown ? failedIndex + 1 : failedIndex;
 
-        return compensated ? ActivationOutcome::FailedCompensated
-                           : ActivationOutcome::FailedCompensationUncertain;
+        bool restoresConfirmed = true;
+        for (size_t i = restoreFrom; i-- > 0;)
+        {
+            restoresConfirmed = write(plan[i].event, plan[i].priorValue, plan[i].priorValidIn)
+                    == EventWriteResult::DesiredStateConfirmed
+                && restoresConfirmed;
+        }
+
+        return restoresConfirmed ? ActivationOutcome::FailedCompensated
+                                 : ActivationOutcome::FailedCompensationUncertain;
     }
 }
