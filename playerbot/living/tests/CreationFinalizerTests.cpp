@@ -375,3 +375,93 @@ LIVING_TEST(creation_batch_registry_is_bounded_and_prunes_expired)
     registry.PruneExpired(1 + CreationBatchRegistry::kRetentionPumps);
     LIVING_CHECK(registry.BatchCount() == CreationBatchRegistry::kMaxBatches - 1);
 }
+
+LIVING_TEST(creation_batch_completion_enforces_the_desired_size_invariant)
+{
+    // A batch whose initial run fell short (terminal stop, attempt budget)
+    // can complete with an EMPTY failure list if every queued member
+    // succeeds - the desired-size invariant at poll time is what stops a
+    // partial group from reporting unqualified success.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batch;
+    batch.desiredSize = 5;
+    batch.preexistingMembers = 1;
+    batch.pending = {
+        CreationBatchMember{ 21, 1, 1 },
+        CreationBatchMember{ 22, 2, 2 },
+    }; // only 2 of the 4 needed members were ever queued
+
+    uint64_t const token = registry.Begin(std::move(batch));
+
+    auto created = [](uint64_t creationToken, uint32_t guid)
+    {
+        CreationCompletion completion;
+        completion.token = creationToken;
+        completion.guid = guid;
+        completion.status = CreationPollStatus::Created;
+        completion.name = "Member";
+        return completion;
+    };
+
+    registry.OnCreationTerminal(created(21, 2001));
+    registry.OnCreationTerminal(created(22, 2002));
+
+    BatchPollResult result = registry.Poll(token, false);
+    LIVING_CHECK(result.status == BatchPollStatus::Complete);
+    LIVING_CHECK(result.failures.empty());
+    LIVING_CHECK(result.undersized); // 1 + 2 < 5
+
+    // A full batch is NOT undersized.
+    CreationBatchRegistry::Batch full;
+    full.desiredSize = 3;
+    full.preexistingMembers = 1;
+    full.pending = { CreationBatchMember{ 31, 1, 1 }, CreationBatchMember{ 32, 2, 2 } };
+    uint64_t const fullToken = registry.Begin(std::move(full));
+    registry.OnCreationTerminal(created(31, 3001));
+    registry.OnCreationTerminal(created(32, 3002));
+    BatchPollResult fullResult = registry.Poll(fullToken, false);
+    LIVING_CHECK(fullResult.status == BatchPollStatus::Complete);
+    LIVING_CHECK(!fullResult.undersized);
+
+    // While a replacement is still pending, the invariant is not evaluated.
+    CreationBatchRegistry::Batch pendingBatch;
+    pendingBatch.desiredSize = 3;
+    pendingBatch.preexistingMembers = 1;
+    pendingBatch.pending = { CreationBatchMember{ 41, 1, 1 }, CreationBatchMember{ 42, 2, 2 } };
+    uint64_t const pendingToken = registry.Begin(std::move(pendingBatch));
+    registry.OnCreationTerminal(created(41, 4001));
+    LIVING_CHECK(registry.Poll(pendingToken, false).status == BatchPollStatus::Pending);
+    LIVING_CHECK(!registry.Poll(pendingToken, false).undersized);
+}
+
+LIVING_TEST(creation_batch_preserves_allocation_mode_and_slot_class_for_replacements)
+{
+    // The replacement path must reuse the ORIGINAL run's allocation mode (a
+    // random-manager run keeps allocating on random accounts even when the
+    // initiating master owns a personal manager) and the failed slot's
+    // planned class (per-class composition caps were charged for it).
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batch;
+    batch.useRandomAccounts = true;
+    batch.desiredSize = 2;
+    batch.replacementBudget = 1;
+    batch.pending = { CreationBatchMember{ 51, /*cls*/ 4, /*role*/ 2 } };
+    uint64_t const token = registry.Begin(std::move(batch));
+
+    LIVING_CHECK(registry.Find(token) != nullptr);
+    LIVING_CHECK(registry.Find(token)->useRandomAccounts);
+
+    CreationCompletion rolledBack;
+    rolledBack.token = 51;
+    rolledBack.status = CreationPollStatus::FailedRetryable;
+    rolledBack.name = "Member";
+    rolledBack.message = "rolled back";
+
+    auto resolution = registry.OnCreationTerminal(rolledBack);
+    LIVING_CHECK(resolution && resolution->enqueueReplacement);
+    LIVING_CHECK(resolution->cls == 4);  // the slot's planned class travels back
+    LIVING_CHECK(resolution->role == 2);
+    LIVING_CHECK(registry.Find(resolution->batchToken)->useRandomAccounts);
+}

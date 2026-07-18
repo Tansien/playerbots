@@ -125,11 +125,17 @@ public:
     static living::CreationPollResult PollBotCreation(uint64 creationToken, bool acknowledgeTerminal);
     // Polls one HandleGroup batch token (asynchronous group completion).
     static living::BatchPollResult PollBotCreationBatch(uint64 batchToken, bool acknowledgeComplete);
-    // Effective per-account character occupancy: durable characters plus the
+    // Typed durable character count. The cores' GetCharactersCount collapses
+    // a FAILED query to zero, which fails admission OPEN (a full account
+    // admitted as empty); this returns false on query failure so admission
+    // can fail closed instead.
+    static bool TryGetDurableCharacterCount(uint32 accountId, uint32& count);
+    // Effective per-account occupancy: durable characters plus the
     // finalizer's pending/quarantined reservations. Admission must use this,
     // never the durable count alone - a queued-but-unexecuted SaveToDB is
-    // invisible to the durable count.
-    static uint32 EffectiveCharacterCount(uint32 accountId);
+    // invisible to the durable count. Returns false when the durable count
+    // could not be established (callers reject or defer, never assume empty).
+    static bool TryGetEffectiveCharacterCount(uint32 accountId, uint32& count);
     static uint32 MaxCharsPerAccount();
 
     std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security);

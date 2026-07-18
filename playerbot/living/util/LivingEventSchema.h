@@ -97,6 +97,17 @@ namespace living
             : EventCacheLoadState::Loaded;
     }
 
+    // Whether a read of ONE event yields a KNOWN value. A cached entry is
+    // always known (it came from a confirmed write or a successful load); an
+    // ABSENT entry is confirmed absent (zero) only when the bulk-load state is
+    // Loaded. Absent + Unloaded/Unknown is NOT knowledge: destructive callers
+    // (timed-logout deactivation, marker clearing) must skip their mutation
+    // instead of consuming the default zero as an expired event.
+    inline bool EventValueKnown(EventCacheLoadState state, bool hasCachedEntry)
+    {
+        return hasCachedEntry || state == EventCacheLoadState::Loaded;
+    }
+
     enum class EventPersistOutcome
     {
         // The value violates the schema; nothing was attempted.

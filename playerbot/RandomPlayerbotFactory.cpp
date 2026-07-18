@@ -711,7 +711,11 @@ void RandomPlayerbotFactory::CreateRandomBots()
             CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE bot = %d", guid);
             Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), accountId, true, true);
 
-            if (sAccountMgr.GetCharactersCount(accountId) == 0)
+            // Typed count: a FAILED count query must not read as an empty
+            // account - DeleteAccount would take its remaining characters
+            // with it.
+            uint32 remainingCharacters = 0;
+            if (PlayerbotHolder::TryGetDurableCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
             {
                 sAccountMgr.DeleteAccount(accountId);
             }
@@ -730,9 +734,11 @@ void RandomPlayerbotFactory::CreateRandomBots()
         {
             Field* fields = temporaryAccounts->Fetch();
             uint32 accountId = fields[0].GetUInt32();
-            sAccountMgr.GetCharactersCount(accountId);
 
-            if (sAccountMgr.GetCharactersCount(accountId) == 0)
+            // Typed count, same rule as above: unknown occupancy is never
+            // "empty" when the next step is account deletion.
+            uint32 remainingCharacters = 0;
+            if (PlayerbotHolder::TryGetDurableCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
             {
                 sAccountMgr.DeleteAccount(accountId);
             }

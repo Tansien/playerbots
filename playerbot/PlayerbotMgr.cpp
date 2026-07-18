@@ -140,11 +140,16 @@ void PlayerbotHolder::UpdateSessions(uint32 elapsed)
     // Deferred SQL-callback work (creation finalization, relocation homebind
     // verification and finalization retries) runs here: a normal world update
     // that every pinned core executes BEFORE World::UpdateResultQueue in the
-    // tick, so it can never run inside the SQL result-queue mutex. Several
-    // holders pumping per tick is harmless - the queues drain on the first
-    // call and the remaining pumps are no-ops.
-    ai::PumpBotCreation();
-    sRandomPlayerbotMgr.PumpPendingRelocations();
+    // tick, so it can never run inside the SQL result-queue mutex. Pumping is
+    // gated to the ONE UpdateSessions call World::Update makes per tick (the
+    // random manager's) - per-master holders also pass through here from
+    // WorldSession::Update, and letting each advance the pumps multiplied
+    // retention aging and per-tick write retries by the holder count.
+    if (this == static_cast<PlayerbotHolder*>(&sRandomPlayerbotMgr))
+    {
+        ai::PumpBotCreation();
+        sRandomPlayerbotMgr.PumpPendingRelocations();
+    }
 
     ForEachPlayerbot([&](Player* bot)
     {
@@ -2297,10 +2302,26 @@ uint32 PlayerbotHolder::MaxCharsPerAccount()
 #endif
 }
 
-uint32 PlayerbotHolder::EffectiveCharacterCount(uint32 accountId)
+bool PlayerbotHolder::TryGetDurableCharacterCount(uint32 accountId, uint32& count)
 {
-    return sAccountMgr.GetCharactersCount(accountId)
-        + ai::botCreationFinalizer.core.ReservedCount(accountId);
+    // Own COUNT query instead of sAccountMgr.GetCharactersCount: the cores
+    // collapse a failed query to zero, which would admit a full account as
+    // empty. COUNT always yields one row on success, so null = failed.
+    auto result = CharacterDatabase.PQuery("SELECT COUNT(guid) FROM characters WHERE account = '%u'", accountId);
+    if (!result)
+        return false;
+
+    count = result->Fetch()[0].GetUInt32();
+    return true;
+}
+
+bool PlayerbotHolder::TryGetEffectiveCharacterCount(uint32 accountId, uint32& count)
+{
+    if (!TryGetDurableCharacterCount(accountId, count))
+        return false;
+
+    count += ai::botCreationFinalizer.core.ReservedCount(accountId);
+    return true;
 }
 
 namespace ai
@@ -2330,6 +2351,8 @@ namespace ai
         {
             uint64 batchToken = 0;
             uint8 role = 0;
+            uint8 cls = 0; // the failed slot's planned class - preserved so
+                           // per-class composition caps stay honored
         };
         std::vector<Replacement> replacements;
 
@@ -2356,7 +2379,7 @@ namespace ai
             if (std::optional<living::BatchMemberResolution> resolution = botCreationBatches.OnCreationTerminal(completion))
             {
                 if (resolution->enqueueReplacement)
-                    replacements.push_back(Replacement{ resolution->batchToken, resolution->role });
+                    replacements.push_back(Replacement{ resolution->batchToken, resolution->role, resolution->cls });
                 else if (!resolution->failure.empty())
                     if (living::CreationBatchRegistry::Batch const* batch = botCreationBatches.Find(resolution->batchToken))
                         NotifyBatchInitiator(*batch, resolution->failure);
@@ -2382,9 +2405,13 @@ namespace ai
                 continue;
             }
 
+            // The failed slot's PLANNED class is preserved: the run's
+            // per-class composition quotas were charged for that class, so an
+            // unconstrained redraw could exceed them.
             uint8 race = 0;
             uint8 cls = 0;
-            if (!RandomPlayerbotFactory::GetRandomTuple(master->GetTeam(), static_cast<BotRoles>(replacement.role), 0, 0, race, cls))
+            if (!RandomPlayerbotFactory::GetRandomTuple(master->GetTeam(), static_cast<BotRoles>(replacement.role),
+                    0, replacement.cls, race, cls))
             {
                 botCreationBatches.RecordFailure(replacement.batchToken,
                     "replacement for a failed member skipped: no compatible race/class tuple");
@@ -2403,13 +2430,24 @@ namespace ai
             options.autoAdd = batch->memberAutoAdd;
             options.temporary = batch->memberTemporary;
 
-            // A real master (chat-initiated run) allocates on its own holder;
-            // a test-bot initiator has no PlayerbotMgr and uses the random
-            // holder's account allocation - the same holders the original run
-            // used.
-            PlayerbotHolder* holder = master->GetPlayerbotMgr()
-                ? static_cast<PlayerbotHolder*>(master->GetPlayerbotMgr())
-                : static_cast<PlayerbotHolder*>(&sRandomPlayerbotMgr);
+            // The replacement allocates on the SAME holder mode as the
+            // original run, recorded in the batch: a `.rndbot group` run
+            // through the random manager must keep allocating on random
+            // accounts even when the initiating master also owns a personal
+            // PlayerbotMgr - a retry must never create a character on the
+            // master's personal account.
+            PlayerbotHolder* holder = nullptr;
+            if (batch->useRandomAccounts)
+                holder = static_cast<PlayerbotHolder*>(&sRandomPlayerbotMgr);
+            else if (master->GetPlayerbotMgr())
+                holder = static_cast<PlayerbotHolder*>(master->GetPlayerbotMgr());
+
+            if (!holder)
+            {
+                botCreationBatches.RecordFailure(replacement.batchToken,
+                    "replacement for a failed member skipped: initiator has no bot manager");
+                continue;
+            }
 
             BotCreationResult result = holder->CreateBot(master, options);
             if (result.status == living::BotCreateStatus::PendingPersistence)
@@ -2601,12 +2639,22 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
     // Reserve one character slot BEFORE any GUID allocation or SaveToDB. The
     // durable count alone cannot admit safely: a queued-but-unexecuted save is
     // invisible to it, so a burst of creations (group loop, test runner) would
-    // all observe the same stale count and overfill the account. The
-    // reservation is bound to the pending record by Begin and released only on
-    // a CONFIRMED terminal outcome; every failure path between here and Begin
-    // must release it explicitly because no save was queued.
+    // all observe the same stale count and overfill the account. The count
+    // itself is typed: a FAILED count query rejects (fail closed) instead of
+    // reading as an empty account. The reservation is bound to the pending
+    // record by Begin and released only on a CONFIRMED terminal outcome; every
+    // failure path between here and Begin must release it explicitly because
+    // no save was queued.
+    uint32 durableCharacterCount = 0;
+    if (!TryGetDurableCharacterCount(accountId, durableCharacterCount))
+    {
+        result.status = living::BotCreateStatus::TerminalFailure;
+        result.messages.push_back("Account character count could not be verified; refusing creation");
+        return result;
+    }
+
     if (!ai::botCreationFinalizer.core.TryReserveAccountSlot(accountId,
-            sAccountMgr.GetCharactersCount(accountId), MaxCharsPerAccount()))
+            durableCharacterCount, MaxCharsPerAccount()))
     {
         result.status = living::BotCreateStatus::TerminalFailure;
         result.messages.push_back("Account has max characters");
@@ -3042,6 +3090,22 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         batch.memberGear = gear;
         batch.memberAutoAdd = autoAdd;
         batch.memberTemporary = temporary;
+        // Replacements must allocate exactly like this run did.
+        batch.useRandomAccounts = dynamic_cast<RandomPlayerbotMgr*>(this) != nullptr;
+        // The initial run itself can fall short (terminal stop, maxTries
+        // exhaustion): record that shortfall NOW so batch completion reports
+        // it - a partial group must never poll as an unqualified success.
+        if (currentGroupSize < groupSize)
+        {
+            std::ostringstream shortfall;
+            shortfall << "initial run queued only " << (currentGroupSize - preexistingMembers)
+                << " of " << (groupSize - preexistingMembers) << " requested members";
+            if (stoppedOnTerminalFailure)
+                shortfall << " (stopped on a terminal failure)";
+            else if (maxTries == 0)
+                shortfall << " (attempt budget exhausted)";
+            batch.failures.push_back(shortfall.str());
+        }
         batchToken = ai::botCreationBatches.Begin(std::move(batch));
         if (!batchToken)
             messages.push_back("Warning: creation batch registry is full; asynchronous member failures will be logged but not replaced");
@@ -3279,8 +3343,10 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
 
             // Effective occupancy: durable characters plus pending/quarantined
             // creation reservations - several queued tests must not all admit
-            // against the same stale durable count.
-            if (EffectiveCharacterCount(accountId) >= MaxCharsPerAccount())
+            // against the same stale durable count. An UNKNOWN count (failed
+            // query) defers the test instead of assuming capacity.
+            uint32 effectiveCount = 0;
+            if (!TryGetEffectiveCharacterCount(accountId, effectiveCount) || effectiveCount >= MaxCharsPerAccount())
                 continue;
         }
 
