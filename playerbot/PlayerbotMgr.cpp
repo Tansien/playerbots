@@ -32,6 +32,8 @@ namespace ai
 {
     // Defined below with the creation finalizer; hooked into UpdateSessions.
     void PumpBotCreation();
+    // The creation pump's tick counter (paces batch attempt scheduling).
+    uint64 CreationPumpTick();
 }
 
 PlayerbotHolder::PlayerbotHolder() : PlayerbotAIBase()
@@ -2195,35 +2197,38 @@ namespace ai
             core.OnCallbackResult(guid, outcome, living::CreationCallbackKind::CleanupVerify);
         }
 
-        void HandleBulkCountVerify(QueryResult* result, uint32 accountId)
+        void HandleBulkCountVerify(QueryResult* result, uint64 generation)
         {
-            // Any successful readback releases the account's bulk
-            // reservations in the pump: the query executed AFTER the bulk
-            // saves on the same FIFO thread, so its completion is the
-            // durability barrier - the count value itself is not consulted.
+            // Any successful readback releases exactly THIS GENERATION's bulk
+            // reservations in the pump: the query executed AFTER that
+            // generation's saves on the same FIFO thread, so its completion
+            // is their durability barrier - the count value itself is not
+            // consulted, and reservations added after this query was queued
+            // are untouched (they carry their own generation and barrier).
             living::RowVerifyOutcome const outcome = result
                 ? living::RowVerifyOutcome::Verified
                 : living::RowVerifyOutcome::QueryFailed;
             delete result;
 
-            core.OnCallbackResult(accountId, outcome, living::CreationCallbackKind::BulkCount);
+            core.OnBulkCallbackResult(generation, outcome);
         }
 
         living::CreationFinalizerOps Ops()
         {
             living::CreationFinalizerOps ops;
-            ops.requestVerify = [this](uint32 guid)
+            ops.requestVerify = [this](uint32 guid) -> bool
             {
                 // COUNT + identity aggregates always yield one row on success,
                 // so a null callback result is a FAILED query, never absence.
                 // AsyncPQuery is the one async-query form all three pinned
-                // cores share.
-                CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleVerify, guid,
+                // cores share; its return value reports whether the query was
+                // actually ENQUEUED.
+                return CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleVerify, guid,
                     "SELECT COUNT(*), MIN(account), MIN(name) FROM characters WHERE guid = '%u'", guid);
             };
-            ops.requestCleanupVerify = [this](uint32 guid)
+            ops.requestCleanupVerify = [this](uint32 guid) -> bool
             {
-                CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleCleanupVerify, guid,
+                return CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleCleanupVerify, guid,
                     "SELECT COUNT(*) FROM characters WHERE guid = '%u'", guid);
             };
             ops.writeMetadata = [this](uint32 guid)
@@ -2274,15 +2279,14 @@ namespace ai
 
                 sLog.outDetail("Bot creation finalized: '%s' (guid %u)", name.c_str(), guid);
             };
-            ops.requestBulkCountVerify = [this](uint32 accountId)
+            ops.requestBulkCountVerify = [this](uint32 accountId, uint64 generation) -> bool
             {
-                // A failed ENQUEUE feeds back one QueryFailed attempt so the
-                // bounded retry/give-up path owns the outcome instead of the
-                // entry waiting forever for a query that was never queued.
-                if (!CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleBulkCountVerify, accountId,
-                        "SELECT COUNT(guid) FROM characters WHERE account = '%u'", accountId))
-                    core.OnCallbackResult(accountId, living::RowVerifyOutcome::QueryFailed,
-                        living::CreationCallbackKind::BulkCount);
+                // The callback parameter is the GENERATION token; the account
+                // is interpolated into the query text here. The enqueue result
+                // is propagated so the core's bounded retry/give-up path owns
+                // failures instead of the generation waiting forever.
+                return CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleBulkCountVerify, generation,
+                    "SELECT COUNT(guid) FROM characters WHERE account = '%u'", accountId);
             };
             ops.onBulkVerifyGaveUp = [](uint32 accountId, uint32 keptReservations)
             {
@@ -2382,6 +2386,28 @@ void PlayerbotHolder::BeginBulkReservationVerify(uint32 accountId, uint32 reserv
     ai::botCreationFinalizer.core.BeginBulkVerify(accountId, reservedSlots, ai::botCreationFinalizer.Ops());
 }
 
+AccountLookupOutcome PlayerbotHolder::TryLookupAccountId(std::string const& accountName, uint32& accountId)
+{
+    // COUNT + MIN aggregate: it always yields one row on success, so a null
+    // result is a FAILED query - never a missing account. Only a confirmed
+    // zero count is Missing (the sole outcome that may trigger account
+    // creation). The name is escaped here, once.
+    std::string escapedName = accountName;
+    LoginDatabase.escape_string(escapedName);
+
+    auto result = LoginDatabase.PQuery(
+        "SELECT COUNT(*), MIN(id) FROM account WHERE username = '%s'", escapedName.c_str());
+    if (!result)
+        return AccountLookupOutcome::DatabaseUnavailable;
+
+    Field* fields = result->Fetch();
+    if (fields[0].GetUInt32() == 0)
+        return AccountLookupOutcome::Missing;
+
+    accountId = fields[1].GetUInt32();
+    return AccountLookupOutcome::Found;
+}
+
 namespace ai
 {
     static void NotifyBatchInitiator(living::CreationBatchRegistry::Batch const& batch, std::string const& message, bool isError = true)
@@ -2403,19 +2429,19 @@ namespace ai
     // PlayerbotHolder::UpdateSessions: a normal world update that all three
     // pinned cores execute BEFORE World::UpdateResultQueue, so nothing here
     // ever runs inside the SQL result-queue mutex.
+    static uint64 creationPumpTick = 0;
+
+    uint64 CreationPumpTick()
+    {
+        return creationPumpTick;
+    }
+
     void PumpBotCreation()
     {
-        struct Replacement
-        {
-            uint64 batchToken = 0;
-            uint8 role = 0;
-            uint8 cls = 0; // the failed slot's planned class - preserved so
-                           // per-class composition caps stay honored
-        };
-        std::vector<Replacement> replacements;
+        uint64 const pumpCount = ++creationPumpTick;
 
         botCreationFinalizer.core.Pump(botCreationFinalizer.Ops(),
-            [&replacements](living::CreationCompletion const& completion)
+            [pumpCount](living::CreationCompletion const& completion)
         {
             switch (completion.status)
             {
@@ -2433,24 +2459,20 @@ namespace ai
             botCreationFinalizer.payloads.erase(completion.guid);
 
             // Publish to the batch coordinator BEFORE the finalizer removes
-            // the record (this observer runs inside PublishTerminal).
-            if (std::optional<living::BatchMemberResolution> resolution = botCreationBatches.OnCreationTerminal(completion))
-            {
-                if (resolution->enqueueReplacement)
-                    replacements.push_back(Replacement{ resolution->batchToken, resolution->role, resolution->cls });
-                else if (!resolution->failure.empty())
-                    if (living::CreationBatchRegistry::Batch const* batch = botCreationBatches.Find(resolution->batchToken))
-                        NotifyBatchInitiator(*batch, resolution->failure);
-            }
+            // the record: the member transitions in place (Finalized,
+            // back to AwaitingAttempt as an in-slot replacement, or a
+            // recorded TerminalFailure).
+            botCreationBatches.OnCreationTerminal(completion, pumpCount);
         });
 
-        // Replacements run AFTER the pump drained (CreateBot re-enters the
-        // finalizer via Begin; keeping that outside the drain loop keeps the
-        // flow single-level). A replacement re-plans the failed slot's ROLE
-        // with the run's own creation parameters.
-        for (Replacement const& replacement : replacements)
+        // Paced attempt loop: every planned slot whose backoff elapsed -
+        // in-slot replacements, initial transient shortfalls, and transient
+        // retries all flow through here, so pacing and budgets are enforced
+        // in ONE place. Attempts run AFTER the pump drained (CreateBot
+        // re-enters the finalizer via Begin).
+        for (living::DueAttempt const& attempt : botCreationBatches.TakeDueAttempts(pumpCount))
         {
-            living::CreationBatchRegistry::Batch const* batch = botCreationBatches.Find(replacement.batchToken);
+            living::CreationBatchRegistry::Batch const* batch = botCreationBatches.Find(attempt.batchToken);
             if (!batch)
                 continue;
 
@@ -2458,21 +2480,32 @@ namespace ai
                 ? sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, batch->initiatorGuid)) : nullptr;
             if (!master)
             {
-                botCreationBatches.RecordFailure(replacement.batchToken,
-                    "replacement for a failed member skipped: initiator is offline");
+                botCreationBatches.OnAttemptResult(attempt.batchToken, attempt.memberIndex,
+                    living::BotCreateStatus::TerminalFailure, 0, 0, pumpCount);
+                botCreationBatches.RecordFailure(attempt.batchToken,
+                    "member attempt skipped: initiator is offline");
                 continue;
             }
 
-            // The failed slot's PLANNED class is preserved: the run's
-            // per-class composition quotas were charged for that class, so an
-            // unconstrained redraw could exceed them.
+            // The slot's PLANNED role/class are preserved (per-class quotas
+            // were charged for them); an unplanned slot (initial transient
+            // shortfall) draws its role now.
+            uint8 role = attempt.role;
+            if (!role)
+            {
+                static BotRoles const groupRoles[3] = { BotRoles::BOT_ROLE_TANK, BotRoles::BOT_ROLE_HEALER, BotRoles::BOT_ROLE_DPS };
+                role = static_cast<uint8>(groupRoles[urand(0, 2)]);
+            }
+
             uint8 race = 0;
             uint8 cls = 0;
-            if (!RandomPlayerbotFactory::GetRandomTuple(master->GetTeam(), static_cast<BotRoles>(replacement.role),
-                    0, replacement.cls, race, cls))
+            if (!RandomPlayerbotFactory::GetRandomTuple(master->GetTeam(), static_cast<BotRoles>(role),
+                    0, attempt.cls, race, cls))
             {
-                botCreationBatches.RecordFailure(replacement.batchToken,
-                    "replacement for a failed member skipped: no compatible race/class tuple");
+                botCreationBatches.OnAttemptResult(attempt.batchToken, attempt.memberIndex,
+                    living::BotCreateStatus::TerminalFailure, 0, 0, pumpCount);
+                botCreationBatches.RecordFailure(attempt.batchToken,
+                    "member attempt skipped: no compatible race/class tuple");
                 continue;
             }
 
@@ -2480,7 +2513,7 @@ namespace ai
             options.level = master->GetLevel();
             options.race = race;
             options.cls = cls;
-            options.role = replacement.role;
+            options.role = role;
             options.requireRoleMatch = true;
             options.groupWith = master->GetName();
             options.explicitGroup = true;
@@ -2488,12 +2521,10 @@ namespace ai
             options.autoAdd = batch->memberAutoAdd;
             options.temporary = batch->memberTemporary;
 
-            // The replacement allocates on the SAME holder mode as the
-            // original run, recorded in the batch: a `.rndbot group` run
-            // through the random manager must keep allocating on random
-            // accounts even when the initiating master also owns a personal
-            // PlayerbotMgr - a retry must never create a character on the
-            // master's personal account.
+            // The attempt allocates on the SAME holder mode as the original
+            // run, recorded in the batch: a `.rndbot group` run through the
+            // random manager must keep allocating on random accounts even
+            // when the initiating master also owns a personal PlayerbotMgr.
             PlayerbotHolder* holder = nullptr;
             if (batch->useRandomAccounts)
                 holder = static_cast<PlayerbotHolder*>(&sRandomPlayerbotMgr);
@@ -2502,46 +2533,43 @@ namespace ai
 
             if (!holder)
             {
-                botCreationBatches.RecordFailure(replacement.batchToken,
-                    "replacement for a failed member skipped: initiator has no bot manager");
+                botCreationBatches.OnAttemptResult(attempt.batchToken, attempt.memberIndex,
+                    living::BotCreateStatus::TerminalFailure, 0, 0, pumpCount);
+                botCreationBatches.RecordFailure(attempt.batchToken,
+                    "member attempt skipped: initiator has no bot manager");
                 continue;
             }
 
+            // The typed result flows back verbatim: transient failures keep
+            // the slot with paced bounded retries (never consuming the
+            // replacement budget), retryable failures consume it, terminal
+            // failures are recorded.
             BotCreationResult result = holder->CreateBot(master, options);
-            if (result.status == living::BotCreateStatus::PendingPersistence)
-            {
-                living::CreationBatchMember member;
-                member.creationToken = result.creationToken;
-                member.cls = result.createdClass;
-                member.role = replacement.role;
-                botCreationBatches.AddPendingMember(replacement.batchToken, member);
-            }
-            else
-            {
-                std::string reason = result.messages.empty() ? "unknown" : result.messages.front();
-                botCreationBatches.RecordFailure(replacement.batchToken,
-                    "replacement creation failed immediately: " + reason);
-                NotifyBatchInitiator(*batch, "replacement creation failed: " + reason);
-            }
+            botCreationBatches.OnAttemptResult(attempt.batchToken, attempt.memberIndex,
+                result.status, result.creationToken, result.createdClass, pumpCount);
         }
 
         // Surface completed batches exactly once - the requested group is
         // never left silently undersized.
         for (living::CreationBatchRegistry::Batch const* batch : botCreationBatches.TakeNewlyCompleted())
         {
+            size_t finalized = 0;
+            for (living::CreationBatchMember const& member : batch->members)
+                if (member.state == living::BatchMemberState::Finalized)
+                    ++finalized;
+
             std::ostringstream summary;
-            summary << "batch complete: " << batch->finalizedGuids.size() << " member(s) finalized";
+            summary << "batch complete: " << finalized << " member(s) finalized";
             uint32 const wanted = batch->desiredSize > batch->preexistingMembers
                 ? batch->desiredSize - batch->preexistingMembers : 0;
-            if (batch->finalizedGuids.size() < wanted)
+            if (finalized < wanted)
                 summary << " of " << wanted << " requested";
             if (!batch->failures.empty())
                 summary << ", " << batch->failures.size() << " failure(s), first: " << batch->failures.front();
             NotifyBatchInitiator(*batch, summary.str(), !batch->failures.empty());
         }
 
-        static uint64 pumpCount = 0;
-        botCreationBatches.PruneExpired(++pumpCount);
+        botCreationBatches.PruneExpired(pumpCount);
     }
 }
 
@@ -3032,32 +3060,79 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
 
     uint32 maxTries = 10*groupSize;
 
-    // Outstanding slots already owned by this initiator's in-flight batches:
+    // ONE batch owns a target group's deficit at a time. A repeated command
+    // with COMPATIBLE options extends the initiator's existing batch (same
+    // token, one shared pending/finalized/join ledger); incompatible options
+    // are refused without enqueueing anything - an independent residual batch
+    // could otherwise report success using members owned by an older batch
+    // that later fails.
+    bool const wantRandomAccounts = dynamic_cast<RandomPlayerbotMgr*>(this) != nullptr;
+    uint64 const existingToken = ai::botCreationBatches.FindBatchTokenForInitiator(master->GetGUIDLow());
+    if (existingToken)
+    {
+        living::CreationBatchRegistry::Batch const* existing = ai::botCreationBatches.Find(existingToken);
+        bool const compatible = existing
+            && existing->memberGear == gear
+            && existing->memberAutoAdd == autoAdd
+            && existing->memberTemporary == temporary
+            && existing->useRandomAccounts == wantRandomAccounts;
+
+        if (!compatible)
+        {
+            messages.push_back("A group creation with different options is already in progress for you; wait for it to complete before requesting different options");
+            return messages;
+        }
+    }
+
+    // Outstanding slots already owned by this initiator's batch: planned and
     // pending creations PLUS finalized members that have not yet joined the
-    // group. Effective membership counts them, so a repeated `.group`/
-    // `.rndbot group` enqueues only the residual deficit - never the same
-    // deficit twice. A slot stays reserved until membership is verified in
-    // the live group or the batch expires (the bounded terminal path for
-    // joins that never happen).
-    uint32 const outstandingSlots = ai::botCreationBatches.OutstandingSlotsForInitiator(master->GetGUIDLow(),
-        [group](uint32 guid) { return group && group->IsMember(ObjectGuid(HIGHGUID_PLAYER, guid)); });
+    // group. Effective membership counts them, so a repeated command enqueues
+    // only the residual deficit. Their planned classes/roles also consume the
+    // composition quotas below, so older allocations constrain this
+    // selection. A slot stays owned until membership is verified in the live
+    // group or the batch expires (the bounded terminal path for joins that
+    // never happen).
+    auto const isJoined = [group](uint32 guid) { return group && group->IsMember(ObjectGuid(HIGHGUID_PLAYER, guid)); };
+    uint32 const liveMembers = currentGroupSize;
+    uint32 const outstandingSlots = ai::botCreationBatches.OutstandingSlotsForInitiator(master->GetGUIDLow(), isJoined);
     currentGroupSize += outstandingSlots;
 
-    if (currentGroupSize >= groupSize && outstandingSlots)
+    ai::botCreationBatches.ForEachOutstandingMember(master->GetGUIDLow(), isJoined,
+        [&allowedClassNr](living::CreationBatchMember const& member)
+        {
+            if (!member.role)
+                return; // unplanned slot: constrains size only, not quotas
+
+            living::TryConsumeQuota(allowedClassNr[0][static_cast<BotRoles>(member.role)]);
+            if (member.cls)
+            {
+                auto classQuota = allowedClassNr[member.cls].find(static_cast<BotRoles>(member.role));
+                if (classQuota != allowedClassNr[member.cls].end())
+                    living::TryConsumeQuota(classQuota->second);
+            }
+        });
+
+    if (existingToken)
     {
-        // The requested size is already covered by live members plus the
-        // in-flight batch: coalesce onto it instead of enqueueing again.
-        batchToken = ai::botCreationBatches.FindBatchTokenForInitiator(master->GetGUIDLow());
-        messages.push_back("Group creation already in progress covers the requested size ("
-            + std::to_string(outstandingSlots) + " outstanding member slot(s)); no additional members queued");
-        return messages;
+        batchToken = existingToken;
+        ai::botCreationBatches.ExtendDesiredSize(existingToken, groupSize);
+
+        if (currentGroupSize >= groupSize)
+        {
+            // The requested size is already covered by live members plus the
+            // batch's outstanding slots: coalesce, enqueue nothing more.
+            messages.push_back("Group creation already in progress covers the requested size ("
+                + std::to_string(outstandingSlots) + " outstanding member slot(s)); no additional members queued");
+            return messages;
+        }
     }
 
     living::GroupCreationLedger ledger;
     std::vector<living::CreationBatchMember> batchMembers;
-    uint32 const preexistingMembers = currentGroupSize;
+    uint32 const preexistingMembers = liveMembers;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     bool stoppedOnTerminalFailure = false;
+    bool stoppedOnTransientFailure = false;
 
     while (currentGroupSize < groupSize)
     {
@@ -3154,42 +3229,59 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
                 living::TryConsumeQuota(allowedClassNr[actualClass][role]);
         }
 
-        // A terminal failure (invalid arguments, no account capacity) cannot
-        // succeed on retry; stop instead of burning through maxTries.
+        // A terminal failure (invalid arguments) cannot succeed on retry; a
+        // TRANSIENT failure (database unavailable) must not hammer the DB
+        // inside this call - the remaining deficit becomes paced planned
+        // slots below instead of terminal shortfall.
         if (terminal)
         {
-            stoppedOnTerminalFailure = true;
+            stoppedOnTerminalFailure = result.status == living::BotCreateStatus::TerminalFailure;
+            stoppedOnTransientFailure = result.status == living::BotCreateStatus::TransientFailure;
             break;
         }
     }
 
-    // Register the completion batch: the finalizer publishes each member's
-    // terminal result to it, retryable failures are replaced within the
-    // bounded budget, and the initiator/test queue is told the real outcome
-    // instead of the group staying silently undersized.
-    if (!batchMembers.empty())
+    // Register/extend the completion batch: the finalizer publishes each
+    // member's terminal result to it, retryable failures are replaced in
+    // place within the bounded budget, transient shortfalls are retried with
+    // pacing, and the initiator/test queue is told the real outcome instead
+    // of the group staying silently undersized.
+    uint32 const transientShortfall = stoppedOnTransientFailure && groupSize > currentGroupSize
+        ? groupSize - currentGroupSize : 0;
+
+    if (existingToken)
+    {
+        // Extension: the members join the EXISTING batch's shared ledger.
+        for (living::CreationBatchMember const& member : batchMembers)
+            ai::botCreationBatches.AddPendingMember(existingToken, member);
+        if (transientShortfall)
+            ai::botCreationBatches.AddPlannedSlots(existingToken, transientShortfall, ai::CreationPumpTick());
+        messages.push_back("Extended the in-progress group creation; members are confirmed asynchronously");
+    }
+    else if (!batchMembers.empty() || transientShortfall)
     {
         living::CreationBatchRegistry::Batch batch;
         batch.initiatorName = master->GetName();
         batch.initiatorGuid = master->GetGUIDLow();
         batch.desiredSize = groupSize;
         batch.preexistingMembers = preexistingMembers;
-        batch.pending = batchMembers;
+        batch.members = batchMembers;
         // Bounded replacement: at most one replacement per requested slot.
         batch.replacementBudget = groupSize;
         batch.memberGear = gear;
         batch.memberAutoAdd = autoAdd;
         batch.memberTemporary = temporary;
         // Replacements must allocate exactly like this run did.
-        batch.useRandomAccounts = dynamic_cast<RandomPlayerbotMgr*>(this) != nullptr;
-        // The initial run itself can fall short (terminal stop, maxTries
-        // exhaustion): record that shortfall NOW so batch completion reports
-        // it - a partial group must never poll as an unqualified success.
-        if (currentGroupSize < groupSize)
+        batch.useRandomAccounts = wantRandomAccounts;
+        // The initial run itself can fall short TERMINALLY (terminal stop,
+        // maxTries exhaustion): record that shortfall NOW so batch completion
+        // reports it - a partial group must never poll as an unqualified
+        // success. A TRANSIENT shortfall becomes paced planned slots instead.
+        if (!stoppedOnTransientFailure && currentGroupSize < groupSize)
         {
             std::ostringstream shortfall;
-            shortfall << "initial run queued only " << (currentGroupSize - preexistingMembers)
-                << " of " << (groupSize - preexistingMembers) << " requested members";
+            shortfall << "initial run queued only " << (currentGroupSize - preexistingMembers - outstandingSlots)
+                << " of " << (groupSize - preexistingMembers - outstandingSlots) << " requested members";
             if (stoppedOnTerminalFailure)
                 shortfall << " (stopped on a terminal failure)";
             else if (maxTries == 0)
@@ -3199,6 +3291,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         batchToken = ai::botCreationBatches.Begin(std::move(batch));
         if (!batchToken)
             messages.push_back("Warning: creation batch registry is full; asynchronous member failures will be logged but not replaced");
+        else if (transientShortfall)
+        {
+            ai::botCreationBatches.AddPlannedSlots(batchToken, transientShortfall, ai::CreationPumpTick());
+            messages.push_back("Group creation queued; the database is transiently unavailable, remaining members will be created with paced retries");
+        }
         else
             messages.push_back("Group creation queued; members are confirmed asynchronously and failures are replaced or reported");
     }
@@ -3385,6 +3482,15 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
         if (pt.completed)
             continue;
 
+        // Paced transient backoff: during a database outage the runner skips
+        // whole update passes instead of issuing a synchronous capacity count
+        // (or creation attempt) every tick.
+        if (pt.transientBackoff)
+        {
+            --pt.transientBackoff;
+            continue;
+        }
+
         // Poll an outstanding asynchronous creation to a REAL terminal result
         // before anything else: enqueueing was never success. A retryable
         // failure re-attempts within a bounded budget; terminal/quarantined
@@ -3434,9 +3540,23 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
             // Effective occupancy: durable characters plus pending/quarantined
             // creation reservations - several queued tests must not all admit
             // against the same stale durable count. An UNKNOWN count (failed
-            // query) defers the test instead of assuming capacity.
+            // query) is a TRANSIENT deferral with the same bounded paced
+            // schedule as transient creation - never a per-tick synchronous
+            // retry, never an assumed capacity.
             uint32 effectiveCount = 0;
-            if (!TryGetEffectiveCharacterCount(accountId, effectiveCount) || effectiveCount >= MaxCharsPerAccount())
+            if (!TryGetEffectiveCharacterCount(accountId, effectiveCount))
+            {
+                if (++pt.transientRetries >= 60)
+                {
+                    pt.result = "IMPOSSIBLE: database unavailable for the capacity precheck (deferred attempts exhausted)";
+                    pt.completed = true;
+                }
+                else
+                    pt.transientBackoff = 5;
+                continue;
+            }
+
+            if (effectiveCount >= MaxCharsPerAccount())
                 continue;
         }
 
@@ -3475,14 +3595,16 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
                 }
                 break;
             case living::BotCreateStatus::TransientFailure:
-                // Transient database unavailability: defer to a later tick
-                // (bounded backoff, separate from the creation retry budget)
-                // instead of failing the test or hammering the DB.
+                // Transient database unavailability: defer with the bounded
+                // PACED schedule (separate from the creation retry budget)
+                // instead of failing the test or hammering the DB every tick.
                 if (++pt.transientRetries >= 60)
                 {
                     pt.result = "IMPOSSIBLE: database unavailable for bot creation (deferred attempts exhausted)";
                     pt.completed = true;
                 }
+                else
+                    pt.transientBackoff = 5;
                 break;
             case living::BotCreateStatus::TerminalFailure:
             default:

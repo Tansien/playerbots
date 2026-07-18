@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
@@ -24,14 +23,17 @@ namespace living
     // DB-lock -> waits for queue-lock.
     //
     // The contract enforced here: a SQL result callback may only call
-    // OnCallbackResult, which copies the parsed outcome into a bounded
-    // in-memory queue and returns. Every lifecycle transition, metadata write,
-    // cleanup, retry and follow-up query scheduling runs in Pump(), which the
-    // module executes from a normal world update - in all three pinned cores
-    // the playerbots update hooks run BEFORE World::UpdateResultQueue in the
-    // same tick, so an event queued while ProcessResultQueue dispatched a
-    // callback is always pumped on a LATER tick, strictly after the
-    // result-queue mutex was released.
+    // OnCallbackResult/OnBulkCallbackResult, which copy the parsed outcome
+    // into the owning record's or bulk generation's MAILBOX and return. The
+    // storage exists from admission (each request has at most one outstanding
+    // query), so a callback for admitted work can never be dropped. Every
+    // lifecycle transition, metadata write, cleanup, retry and follow-up
+    // query scheduling runs in Pump(), which the module executes from a
+    // normal world update - in all three pinned cores the playerbots update
+    // hooks run BEFORE World::UpdateResultQueue in the same tick, so an
+    // outcome stored while ProcessResultQueue dispatched a callback is always
+    // pumped on a LATER tick, strictly after the result-queue mutex was
+    // released.
     //
     // The database boundary is injected through CreationFinalizerOps so the
     // exact production flow is host-testable with spy callables.
@@ -99,13 +101,18 @@ namespace living
     };
 
     // Database/world boundary. Every callable is executed from Pump()/Begin()
-    // on the world thread, never from a SQL result callback.
+    // on the world thread, never from a SQL result callback. The request
+    // callables return whether the query was actually ENQUEUED (the pinned
+    // cores report enqueue failure via a false AsyncPQuery return); a failed
+    // enqueue is fed back as a QueryFailed outcome so the bounded retry paths
+    // own it instead of the request waiting forever for a callback that was
+    // never queued.
     struct CreationFinalizerOps
     {
         // Schedules the execution-ordered character-row verification query.
-        std::function<void(uint32_t /*guid*/)> requestVerify;
+        std::function<bool(uint32_t /*guid*/)> requestVerify;
         // Schedules the deletion-verification query.
-        std::function<void(uint32_t /*guid*/)> requestCleanupVerify;
+        std::function<bool(uint32_t /*guid*/)> requestCleanupVerify;
         // Performs ALL execution-confirmed metadata writes for the record.
         std::function<bool(uint32_t /*guid*/)> writeMetadata;
         // Execution-confirmed removal of the record's event rows.
@@ -115,12 +122,13 @@ namespace living
         // The one place a confirmed GUID is exposed (freeAltBots etc.).
         std::function<void(uint32_t /*guid*/, uint32_t /*accountId*/, std::string const& /*name*/, bool /*autoAdd*/)> onCreated;
         // Schedules the execution-ordered bulk-reservation count readback for
-        // one account (issued AFTER the bulk saves were queued on the same
-        // FIFO thread, so its execution is a durability barrier for them).
-        std::function<void(uint32_t /*accountId*/)> requestBulkCountVerify;
-        // Observes a bulk verification giving up after bounded attempts: the
-        // account's bulk reservations are KEPT (conservative direction) and
-        // the caller logs the stuck capacity.
+        // ONE bulk generation (issued AFTER that generation's saves were
+        // queued on the same FIFO thread, so its execution is a durability
+        // barrier for exactly those saves).
+        std::function<bool(uint32_t /*accountId*/, uint64_t /*generation*/)> requestBulkCountVerify;
+        // Observes a bulk generation giving up after bounded attempts: its
+        // reservations are KEPT (conservative direction) and the caller logs
+        // the stuck capacity.
         std::function<void(uint32_t /*accountId*/, uint32_t /*keptReservations*/)> onBulkVerifyGaveUp;
     };
 
@@ -139,17 +147,18 @@ namespace living
             // slot (see TryReserveAccountSlot); released only on a CONFIRMED
             // terminal outcome, kept forever by quarantined records.
             bool holdsAccountReservation = false;
+            // Per-record callback MAILBOX: each record has at most one
+            // outstanding query, its storage exists from admission, and the
+            // SQL callback only copies the outcome here - a callback for an
+            // admitted record can never be dropped.
+            bool hasPendingOutcome = false;
+            RowVerifyOutcome pendingOutcome = RowVerifyOutcome::QueryFailed;
+            CreationCallbackKind pendingKind = CreationCallbackKind::Verify;
         };
 
         static constexpr uint32_t kMaxRecords = 64;
         static constexpr uint32_t kMaxVerifyAttempts = 5;
         static constexpr uint32_t kMaxCleanupAttempts = 5;
-        // Each record has at most ONE outstanding async query at a time, so 64
-        // records can never queue more than 64 events; the bound only guards
-        // against logic regressions. An overflow drops the NEW event: the
-        // record then simply never advances (it keeps occupying capacity, the
-        // safe direction) instead of corrupting another record's event.
-        static constexpr size_t kMaxQueuedEvents = 256;
         static constexpr size_t kMaxCompletions = 128;
         // Terminal completions are retained this many pumps for pollers that
         // never acknowledge (bounded expiry).
@@ -211,25 +220,45 @@ namespace living
         // --- Bulk-reservation verification (legacy mass factory) -----------
         // The bulk factory reserves one shared slot per queued character but
         // cannot register hundreds of records in this bounded registry.
-        // Instead it registers ONE execution-ordered count readback per
-        // touched account, issued AFTER all its saves were queued on the same
-        // FIFO thread: when that readback returns (any successful readback -
-        // the barrier property is what matters, not the value), the account's
-        // bulk reservations are released; failed readbacks retry bounded, and
-        // exhaustion KEEPS the reservations - capacity stays blocked in the
-        // conservative direction, never released on "SaveToDB returned".
+        // Instead each bulk RUN registers one GENERATION per touched account:
+        // a monotonic token owning exactly the slots that run reserved, with
+        // its count readback queued AFTER that generation's saves on the same
+        // FIFO thread. The barrier property is generation-scoped: a readback
+        // releases ONLY its own generation's slots - it proves nothing about
+        // reservations added after its query was queued, so generations are
+        // never merged. Failed readbacks retry bounded per generation, and
+        // exhaustion KEEPS that generation's reservations - capacity stays
+        // blocked in the conservative direction, never released on "SaveToDB
+        // returned". Stale or duplicate generation results match nothing and
+        // are ignored.
 
         static constexpr uint32_t kMaxBulkVerifyAttempts = 5;
 
-        void BeginBulkVerify(uint32_t accountId, uint32_t reservedSlots, CreationFinalizerOps const& ops)
+        // Returns the generation token (0 for an empty registration). The
+        // caller must queue this generation's saves BEFORE calling (the
+        // request is issued here, after them, preserving FIFO ordering).
+        uint64_t BeginBulkVerify(uint32_t accountId, uint32_t reservedSlots, CreationFinalizerOps const& ops)
         {
             if (reservedSlots == 0)
-                return;
+                return 0;
 
-            bool const alreadyPending = bulkVerifies.find(accountId) != bulkVerifies.end();
-            bulkVerifies[accountId].reservedSlots += reservedSlots;
-            if (!alreadyPending && ops.requestBulkCountVerify)
-                ops.requestBulkCountVerify(accountId);
+            uint64_t const generation = nextToken++;
+            BulkVerify& entry = bulkVerifies[generation];
+            entry.accountId = accountId;
+            entry.reservedSlots = reservedSlots;
+
+            if (!ops.requestBulkCountVerify || !ops.requestBulkCountVerify(accountId, generation))
+                StoreBulkOutcome(generation, RowVerifyOutcome::QueryFailed); // bounded retry from the pump
+
+            return generation;
+        }
+
+        // SQL-callback entry for bulk count readbacks: copies the outcome
+        // into the generation's mailbox and returns. Unknown generations
+        // (stale, duplicate, completed) are ignored.
+        void OnBulkCallbackResult(uint64_t generation, RowVerifyOutcome outcome)
+        {
+            StoreBulkOutcome(generation, outcome);
         }
 
         uint32_t PendingBulkVerifyCount() const { return static_cast<uint32_t>(bulkVerifies.size()); }
@@ -238,62 +267,102 @@ namespace living
 
         // Registers the record (adopting the caller's account reservation when
         // record.holdsAccountReservation is set) and schedules the first
-        // verification. Returns the creation token.
+        // verification. Returns the creation token. Callback storage lives in
+        // the record itself, so admission (CanAdmit) is what bounds callback
+        // work - an admitted record's callback can never be dropped.
         uint64_t Begin(Record record, CreationFinalizerOps const& ops)
         {
             record.token = nextToken++;
             uint32_t const guid = record.guid;
             uint64_t const token = record.token;
             tokenToGuid[token] = guid;
-            records[guid] = std::move(record);
-            if (ops.requestVerify)
-                ops.requestVerify(guid);
+            Record& stored = records[guid];
+            stored = std::move(record);
+            if (!ops.requestVerify || !ops.requestVerify(guid))
+            {
+                // Enqueue failure: feed a QueryFailed outcome through the
+                // record's own mailbox so the bounded verify-retry path owns
+                // it (one attempt consumed per pump, then quarantine).
+                stored.hasPendingOutcome = true;
+                stored.pendingOutcome = RowVerifyOutcome::QueryFailed;
+                stored.pendingKind = CreationCallbackKind::Verify;
+            }
             return token;
         }
 
-        // The ONLY entry point for SQL result callbacks: copies the parsed
-        // outcome into the bounded queue and returns. No lifecycle transition,
-        // no ops callable, no database work happens here.
+        // The ONLY entry point for ordinary SQL result callbacks: copies the
+        // parsed outcome into the record's mailbox and returns. No lifecycle
+        // transition, no ops callable, no database work happens here. A
+        // callback for an erased/unknown record is ignored (its work is
+        // already terminal).
         void OnCallbackResult(uint32_t guid, RowVerifyOutcome outcome, CreationCallbackKind kind)
         {
-            if (queue.size() >= kMaxQueuedEvents)
-            {
-                ++droppedEvents;
+            auto it = records.find(guid);
+            if (it == records.end())
                 return;
-            }
 
-            queue.push_back(CreationCallbackEvent{ guid, outcome, kind });
+            it->second.hasPendingOutcome = true;
+            it->second.pendingOutcome = outcome;
+            it->second.pendingKind = kind;
         }
 
-        // Drains queued callback events and drives every lifecycle transition,
-        // metadata write, cleanup, retry and follow-up query. `onTerminal`
-        // observes each terminal completion BEFORE its record is removed (the
-        // batch coordinator and logging hook in).
+        // Consumes every stored callback outcome and drives every lifecycle
+        // transition, metadata write, cleanup, retry and follow-up query.
+        // `onTerminal` observes each terminal completion BEFORE its record is
+        // removed (the batch coordinator and logging hook in).
         void Pump(CreationFinalizerOps const& ops,
             std::function<void(CreationCompletion const&)> const& onTerminal = {})
         {
             ++pumpCount;
 
-            while (!queue.empty())
+            // Collect first, process second: processing can erase records
+            // (and enqueue-failure synthesis can store new outcomes that
+            // belong to the NEXT pump).
+            struct DueOutcome
             {
-                CreationCallbackEvent const event = queue.front();
-                queue.pop_front();
-
-                if (event.kind == CreationCallbackKind::BulkCount)
-                {
-                    ProcessBulkCount(event.guid /*accountId*/, event.outcome, ops);
+                uint32_t guid;
+                RowVerifyOutcome outcome;
+                CreationCallbackKind kind;
+            };
+            std::vector<DueOutcome> due;
+            for (auto& [guid, record] : records)
+            {
+                if (!record.hasPendingOutcome)
                     continue;
-                }
 
-                auto it = records.find(event.guid);
+                record.hasPendingOutcome = false;
+                due.push_back(DueOutcome{ guid, record.pendingOutcome, record.pendingKind });
+            }
+
+            for (DueOutcome const& outcome : due)
+            {
+                auto it = records.find(outcome.guid);
                 if (it == records.end())
                     continue;
 
-                if (event.kind == CreationCallbackKind::Verify)
-                    ProcessVerify(it->second, event.outcome, ops, onTerminal);
+                if (outcome.kind == CreationCallbackKind::Verify)
+                    ProcessVerify(it->second, outcome.outcome, ops, onTerminal);
                 else
-                    ProcessCleanupVerify(it->second, event.outcome, ops, onTerminal);
+                    ProcessCleanupVerify(it->second, outcome.outcome, ops, onTerminal);
             }
+
+            struct DueBulk
+            {
+                uint64_t generation;
+                RowVerifyOutcome outcome;
+            };
+            std::vector<DueBulk> dueBulk;
+            for (auto& [generation, entry] : bulkVerifies)
+            {
+                if (!entry.hasPendingOutcome)
+                    continue;
+
+                entry.hasPendingOutcome = false;
+                dueBulk.push_back(DueBulk{ generation, entry.pendingOutcome });
+            }
+
+            for (DueBulk const& outcome : dueBulk)
+                ProcessBulkCount(outcome.generation, outcome.outcome, ops);
 
             PruneExpiredCompletions();
         }
@@ -358,22 +427,51 @@ namespace living
         }
 
         size_t RecordCount() const { return records.size(); }
-        size_t QueuedEventCount() const { return queue.size(); }
-        uint32_t DroppedEventCount() const { return droppedEvents; }
+
+        // Stored-but-unconsumed callback outcomes (record mailboxes plus bulk
+        // generation mailboxes).
+        size_t PendingCallbackCount() const
+        {
+            size_t count = 0;
+            for (auto const& [guid, record] : records)
+                if (record.hasPendingOutcome)
+                    ++count;
+            for (auto const& [generation, entry] : bulkVerifies)
+                if (entry.hasPendingOutcome)
+                    ++count;
+            return count;
+        }
 
     private:
-        struct CreationCallbackEvent
-        {
-            uint32_t guid = 0;
-            RowVerifyOutcome outcome = RowVerifyOutcome::QueryFailed;
-            CreationCallbackKind kind = CreationCallbackKind::Verify;
-        };
-
         struct StoredCompletion
         {
             CreationCompletion completion;
             uint64_t expiresAtPump = 0;
         };
+
+        // Feeds an outcome into a record's mailbox from PUMP context (retry
+        // request enqueue failures): consumed on the NEXT pump, which paces
+        // the bounded retries one attempt per tick.
+        void StoreRecordOutcome(uint32_t guid, RowVerifyOutcome outcome, CreationCallbackKind kind)
+        {
+            auto it = records.find(guid);
+            if (it == records.end())
+                return;
+
+            it->second.hasPendingOutcome = true;
+            it->second.pendingOutcome = outcome;
+            it->second.pendingKind = kind;
+        }
+
+        void StoreBulkOutcome(uint64_t generation, RowVerifyOutcome outcome)
+        {
+            auto it = bulkVerifies.find(generation);
+            if (it == bulkVerifies.end())
+                return; // stale/duplicate/completed generation: ignored
+
+            it->second.hasPendingOutcome = true;
+            it->second.pendingOutcome = outcome;
+        }
 
         void ProcessVerify(Record& record, RowVerifyOutcome outcome, CreationFinalizerOps const& ops,
             std::function<void(CreationCompletion const&)> const& onTerminal)
@@ -383,8 +481,10 @@ namespace living
                 case CreationStage::PendingPersistence:
                     if (outcome == RowVerifyOutcome::Verified)
                         FinalizeVerified(record, ops, onTerminal);
-                    else if (ops.requestVerify)
-                        ops.requestVerify(record.guid); // bounded retry of a failed query
+                    // Bounded retry of a failed query; a failed ENQUEUE feeds
+                    // back through the mailbox and consumes the next attempt.
+                    else if (!ops.requestVerify || !ops.requestVerify(record.guid))
+                        StoreRecordOutcome(record.guid, RowVerifyOutcome::QueryFailed, CreationCallbackKind::Verify);
                     break;
                 case CreationStage::FailedRetryable:
                     // The character transaction executed and rolled back; no
@@ -432,23 +532,27 @@ namespace living
 
             if (ops.deleteCharacter)
                 ops.deleteCharacter(record.guid, record.accountId);
-            if (ops.requestCleanupVerify)
-                ops.requestCleanupVerify(record.guid);
+            if (!ops.requestCleanupVerify || !ops.requestCleanupVerify(record.guid))
+                StoreRecordOutcome(record.guid, RowVerifyOutcome::QueryFailed, CreationCallbackKind::CleanupVerify);
         }
 
-        void ProcessBulkCount(uint32_t accountId, RowVerifyOutcome outcome, CreationFinalizerOps const& ops)
+        void ProcessBulkCount(uint64_t generation, RowVerifyOutcome outcome, CreationFinalizerOps const& ops)
         {
-            auto it = bulkVerifies.find(accountId);
+            auto it = bulkVerifies.find(generation);
             if (it == bulkVerifies.end())
-                return;
+                return; // stale/duplicate generation result: ignored
+
+            uint32_t const accountId = it->second.accountId;
 
             if (outcome != RowVerifyOutcome::QueryFailed)
             {
-                // The execution-ordered readback returned: every bulk save for
-                // this account has executed (success or rollback), so the
-                // durable count now reflects reality and the reservations are
-                // released - a rolled-back save occupies nothing, a landed one
-                // is in the durable count.
+                // The execution-ordered readback for THIS generation returned:
+                // every save queued before its barrier has executed (success
+                // or rollback), so exactly this generation's reservations are
+                // released - a rolled-back save occupies nothing, a landed
+                // one is in the durable count. Reservations of NEWER
+                // generations (saves queued after this barrier) stay
+                // untouched until their own barriers complete.
                 for (uint32_t i = 0; i < it->second.reservedSlots; ++i)
                     ReleaseAccountSlot(accountId);
                 bulkVerifies.erase(it);
@@ -457,17 +561,20 @@ namespace living
 
             if (++it->second.attempts >= kMaxBulkVerifyAttempts)
             {
-                // Bounded give-up KEEPS the reservations: unknown durable
-                // occupancy stays charged (the conservative direction) and the
-                // caller logs the stuck capacity.
+                // Bounded give-up KEEPS this generation's reservations:
+                // unknown durable occupancy stays charged (the conservative
+                // direction) and the caller logs the stuck capacity.
                 if (ops.onBulkVerifyGaveUp)
                     ops.onBulkVerifyGaveUp(accountId, it->second.reservedSlots);
                 bulkVerifies.erase(it);
                 return;
             }
 
-            if (ops.requestBulkCountVerify)
-                ops.requestBulkCountVerify(accountId);
+            // A retry of an old generation may execute after newer saves -
+            // harmless, because it still releases only this generation's
+            // slots. A failed ENQUEUE feeds back through the mailbox.
+            if (!ops.requestBulkCountVerify || !ops.requestBulkCountVerify(accountId, generation))
+                StoreBulkOutcome(generation, RowVerifyOutcome::QueryFailed);
         }
 
         void ProcessCleanupVerify(Record& record, RowVerifyOutcome outcome, CreationFinalizerOps const& ops,
@@ -543,18 +650,21 @@ namespace living
 
         struct BulkVerify
         {
+            uint32_t accountId = 0;
             uint32_t reservedSlots = 0;
             uint32_t attempts = 0;
+            // Per-generation callback mailbox (same losslessness rule as the
+            // per-record mailboxes).
+            bool hasPendingOutcome = false;
+            RowVerifyOutcome pendingOutcome = RowVerifyOutcome::QueryFailed;
         };
 
         std::map<uint32_t, Record> records;        // by character GUID
         std::map<uint64_t, uint32_t> tokenToGuid;  // erased with the record
-        std::map<uint32_t, BulkVerify> bulkVerifies; // by account id
-        std::deque<CreationCallbackEvent> queue;
+        std::map<uint64_t, BulkVerify> bulkVerifies; // by GENERATION token
         std::map<uint64_t, StoredCompletion> completions;
         std::map<uint32_t, uint32_t> reservedSlots; // account -> reserved character slots
         uint64_t nextToken = 1;
         uint64_t pumpCount = 0;
-        uint32_t droppedEvents = 0;
     };
 }

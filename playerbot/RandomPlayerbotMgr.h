@@ -241,6 +241,12 @@ public:
         bool TryReadRequiredEvents(uint32 bot, std::initializer_list<std::pair<char const*, uint32*>> reads);
         std::string GetEventData(uint32 bot, std::string event);
         bool SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data = "");
+        // Typed durability result RELATIVE TO THE REQUESTED STATE: a reported
+        // execution failure is not proof of non-mutation, so this reloads and
+        // classifies (DesiredStateConfirmed / DefinitelyNotApplied /
+        // StateUnknown). Compensation logic must use THIS - the bool wrapper
+        // above returns true only for DesiredStateConfirmed.
+        living::EventWriteResult SetEventValueEx(uint32 bot, std::string const& event, uint32 value, uint32 validIn, std::string const& data = "");
         // Reloads ONE durable event row into the cache with a typed outcome:
         // only a successful COUNT confirms absence; a failed query preserves
         // the prior cached value (the caller marks the entry dirty).

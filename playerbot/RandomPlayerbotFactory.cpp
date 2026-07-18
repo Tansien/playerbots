@@ -775,10 +775,19 @@ void RandomPlayerbotFactory::CreateRandomBots()
     {
         std::ostringstream out; out << sPlayerbotAIConfig.randomBotAccountPrefix << accountNumber;
         std::string accountName = out.str();
-        auto results = LoginDatabase.PQuery("SELECT id FROM account where username = '%s'", accountName.c_str());
-        if (results)
-        {
+
+        // Typed existence lookup: only a CONFIRMED Missing may create. A
+        // failed lookup used to read as "absent" and create a duplicate
+        // account as a side effect of a database outage; it now aborts the
+        // provisioning loop (retried on the next startup/reload).
+        uint32 existingAccountId = 0;
+        AccountLookupOutcome const lookup = PlayerbotHolder::TryLookupAccountId(accountName, existingAccountId);
+        if (lookup == AccountLookupOutcome::Found)
             continue;
+        if (lookup == AccountLookupOutcome::DatabaseUnavailable)
+        {
+            sLog.outError("CreateRandomBots: account lookup for '%s' unavailable; aborting account provisioning until the next reload", accountName.c_str());
+            break;
         }
 
         std::string password = "";
@@ -909,12 +918,18 @@ void RandomPlayerbotFactory::CreateRandomBots()
         std::ostringstream out; out << sPlayerbotAIConfig.randomBotAccountPrefix << accountNumber;
         std::string accountName = out.str();
 
-        auto results = LoginDatabase.PQuery("SELECT id FROM account where username = '%s'", accountName.c_str());
-        if (!results)
+        // Typed existence lookup: a missing account is skipped, but a FAILED
+        // lookup aborts the whole bulk run - the same fail-closed rule as the
+        // count queries below.
+        uint32 accountId = 0;
+        AccountLookupOutcome const lookup = PlayerbotHolder::TryLookupAccountId(accountName, accountId);
+        if (lookup == AccountLookupOutcome::Missing)
             continue;
-
-        Field* fields = results->Fetch();
-        uint32 accountId = fields[0].GetUInt32();
+        if (lookup == AccountLookupOutcome::DatabaseUnavailable)
+        {
+            sLog.outError("CreateRandomBots: account lookup for '%s' unavailable; aborting bulk creation until the next reload", accountName.c_str());
+            break;
+        }
 
         sPlayerbotAIConfig.randomBotAccounts.push_back(accountId);
 

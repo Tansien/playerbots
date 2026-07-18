@@ -123,6 +123,28 @@ namespace living
         Persisted,
     };
 
+    // Detailed durability result of one event write RELATIVE TO THE REQUESTED
+    // STATE. A reported execution failure is NOT proof that nothing mutated:
+    // the statement may have applied and the failure been reported anyway, so
+    // the setter reloads and classifies. Compensation logic must branch on
+    // this - the old bool collapsed "definitely untouched" and "possibly
+    // applied" into the same false.
+    enum class EventWriteResult
+    {
+        // Durable state provably equals the requested value (the write
+        // succeeded, or a reload after a reported failure proved the value
+        // landed anyway).
+        DesiredStateConfirmed,
+        // The failure occurred BEFORE any mutation (schema rejection, failed
+        // probe), or a reload proved the known prior value remained: durable
+        // state is confirmed unchanged.
+        DefinitelyNotApplied,
+        // Execution was attempted and the resulting durable state cannot be
+        // confirmed (reload failed, or shows neither the requested nor the
+        // prior value).
+        StateUnknown,
+    };
+
     // Drives the execution-confirmed persistence flow for one event write:
     // schema validation first, then value == 0 -> Delete; otherwise a
     // synchronous existence probe decides Update (matching rows exist) vs
