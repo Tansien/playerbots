@@ -1246,10 +1246,12 @@ void PlayerbotAI::HandleTeleportAck()
     // acknowledgement above landed it on the accepted destination, finalize it
     // now (full reset, Refresh, homebind, inn binding, revive markers,
     // scheduling) - skip the plain Reset in that case so the acknowledgement
-    // resets exactly once. Any other completion result (a mismatched landing
-    // terminally cancels its obsolete record) falls through to the normal
-    // post-teleport Reset.
-    if (sRandomPlayerbotMgr.FinalizeRelocation(bot) == living::RelocationCompleteResult::Completed)
+    // resets exactly once. Finalizing means the runtime reset ran but durable
+    // side effects are still being confirmed/retried from the pump - the
+    // plain Reset must be skipped then too. Any other result (no record, a
+    // mismatched landing terminally cancelling its obsolete record) falls
+    // through to the normal post-teleport Reset.
+    if (sRandomPlayerbotMgr.FinalizeRelocation(bot) != living::RelocationAdvanceResult::NoPending)
         return;
 
     Reset();

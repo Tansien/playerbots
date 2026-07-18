@@ -12,32 +12,6 @@
 
 using namespace ai;
 
-namespace
-{
-    // Shared same-account admission check (finding: bots bid on online sibling
-    // characters' auctions - the cores only block same-account bids for
-    // OFFLINE owners). Resolves the owner's account and fails CLOSED when the
-    // lookup cannot resolve; ownerless (auction-house-bot) listings pass.
-    // Applied at scan time, immediately before BidItem, and again inside
-    // BidItem at the packet boundary as defense in depth.
-    bool IsAdmissibleAuction(Player* bot, AuctionEntry const* auction)
-    {
-        uint32 ownerAccount = 0;
-        bool ownerAccountKnown = false;
-        if (auction->owner != 0)
-        {
-            ownerAccount = sObjectMgr.GetPlayerAccountIdByGUID(ObjectGuid(HIGHGUID_PLAYER, auction->owner));
-            ownerAccountKnown = ownerAccount != 0;
-            if (!ownerAccountKnown)
-                sLog.outError("AhAction: cannot resolve owner account for auction %u (owner guid %u); rejecting bid by %s",
-                    auction->Id, auction->owner, bot->GetName());
-        }
-
-        return !living::RejectAuctionBidder(auction->owner, bot->GetGUIDLow(),
-            ownerAccountKnown, ownerAccount, bot->GetSession()->GetAccountId());
-    }
-}
-
 bool AhAction::Execute(Event& event)
 {
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
@@ -49,6 +23,12 @@ bool AhAction::Execute(Event& event)
         Unit* npc = bot->GetNPCIfCanInteractWith(*i, UNIT_NPC_FLAG_AUCTIONEER);
         if (!npc)
             continue;
+
+        // Action-scoped preparation BEFORE the AH mutex: the bid action loads
+        // its sibling set here (one DB round trip), so no query ever runs
+        // under the mutex and a failed lookup fails the whole action closed.
+        if (!PrepareAction())
+            return false;
 
         if (!sRandomPlayerbotMgr.m_ahActionMutex.try_lock()) //Another bot is using the Auction right now. Try again later.
             return false;
@@ -62,6 +42,41 @@ bool AhAction::Execute(Event& event)
 
     ai->TellPlayerNoFacing(requester, "Cannot find auctioneer nearby");
     return false;
+}
+
+bool AhBidAction::PrepareAction()
+{
+    // ONE account lookup per bid action, before the AH mutex: every character
+    // GUID on the bidder's account. Same-account admission for every listing
+    // in this action is then a pure set check - the per-listing
+    // GetPlayerAccountIdByGUID resolution performed a synchronous
+    // CharacterDatabase round trip for every offline owner, turning a full
+    // scan into thousands of serial queries on the world thread.
+    uint32 const account = bot->GetSession()->GetAccountId();
+    bidderSiblings = living::AuctionBidderSiblings::Load(bot->GetGUIDLow(),
+        [account]() -> std::optional<std::vector<uint32>>
+        {
+            // The bidder's own character row exists on this account, so a null
+            // result here is a FAILED query, never a valid empty set.
+            auto result = CharacterDatabase.PQuery(
+                "SELECT guid FROM characters WHERE account = '%u'", account);
+            if (!result)
+                return std::nullopt;
+
+            std::vector<uint32> guids;
+            do
+            {
+                guids.push_back(result->Fetch()[0].GetUInt32());
+            } while (result->NextRow());
+
+            return guids;
+        });
+
+    if (!bidderSiblings.loaded)
+        sLog.outError("AhBidAction: sibling lookup failed for account %u; failing the whole bid action closed for %s",
+            account, bot->GetName());
+
+    return bidderSiblings.loaded;
 }
 
 bool AhAction::ExecuteCommand(Player* requester, std::string text, Unit* auctioneer)
@@ -308,9 +323,10 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!auction)
                 continue;
 
-            // Never bid on the bot's own account's auctions (incl. online
-            // siblings); unresolvable owner accounts fail closed.
-            if (!IsAdmissibleAuction(bot, auction))
+            // Never bid on the bot's own account's auctions (incl. online AND
+            // offline siblings - the preloaded set covers both); ownerless
+            // (auction-house-bot) listings pass. Pure set check, no query.
+            if (bidderSiblings.Rejects(auction->owner))
                 continue;
 
             // Also skip auctions the bot is already winning: the core accepts a
@@ -410,8 +426,8 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             auction = auctionHouse->GetAuction(candidate.auctionId);
 
             // Gone, changed hands (incl. onto this account), or the bot became
-            // high bidder meanwhile.
-            if (!auction || !IsAdmissibleAuction(bot, auction) || auction->bidder == bot->GetGUIDLow())
+            // high bidder meanwhile. Same preloaded sibling set - no query.
+            if (!auction || bidderSiblings.Rejects(auction->owner) || auction->bidder == bot->GetGUIDLow())
                 continue;
 
             usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(auction).GetQualifier());
@@ -510,12 +526,11 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     {
         auction = curAuction.second;
 
-        // Skip own-account auctions (incl. online siblings; fail closed on
-        // unresolvable owners) and auctions the bot is already winning (the
-        // core accepts a same-bidder raise and charges the delta).
-        if (!auction || !IsAdmissibleAuction(bot, auction) || auction->bidder == bot->GetGUIDLow())
+        if (!auction)
             continue;
 
+        // Item-link/name matching runs FIRST: most listings fail the match,
+        // so no admission work is spent on them.
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
 
         if (!proto || !proto->Name1)
@@ -527,6 +542,13 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
                 continue;
         }
         else if (!strstri(proto->Name1, itemQuery.c_str()))
+            continue;
+
+        // Skip own-account auctions (online AND offline siblings via the
+        // preloaded set; fail closed when the set failed to load) and auctions
+        // the bot is already winning (the core accepts a same-bidder raise and
+        // charges the delta).
+        if (bidderSiblings.Rejects(auction->owner) || auction->bidder == bot->GetGUIDLow())
             continue;
 
         // ONE exact bid cost per candidate, mirroring the core handler's
@@ -556,7 +578,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
     // the scan-time cost ranked candidates, it does not authorize spending.
     BidCandidate const& best = candidates.front();
     auction = auctionHouse->GetAuction(best.auctionId);
-    if (!auction || !IsAdmissibleAuction(bot, auction) || auction->bidder == bot->GetGUIDLow())
+    if (!auction || bidderSiblings.Rejects(auction->owner) || auction->bidder == bot->GetGUIDLow())
         return false;
 
     uint32 currentCost = 0;
@@ -590,7 +612,8 @@ bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price
 
     // Defense in depth at the packet-send boundary: no same-account bid may
     // leave this function regardless of which scan admitted the candidate.
-    if (!IsAdmissibleAuction(bot, auction))
+    // Same preloaded sibling set as the scans - still no per-auction query.
+    if (bidderSiblings.Rejects(auction->owner))
         return false;
 
     WorldPacket packet;

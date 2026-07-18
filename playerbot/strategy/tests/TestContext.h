@@ -32,8 +32,15 @@ namespace ai
         uint32 focusMobEntry;                   
         ObjectGuid focusMobGuid;                
         bool focusMobKilled;                    
-        std::vector<ObjectGuid> spawnedBots;    
-        std::vector<std::string> monitors;      
+        std::vector<ObjectGuid> spawnedBots;
+        // Outstanding asynchronous creation for the `spawn` command: the
+        // command returns PENDING and polls this token until the finalizer
+        // reports a terminal result (the finalized GUID then joins
+        // spawnedBots for cleanup). Opaque - never a GUID.
+        uint64_t spawnBotToken = 0;
+        // Outstanding asynchronous batch for the `mgroup` command.
+        uint64_t spawnGroupBatchToken = 0;
+        std::vector<std::string> monitors;
         std::vector<std::string> deferredCleanups;
         size_t cleanupPc;
         bool cleanupPrepared;

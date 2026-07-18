@@ -1,5 +1,6 @@
 #pragma once
 #include "GenericActions.h"
+#include "playerbot/living/util/LivingAuction.h"
 
 namespace ai
 {
@@ -9,9 +10,15 @@ namespace ai
         AhAction(PlayerbotAI* ai, std::string name = "ah") : ChatCommandAction(ai, name) {}
         virtual bool Execute(Event& event) override;
 
+    protected:
+        // Action-scoped preparation, run BEFORE the AH mutex is taken (so a DB
+        // round trip never happens under the mutex). Returning false fails the
+        // whole action closed. The bid action loads its sibling set here.
+        virtual bool PrepareAction() { return true; }
+
     private:
         virtual bool ExecuteCommand(Player* requester, std::string text, Unit* auctioneer);
-        bool PostItem(Player* requester, Item* item, uint32 price, Unit* auctioneer, uint32 time);       
+        bool PostItem(Player* requester, Item* item, uint32 price, Unit* auctioneer, uint32 time);
 
 #ifdef GenerateBotHelp
         virtual std::string GetHelpName() { return "ah"; } //Must equal iternal name
@@ -47,8 +54,17 @@ namespace ai
         virtual std::vector<std::string> GetUsedActions() { return {}; }
         virtual std::vector<std::string> GetUsedValues() { return { "nearest npcs", "item usage", "free money for" }; }
 #endif 
+    protected:
+        virtual bool PrepareAction() override;
+
     private:
         virtual bool ExecuteCommand(Player* requester, std::string text, Unit* auctioneer);
         bool BidItem(Player* requester, AuctionEntry* auction, uint32 price, Unit* auctioneer, bool isBuyout, std::string reason = "");
+
+        // The bidder account's character GUIDs, loaded ONCE per action by
+        // PrepareAction and reused by every scan, pre-bid revalidation and the
+        // BidItem packet boundary - admission is a pure set membership check,
+        // never a per-auction account lookup.
+        living::AuctionBidderSiblings bidderSiblings;
     };
 }

@@ -142,3 +142,72 @@ LIVING_TEST(auction_standing_bid_cap_boundaries)
     bool const isBuyout = true;
     LIVING_CHECK(!(!isBuyout && !capped.CanPlaceStandingBid()));
 }
+
+LIVING_TEST(auction_bidder_rejection_is_a_pure_sibling_set_check)
+{
+    // Direct coverage of the RejectAuctionBidder admission rule (packet
+    // boundary and every scan/revalidation):
+    // - owner GUID 0 (ownerless auction-house-bot listing): allowed;
+    // - owner equals bidder: rejected;
+    // - owner in the bidder account's sibling set: rejected;
+    // - unknown sibling set (lookup failed): fail closed, rejected;
+    // - otherwise: allowed.
+    LIVING_CHECK(!RejectAuctionBidder(0, 100, true, false));   // ownerless
+    LIVING_CHECK(!RejectAuctionBidder(0, 100, false, false));  // ownerless even fail-closed
+    LIVING_CHECK(RejectAuctionBidder(100, 100, true, false));  // self-owned
+    LIVING_CHECK(RejectAuctionBidder(101, 100, true, true));   // account sibling
+    LIVING_CHECK(RejectAuctionBidder(101, 100, false, false)); // unknown set: closed
+    LIVING_CHECK(!RejectAuctionBidder(200, 100, true, false)); // different account
+}
+
+LIVING_TEST(auction_bidder_siblings_load_once_for_any_number_of_listings)
+{
+    // The task-3 query-count contract: the loader runs EXACTLY once per
+    // action, no matter how many listings are admitted afterwards - admission
+    // is set membership, never a per-auction account lookup.
+    int loaderCalls = 0;
+    AuctionBidderSiblings const siblings = AuctionBidderSiblings::Load(100,
+        [&loaderCalls]() -> std::optional<std::vector<uint32_t>>
+        {
+            ++loaderCalls;
+            // The set covers ONLINE and OFFLINE siblings alike: the character
+            // table has no online filter, which is exactly why the core's
+            // offline-only protection was insufficient.
+            return std::vector<uint32_t>{ 100, 101, 102 };
+        });
+
+    LIVING_CHECK(loaderCalls == 1);
+    LIVING_CHECK(siblings.loaded);
+
+    for (int i = 0; i < 1000; ++i)
+    {
+        LIVING_CHECK(siblings.Rejects(100));  // self
+        LIVING_CHECK(siblings.Rejects(101));  // sibling (online or offline)
+        LIVING_CHECK(siblings.Rejects(102));  // sibling (online or offline)
+        LIVING_CHECK(!siblings.Rejects(0));   // ownerless
+        LIVING_CHECK(!siblings.Rejects(555)); // different account
+    }
+    LIVING_CHECK(loaderCalls == 1);
+}
+
+LIVING_TEST(auction_bidder_siblings_lookup_failure_fails_closed)
+{
+    int loaderCalls = 0;
+    AuctionBidderSiblings const failed = AuctionBidderSiblings::Load(100,
+        [&loaderCalls]() -> std::optional<std::vector<uint32_t>>
+        {
+            ++loaderCalls;
+            return std::nullopt; // sibling query failed
+        });
+
+    LIVING_CHECK(loaderCalls == 1);
+    LIVING_CHECK(!failed.loaded);
+
+    // Fail closed: every owned listing is rejected (the production caller
+    // additionally fails the whole action and logs once); ownerless listings
+    // remain admissible.
+    LIVING_CHECK(failed.Rejects(100));
+    LIVING_CHECK(failed.Rejects(101));
+    LIVING_CHECK(failed.Rejects(999));
+    LIVING_CHECK(!failed.Rejects(0));
+}

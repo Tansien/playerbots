@@ -7,6 +7,7 @@
 #include "Database/DatabaseEnv.h"
 #include "Globals/SharedDefines.h"
 #include "playerbot/living/util/LivingBotCreation.h"
+#include "playerbot/living/util/LivingCreationBatch.h"
 
 
 class WorldPacket;
@@ -22,11 +23,14 @@ typedef std::map<std::string, std::set<std::string> > PlayerBotErrorMap;
 // (and use `guid` for the created character); `messages` is display text only
 // and must never be parsed to infer success. `createdClass`/`createdRole` are
 // the values the creation ACTUALLY persisted - group accounting must use these,
-// never its preselected assumptions.
+// never its preselected assumptions. A PendingPersistence result carries the
+// OPAQUE `creationToken` (never a GUID): callers poll it through
+// PlayerbotHolder::PollBotCreation until a terminal result arrives.
 struct BotCreationResult
 {
     living::BotCreateStatus status = living::BotCreateStatus::TerminalFailure;
     ObjectGuid guid;
+    uint64 creationToken = 0; // nonzero for PendingPersistence
     uint8 createdClass = 0;
     uint8 createdRole = 0; // ai::BotRoles derived from the created character
     std::list<std::string> messages;
@@ -114,7 +118,25 @@ public:
     void DepositTestResult(const std::string& testName, const std::string& result);
 #endif
 
+    // Polls one PendingPersistence creation token. Pending until the
+    // finalizer confirms a terminal outcome; a terminal result is retained
+    // (bounded) until acknowledged. Enqueueing was never success - callers
+    // must poll to a real terminal result.
+    static living::CreationPollResult PollBotCreation(uint64 creationToken, bool acknowledgeTerminal);
+    // Polls one HandleGroup batch token (asynchronous group completion).
+    static living::BatchPollResult PollBotCreationBatch(uint64 batchToken, bool acknowledgeComplete);
+    // Effective per-account character occupancy: durable characters plus the
+    // finalizer's pending/quarantined reservations. Admission must use this,
+    // never the durable count alone - a queued-but-unexecuted SaveToDB is
+    // invisible to the durable count.
+    static uint32 EffectiveCharacterCount(uint32 accountId);
+    static uint32 MaxCharsPerAccount();
+
     std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security);
+    // Batch-token surface: identical to HandleGroup but exposes the creation
+    // batch registered for the run (0 when nothing was enqueued or the batch
+    // registry is full). The test DSL polls this token for real completion.
+    std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security, uint64& batchToken);
 protected:
     virtual void OnBotLoginInternal(Player * const bot) = 0;
     virtual void OnBotDeleted(uint32 botGuid, uint32 accountId);
@@ -151,6 +173,12 @@ private:
         bool completed;
         uint32 expectedBotSpawnCount = 1;
         uint8 retry = 0;
+        // Outstanding asynchronous creation for this test's bot: the runner
+        // polls it to a REAL terminal result instead of assuming enqueueing
+        // succeeded (a parse/admission failure fails the test immediately, an
+        // async failure retries within the bounded budget).
+        uint64 creationToken = 0;
+        uint8 creationRetries = 0;
     };
 
     void UpdatePendingTests(uint32 elapsed);

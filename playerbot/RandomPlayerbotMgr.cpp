@@ -12,6 +12,7 @@
 #include "Accounts/AccountMgr.h"
 #include "Globals/ObjectMgr.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/DatabaseImpl.h"
 #include "PlayerbotAI.h"
 #include "Entities/Player.h"
 #include "playerbot/AiFactory.h"
@@ -759,7 +760,11 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
             if (GetPlayerBot(bot))
                 continue;   
 
-            if (!eventCache[bot].empty() && GetEventValue(bot, "login"))
+            // find() instead of operator[]: probing must not default-insert an
+            // empty per-bot map (that poisoned the explicit load-state
+            // bookkeeping the bulk loader relies on).
+            auto cachedBot = eventCache.find(bot);
+            if (cachedBot != eventCache.end() && !cachedBot->second.empty() && GetEventValue(bot, "login"))
             {
                 onlineBotCount++;
                 continue;
@@ -2207,11 +2212,11 @@ void RandomPlayerbotMgr::ScheduleRandomize(uint32 bot, uint32 time)
     SetEventValue(bot, "randomize", 1, time);
 }
 
-void RandomPlayerbotMgr::ScheduleTeleport(uint32 bot, uint32 time)
+bool RandomPlayerbotMgr::ScheduleTeleport(uint32 bot, uint32 time)
 {
     if (!time)
         time = 60 + urand(sPlayerbotAIConfig.randomBotTeleportMinInterval, sPlayerbotAIConfig.randomBotTeleportMaxInterval);
-    SetEventValue(bot, "teleport", 1, time);
+    return SetEventValue(bot, "teleport", 1, time);
 }
 
 void RandomPlayerbotMgr::ScheduleChangeStrategy(uint32 bot, uint32 time)
@@ -2476,86 +2481,111 @@ living::RelocationOutcome RandomPlayerbotMgr::Revive(Player* player)
     return RandomTeleportForLevel(player, false, false, /*reviveRecovery*/ true);
 }
 
-living::RelocationCompleteResult RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
+living::RelocationAdvanceResult RandomPlayerbotMgr::FinalizeRelocation(Player* bot)
 {
-    if (!bot || !relocations.HasPending(bot->GetGUIDLow()))
-        return living::RelocationCompleteResult::NoPending;
-
-    // The acknowledgement is complete only when the bot is back in-world and no
-    // longer teleporting; until then the record stays pending.
-    if (!bot->IsInWorld() || bot->IsBeingTeleported())
-        return living::RelocationCompleteResult::StillPending;
-
-    // Complete() verifies the bot is standing on the EXACT destination the
-    // accepted TeleportTo was given. A finished acknowledgement anywhere else
-    // means the tracked teleport chain is dead (redirected, clobbered, or
-    // superseded mid-chain): the obsolete record is erased - never left armed
-    // for a later unrelated landing - while revive/retry markers stay, so the
-    // recovery is retried rather than falsely completed.
-    living::PendingRelocation record;
-    living::RelocationCompleteResult const completion = relocations.Complete(
-        bot->GetGUIDLow(), bot->GetMapId(),
-        bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetOrientation(), record);
-
-    if (completion == living::RelocationCompleteResult::TerminalMismatch)
-    {
-        sLog.outDetail("Relocation of bot %s terminally cancelled: acknowledged landing does not match the accepted destination (token " UI64FMTD ")",
-            bot->GetName(), record.token);
-        return completion;
-    }
-
-    if (completion != living::RelocationCompleteResult::Completed)
-        return completion;
+    if (!bot)
+        return living::RelocationAdvanceResult::NoPending;
 
     uint32 const botGuid = bot->GetGUIDLow();
+    if (!relocations.HasPending(botGuid))
+        return living::RelocationAdvanceResult::NoPending;
 
-    // The homebind reuses the exact accepted destination and the area resolved
-    // from those FINAL coordinates (post-jitter, post-terrain-height), never a
-    // cached pre-adjustment location.
-    if (record.setHomebind)
-        bot->SetHomebindToLocation(WorldLocation(record.mapId, record.x, record.y, record.z, record.orientation), record.homebindAreaId);
+    if (!relocations.IsFinalizing(botGuid))
+    {
+        // The acknowledgement is complete only when the bot is back in-world
+        // and no longer teleporting; until then the record stays armed.
+        if (!bot->IsInWorld() || bot->IsBeingTeleported())
+            return living::RelocationAdvanceResult::NoPending;
 
-    // Exactly one FULL AI reset per completed relocation, unconditionally:
-    // Reset(true) clears old-map movement/travel/spell state and reinitializes
-    // the engines. Refresh's own internal reset is both plain (Reset(false))
-    // and skipped entirely when random levels are disabled, so relying on it
-    // let bots resume stale cross-map navigation.
-    bot->GetPlayerbotAI()->Reset(true);
+        // Acknowledge() verifies the bot is standing on the EXACT destination
+        // the accepted TeleportTo was given. A finished acknowledgement
+        // anywhere else means the tracked teleport chain is dead (redirected,
+        // clobbered, or superseded mid-chain): the obsolete record is erased -
+        // never left armed for a later unrelated landing - while revive/retry
+        // markers stay, so the recovery is retried rather than falsely
+        // completed. An exact landing moves the record to Finalizing; it is
+        // NOT erased - it now tracks the owed completion work.
+        living::PendingRelocation record;
+        switch (relocations.Acknowledge(botGuid, bot->GetMapId(),
+            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetOrientation(), record))
+        {
+            case living::RelocationAckResult::TerminalMismatch:
+                sLog.outDetail("Relocation of bot %s terminally cancelled: acknowledged landing does not match the accepted destination (token " UI64FMTD ")",
+                    bot->GetName(), record.token);
+                return living::RelocationAdvanceResult::NoPending;
+            case living::RelocationAckResult::NoPending:
+                return living::RelocationAdvanceResult::NoPending;
+            default:
+                break; // Landed / AlreadyFinalizing: advance below
+        }
+    }
 
-    // Refresh resurrects/repairs/refills - exactly once, and only now that the
-    // bot demonstrably arrived (it exits early during a far transfer, which is
-    // why running it on acceptance silently did nothing). resetAi=false: the
-    // full reset above already ran.
-    Refresh(bot, /*resetAi*/ false);
+    return AdvanceRelocation(bot);
+}
 
-    if (record.reviveRecovery)
+living::RelocationAdvanceResult RandomPlayerbotMgr::AdvanceRelocation(Player* bot)
+{
+    uint32 const botGuid = bot->GetGUIDLow();
+    living::PendingRelocation const* liveRecord = relocations.Find(botGuid);
+    if (!liveRecord || liveRecord->stage != living::RelocationStage::Finalizing)
+        return living::RelocationAdvanceResult::NoPending;
+
+    // Copy the request out: Advance may erase the live record on completion.
+    living::PendingRelocation const record = *liveRecord;
+
+    living::RelocationAdvanceOps ops;
+
+    ops.runtimeReset = [this, bot]()
+    {
+        // Exactly one FULL AI reset per completed relocation, unconditionally:
+        // Reset(true) clears old-map movement/travel/spell state and
+        // reinitializes the engines. Refresh's own internal reset is both
+        // plain (Reset(false)) and skipped entirely when random levels are
+        // disabled, so relying on it let bots resume stale cross-map
+        // navigation. Refresh resurrects/repairs/refills - exactly once, and
+        // only now that the bot demonstrably arrived (it exits early during a
+        // far transfer, which is why running it on acceptance silently did
+        // nothing). The done-flag in the record guarantees neither re-runs on
+        // later persistence-retry advances.
+        bot->GetPlayerbotAI()->Reset(true);
+        Refresh(bot, /*resetAi*/ false);
+    };
+
+    ops.clearReviveMarkers = [this, bot, botGuid]() -> living::MarkerClearOutcome
     {
         // Clear the retry markers only after ACTUAL recovery. If the bot is
         // somehow still dead (Refresh is guarded against battlegrounds), the
-        // markers stay and the next update cycle retries the revive.
-        if (!sServerFacade.UnitIsDead(bot))
-        {
-            SetEventValue(botGuid, "dead", 0, 0);
-            SetEventValue(botGuid, "revive", 0, 0);
-        }
-        else
+        // markers stay - deliberately - and the event-driven revive retry owns
+        // the next attempt; a failed WRITE, in contrast, is retried here.
+        if (sServerFacade.UnitIsDead(bot))
         {
             sLog.outDetail("Relocation of bot %s completed but the bot is still dead; revive markers kept", bot->GetName());
+            return living::MarkerClearOutcome::KeptStillDead;
         }
-    }
 
-    // Closest-inn selection runs from the post-acknowledgement position - the
-    // pre-ack origin used to be measured instead. The old -1.0f sentinel also
-    // made every nonnegative squared distance compare as "not closer", so no inn
-    // was ever selected.
-    if (record.bindInn)
+        bool cleared = SetEventValue(botGuid, "dead", 0, 0);
+        cleared = SetEventValue(botGuid, "revive", 0, 0) && cleared;
+        return cleared ? living::MarkerClearOutcome::Cleared : living::MarkerClearOutcome::WriteFailed;
+    };
+
+    ops.applyHomebind = [this, bot, &record]() -> std::optional<living::HomebindWrite>
     {
-        WorldPosition botPos(bot);
+        // The homebind reuses the exact accepted destination and the area
+        // resolved from those FINAL coordinates (post-jitter,
+        // post-terrain-height), never a cached pre-adjustment location.
+        if (record.setHomebind)
+        {
+            bot->SetHomebindToLocation(WorldLocation(record.mapId, record.x, record.y, record.z, record.orientation),
+                record.homebindAreaId);
+            return living::HomebindWrite{ record.mapId, record.x, record.y, record.z, record.homebindAreaId };
+        }
 
+        // Closest-inn selection runs from the post-acknowledgement position.
         // Only inns on the bot's CURRENT map are candidates: sqDistance has no
         // map awareness, so a foreign-map inn with numerically similar
         // coordinates could otherwise win and persist a homebind on the wrong
         // continent.
+        WorldPosition botPos(bot);
         ObjectGuid closestInn;
         WorldPosition closestInnPos;
         living::MapLocalMinimum closest(bot->GetMapId());
@@ -2568,46 +2598,139 @@ living::RelocationCompleteResult RandomPlayerbotMgr::FinalizeRelocation(Player* 
             }
         }
 
-        if (closestInn)
-        {
-            // Perform the REAL bind: the state change is the homebind fields
-            // (the innkeeper creature may not even be loaded this far away, so
-            // the SendBindPoint interaction path is not available). The old
-            // code only emitted SMSG_TRAINER_BUY_SUCCEEDED, which is a visual
-            // confirmation and binds nothing.
-            uint32 const innAreaId = sTerrainMgr.GetAreaId(closestInnPos.getMapId(),
-                closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ());
-            bot->SetHomebindToLocation(
-                WorldLocation(closestInnPos.getMapId(), closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ(), 0.0f),
-                innAreaId);
+        if (!closestInn)
+            return std::nullopt; // no eligible inn: nothing to write
 
-            // Legacy visual confirmation for nearby observers.
-            WorldPacket data(SMSG_TRAINER_BUY_SUCCEEDED, (8 + 4));
-            data << closestInn;
-            data << uint32(3286);                               // Bind
-            bot->GetSession()->SendPacket(data);
-        }
-    }
+        // Perform the REAL bind: the state change is the homebind fields (the
+        // innkeeper creature may not even be loaded this far away, so the
+        // SendBindPoint interaction path is not available).
+        uint32 const innAreaId = sTerrainMgr.GetAreaId(closestInnPos.getMapId(),
+            closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ());
+        bot->SetHomebindToLocation(
+            WorldLocation(closestInnPos.getMapId(), closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ(), 0.0f),
+            innAreaId);
 
-    //Travel cooldown for 10 minutes.
-    if (record.rpgTravelCooldown && bot->GetPlayerbotAI())
+        // Legacy visual confirmation for nearby observers.
+        WorldPacket data(SMSG_TRAINER_BUY_SUCCEEDED, (8 + 4));
+        data << closestInn;
+        data << uint32(3286);                               // Bind
+        bot->GetSession()->SendPacket(data);
+
+        return living::HomebindWrite{ closestInnPos.getMapId(),
+            closestInnPos.getX(), closestInnPos.getY(), closestInnPos.getZ(), innAreaId };
+    };
+
+    ops.requestHomebindVerify = [this, botGuid]()
     {
+        // SetHomebindToLocation queues an async UPDATE and returns void in
+        // every pinned core; this execution-ordered query (same FIFO delay
+        // thread) observes the row AFTER that write executed. Its callback
+        // only parses and enqueues - the outcome is processed by
+        // PumpPendingRelocations.
+        CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandleHomebindVerify, botGuid,
+            "SELECT map, zone, position_x, position_y, position_z FROM character_homebind WHERE guid = '%u'", botGuid);
+    };
+
+    ops.applyRpgCooldown = [bot]()
+    {
+        //Travel cooldown for 10 minutes.
         AiObjectContext* context = bot->GetPlayerbotAI()->GetAiObjectContext();
         TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target");
 
         sTravelMgr.SetNullTravelTarget(travelTarget);
         travelTarget->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
         travelTarget->SetExpireIn(10 * MINUTE * IN_MILLISECONDS);
+    };
+
+    ops.scheduleNextTeleport = [this, botGuid]()
+    {
+        // Follow-up scheduling records completed work only now that the work
+        // is actually complete - and a FAILED write keeps the record armed,
+        // so the old expired event cannot trigger an immediate second
+        // teleport; the write is retried from the pump.
+        return ScheduleTeleport(botGuid);
+    };
+
+    living::RelocationAdvanceResult const result = relocations.Advance(botGuid, ops);
+    if (result == living::RelocationAdvanceResult::Completed)
+        sLog.outDetail("Relocation of bot %s to map %u completed (token " UI64FMTD ")",
+            bot->GetName(), record.mapId, record.token);
+
+    return result;
+}
+
+void RandomPlayerbotMgr::HandleHomebindVerify(QueryResult* result, uint32 botGuid)
+{
+    // SQL result callback: parse the row into a typed outcome, enqueue it on
+    // the tracker, return. No database work, no lifecycle decisions - those
+    // run in PumpPendingRelocations, outside the result-queue mutex.
+    living::HomebindVerifyOutcome outcome = living::HomebindVerifyOutcome::QueryFailed;
+    if (result)
+    {
+        Field* fields = result->Fetch();
+        uint32 const mapId = fields[0].GetUInt32();
+        uint32 const zone = fields[1].GetUInt32();
+        float const x = fields[2].GetFloat();
+        float const y = fields[3].GetFloat();
+        float const z = fields[4].GetFloat();
+
+        outcome = living::HomebindVerifyOutcome::Mismatch;
+        if (living::PendingRelocation const* record = relocations.Find(botGuid))
+        {
+            // The core's homebind UPDATE serializes coordinates through "%f"
+            // (6 decimals), so the readback is not bit-exact: compare with a
+            // tolerance far above serialization noise and far below any real
+            // displacement.
+            auto withinTolerance = [](float a, float b) { return std::fabs(a - b) <= 0.1f; };
+            if (record->homebindTargetKnown
+                && record->homebindTargetMap == mapId
+                && record->homebindTargetArea == zone
+                && withinTolerance(record->homebindTargetX, x)
+                && withinTolerance(record->homebindTargetY, y)
+                && withinTolerance(record->homebindTargetZ, z))
+                outcome = living::HomebindVerifyOutcome::Match;
+        }
+    }
+    delete result;
+
+    relocations.OnHomebindVerifyResult(botGuid, outcome);
+}
+
+void RandomPlayerbotMgr::PumpPendingRelocations()
+{
+    // Apply drained homebind-verification callback events first (pump
+    // context: the result-queue mutex is not held here).
+    for (living::RelocationTracker::HomebindVerifyEvent const& event : relocations.DrainHomebindVerifyEvents())
+    {
+        switch (relocations.ApplyHomebindVerify(event.botGuid, event.outcome,
+            living::RelocationTracker::kMaxHomebindWriteAttempts))
+        {
+            case living::HomebindVerifyAction::GaveUp:
+                sLog.outError("Relocation homebind for bot %u could not be durably verified after %u attempts; completing with an UNVERIFIED homebind (may revert on restart)",
+                    event.botGuid, living::RelocationTracker::kMaxHomebindWriteAttempts);
+                break;
+            case living::HomebindVerifyAction::Reissue:
+                sLog.outDetail("Relocation homebind for bot %u not confirmed; reissuing the write", event.botGuid);
+                break;
+            default:
+                break;
+        }
     }
 
-    // Follow-up scheduling records completed work only now that the work is
-    // actually complete.
-    if (record.scheduleNextTeleport)
-        ScheduleTeleport(botGuid);
-
-    sLog.outDetail("Relocation of bot %s to map %u completed (token " UI64FMTD ")",
-        bot->GetName(), record.mapId, record.token);
-    return living::RelocationCompleteResult::Completed;
+    // Advance every Finalizing record: owed durable writes (revive markers,
+    // homebind chain, next-teleport scheduling) retry here until confirmed,
+    // and only then is the record - and its destination reservation -
+    // released.
+    for (uint32 const botGuid : relocations.FinalizingBots())
+    {
+        Player* bot = GetPlayerBot(botGuid);
+        if (bot && bot->IsInWorld() && bot->GetPlayerbotAI())
+            AdvanceRelocation(bot);
+        else if (!bot)
+            // The player is gone without the logout path having cancelled
+            // (defensive): release the record like every other logout.
+            relocations.Cancel(botGuid);
+    }
 }
 
 void RandomPlayerbotMgr::CancelPendingRelocation(uint32 botGuid)
@@ -2730,13 +2853,26 @@ namespace
                 uint32 botsNearTeleportPoint = 0;
                 sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* otherBot)
                 {
-                    // Only check the bots that are in the same zone
-                    if (otherBot && !otherBot->IsBeingTeleported() && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
+                    // Only check the bots that are in the same zone. A bot
+                    // with an in-flight relocation record is skipped here and
+                    // counted through its destination reservation below, so
+                    // each bot contributes exactly once.
+                    if (otherBot && !otherBot->IsBeingTeleported()
+                        && !sRandomPlayerbotMgr.HasPendingRelocation(otherBot->GetGUIDLow())
+                        && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
                     {
                         if (destination.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
                             botsNearTeleportPoint++;
                     }
                 });
+
+                // In-flight reservations: bots whose accepted relocation
+                // targets this vicinity but who have not landed/completed yet
+                // (PendingAck and Finalizing stages). Without them two bots
+                // could pass admission for the same empty destination and both
+                // land, exceeding the cap. The bot's own record is excluded.
+                botsNearTeleportPoint += sRandomPlayerbotMgr.CountPendingRelocationsNear(mapId, x, y,
+                    sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius, bot->GetGUIDLow());
 
                 if (botsNearTeleportPoint >= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmount)
                     return false;
@@ -2774,13 +2910,25 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
     if (bot->IsBeingTeleported())
         return living::RelocationOutcome::Rejected;
 
+    // A previous relocation still finalizing owed side effects (failed
+    // schedule/homebind writes retrying from the pump) blocks any new random
+    // relocation: an old expired teleport event must not trigger an immediate
+    // second teleport while the first one's completion is unconfirmed. This
+    // runs BEFORE TeleportTo so the tracker can never refuse a registration
+    // for an already-queued transfer.
+    if (relocations.IsFinalizing(bot->GetGUIDLow()))
+    {
+        sLog.outDetail("Random teleport skipped for bot %s: previous relocation still finalizing", bot->GetName());
+        return living::RelocationOutcome::Rejected;
+    }
+
     if (bot->InBattleGround())
         return living::RelocationOutcome::Rejected;
 
     if (bot->InBattleGroundQueue())
         return living::RelocationOutcome::Rejected;
 
-	if (bot->GetLevel() < 5)
+    if (bot->GetLevel() < 5)
         return living::RelocationOutcome::Rejected;
 
     // The remaining core TeleportTo rejection paths (verified against all three
@@ -2855,19 +3003,30 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
     {
         for (int attemtps = 0; attemtps < 3; ++attemtps)
         {
-            WorldLocation loc = tlocs[i];
+            WorldLocation const original = tlocs[i];
 
+            bool overrideDrawn = false;
+            WorldLocation overrideLoc = original;
 #ifdef MANGOSBOT_ONE
-            // Teleport to Dark Portal area if event is in progress
+            // Optional Dark Portal override while the opening event is in
+            // progress: drawn per attempt and tried FIRST, but it never
+            // REPLACES the raw candidate - when the portal tuple is rejected
+            // (map 0 not in the allowlist, inactive, over-density, bad
+            // terrain) the original candidate is tried in the SAME attempt,
+            // so only genuine exhaustion of the raw candidates can reach the
+            // wrappers' activeOnly=false fallback.
             if (sWorldState.GetExpansion() == EXPANSION_NONE && bot->GetLevel() > 54 && urand(0, 100) > 20)
             {
+                overrideDrawn = true;
                 if (urand(0, 1))
-                    loc = WorldLocation(uint32(0), -11772.43f, -3272.84f, -17.9f, 3.32447f);
+                    overrideLoc = WorldLocation(uint32(0), -11772.43f, -3272.84f, -17.9f, 3.32447f);
                 else
-                    loc = WorldLocation(uint32(0), -11741.70f, -3130.3f, -11.7936f, 3.32447f);
+                    overrideLoc = WorldLocation(uint32(0), -11741.70f, -3130.3f, -11.7936f, 3.32447f);
             }
 #endif
 
+            for (WorldLocation const& loc : living::OverrideThenOriginal(overrideDrawn, overrideLoc, original))
+            {
             float x = loc.coord_x + (attemtps > 0 ? urand(0, sPlayerbotAIConfig.grindDistance) - sPlayerbotAIConfig.grindDistance / 2 : 0);
             float y = loc.coord_y + (attemtps > 0 ? urand(0, sPlayerbotAIConfig.grindDistance) - sPlayerbotAIConfig.grindDistance / 2 : 0);
             float z = loc.coord_z;
@@ -2886,15 +3045,17 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
 
             z = 0.05f + ground;
 
-            // The FINAL tuple is now known (Dark Portal override and jitter
-            // applied, z replaced by the terrain height). Rerun the complete
-            // eligibility validation on exactly these coordinates: the
-            // override can substitute a disabled map, and jitter or vertical
-            // area resolution can cross expansion/faction/starter/capital,
-            // active-zone or density boundaries the raw candidate satisfied.
-            // The area recorded for the homebind is the area of the LANDING
-            // spot. This also preflights the core's own coordinate rejection
-            // so TeleportTo cannot fail for a reason known in advance.
+            // The FINAL tuple is now known (jitter applied, z replaced by the
+            // terrain height). Rerun the complete eligibility validation on
+            // exactly these coordinates: the override tuple can name a
+            // disabled map, and jitter or vertical area resolution can cross
+            // expansion/faction/starter/capital, active-zone or density
+            // boundaries the raw candidate satisfied. A rejected override
+            // falls through to the original tuple of the SAME attempt - it is
+            // never confused with candidate exhaustion. The area recorded for
+            // the homebind is the area of the LANDING spot. This also
+            // preflights the core's own coordinate rejection so TeleportTo
+            // cannot fail for a reason known in advance.
             AreaTableEntry const* area = nullptr;
             if (!IsEligibleTeleportDestination(bot, loc.mapid, x, y, z, activeOnly, area))
                 continue;
@@ -2928,15 +3089,20 @@ living::RelocationOutcome RandomPlayerbotMgr::RandomTeleport(Player* bot, std::v
             flags.z = z;
             flags.orientation = 0.0f;
             flags.homebindAreaId = area->ID;
-            relocations.Begin(bot->GetGUIDLow(), flags);
+            if (!relocations.Begin(bot->GetGUIDLow(), flags))
+                // Cannot happen: Finalizing was preflighted before any
+                // TeleportTo. Logged in case a future path breaks the order.
+                sLog.outError("Relocation tracker refused registration for bot %s AFTER TeleportTo; completion work will not run", bot->GetName());
 
             // Some core paths complete a same-map transfer synchronously; if no
-            // acknowledgement is owed, finalize right here.
+            // acknowledgement is owed, finalize right here (persistence
+            // retries continue from the pump while the record is Finalizing).
             if (!bot->IsBeingTeleported()
-                && FinalizeRelocation(bot) == living::RelocationCompleteResult::Completed)
+                && FinalizeRelocation(bot) == living::RelocationAdvanceResult::Completed)
                 return living::RelocationOutcome::Completed;
 
             return living::RelocationOutcome::Pending;
+            }
         }
     }
 
@@ -3522,47 +3688,77 @@ bool RandomPlayerbotMgr::IsRandomBot(uint32 bot)
     return GetEventValue(bot, "add");
 }
 
+// The ONE canonical currentBots loader, COUNT-first so a confirmed empty set
+// is distinguishable from a failed query (a plain row query returns null for
+// BOTH). The canonical activation requires `add` active AND `logout`
+// inactive - the `add` marker alone also matched bots already marked logged
+// out. SuccessRows/SuccessEmpty replace the vector; QueryFailed leaves it
+// untouched for the caller's dirty handling.
+living::CountedLoadOutcome RandomPlayerbotMgr::LoadCurrentBotsFromDb()
+{
+    static char const* activeBotsWhere =
+        "FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'add' AND `value` > 0 "
+        "AND bot NOT IN (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'logout' AND `value` > 0)";
+
+    std::optional<uint64> count;
+    if (auto countResult = CharacterDatabase.PQuery("SELECT COUNT(*) %s", activeBotsWhere))
+        count = countResult->Fetch()[0].GetUInt32();
+
+    bool rowsLoaded = false;
+    std::list<uint32> loaded;
+    if (count && *count > 0)
+    {
+        if (auto rows = CharacterDatabase.PQuery("SELECT bot %s", activeBotsWhere))
+        {
+            do
+            {
+                loaded.push_back(rows->Fetch()[0].GetUInt32());
+            } while (rows->NextRow());
+
+            rowsLoaded = true;
+        }
+    }
+
+    living::CountedLoadOutcome const outcome = living::ClassifyCountedLoad(count, rowsLoaded);
+    if (outcome != living::CountedLoadOutcome::QueryFailed)
+        currentBots = std::move(loaded);
+
+    return outcome;
+}
+
 std::list<uint32> RandomPlayerbotMgr::GetBots()
 {
     // After an uncertain activation the nonempty in-memory vector is NOT
-    // trusted: reconcile from canonical durable state (both halves of the
-    // activation pair - `add` set and `logout` not set). A failed
-    // reconciliation query keeps the dirty flag and serves the last known
-    // vector rather than fabricating an empty one.
+    // trusted: reconcile from canonical durable state. A confirmed EMPTY
+    // result is a valid reconciliation (zero active bots) and clears the
+    // dirty flag - AddRandomBots may proceed; only a FAILED query keeps the
+    // flag and serves the last known vector rather than fabricating an empty
+    // one.
     if (currentBotsDirty)
     {
-        auto reconciled = CharacterDatabase.Query(
-            "SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'add' AND `value` > 0 "
-            "AND bot NOT IN (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'logout' AND `value` > 0)");
-        if (reconciled)
+        switch (LoadCurrentBotsFromDb())
         {
-            currentBots.clear();
-            do
-            {
-                currentBots.push_back(reconciled->Fetch()[0].GetUInt32());
-            } while (reconciled->NextRow());
-
-            currentBotsDirty = false;
+            case living::CountedLoadOutcome::SuccessRows:
+            case living::CountedLoadOutcome::SuccessEmpty:
+                currentBotsDirty = false;
+                break;
+            case living::CountedLoadOutcome::QueryFailed:
+                sLog.outError("GetBots: reconciliation query failed; bot list stays dirty");
+                break;
         }
-        else
-            sLog.outError("GetBots: reconciliation query failed; bot list stays dirty");
 
         return currentBots;
     }
 
     if (!currentBots.empty()) return currentBots;
 
-    auto results = CharacterDatabase.Query(
-            "SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'add'");
-
-    if (results)
+    // Initial load through the same canonical loader. A failure marks the
+    // list dirty: mutation (AddRandomBots) stays refused until a load
+    // succeeds - query failure is never treated as "no bots exist".
+    if (LoadCurrentBotsFromDb() == living::CountedLoadOutcome::QueryFailed)
     {
-        do
-        {
-            Field* fields = results->Fetch();
-            uint32 bot = fields[0].GetUInt32();
-            currentBots.push_back(bot);
-        } while (results->NextRow());
+        currentBotsDirty = true;
+        sLog.outError("GetBots: initial bot list load failed; bot list marked dirty");
     }
 
     return currentBots;
@@ -3590,30 +3786,55 @@ std::list<uint32> RandomPlayerbotMgr::GetBgBots(uint32 bracket)
 
 uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
 {
-    // load all events at once on first event load
-    if (eventCache[bot].empty())
+    // Bulk-load all durable events on the first read - with an EXPLICIT load
+    // state instead of the "per-bot map is empty" heuristic. That heuristic
+    // treated a failed query as confirmed absence: the first default-inserted
+    // zero made the map nonempty, permanently suppressing the bulk load while
+    // durable add/logout/specNo state stayed hidden. Here a COUNT first
+    // separates "confirmed empty" from "could not ask"; a failed load leaves
+    // the state Unknown and every later read retries - a sibling cached event
+    // cannot stop the retry.
+    living::EventCacheLoadState& loadState = eventCacheLoadState[bot];
+    if (living::EventCacheNeedsBulkLoad(loadState))
     {
-        auto results = CharacterDatabase.PQuery("SELECT `event`, `value`, `time`, validIn, `data` FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", bot);
-        if (results)
+        living::EventCacheLoadState const previousState = loadState;
+        std::optional<uint64> count;
+        if (auto countResult = CharacterDatabase.PQuery(
+            "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", bot))
+            count = countResult->Fetch()[0].GetUInt32();
+
+        bool rowsLoaded = false;
+        if (count && *count > 0)
         {
-            do
+            auto results = CharacterDatabase.PQuery("SELECT `event`, `value`, `time`, validIn, `data` FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", bot);
+            if (results)
             {
-                Field* fields = results->Fetch();
-                std::string eventName = fields[0].GetString();
-                CachedEvent e;
-                e.value = fields[1].GetUInt32();
-                e.lastChangeTime = fields[2].GetUInt32();
-                e.validIn = fields[3].GetUInt32();
-                e.data = fields[4].GetString();
-                eventCache[bot][eventName] = e;
-            } while (results->NextRow());
+                do
+                {
+                    Field* fields = results->Fetch();
+                    std::string eventName = fields[0].GetString();
+                    CachedEvent e;
+                    e.value = fields[1].GetUInt32();
+                    e.lastChangeTime = fields[2].GetUInt32();
+                    e.validIn = fields[3].GetUInt32();
+                    e.data = fields[4].GetString();
+                    eventCache[bot][eventName] = e;
+                } while (results->NextRow());
+
+                rowsLoaded = true;
+            }
         }
+
+        loadState = living::ResolveEventCacheBulkLoad(living::ClassifyCountedLoad(count, rowsLoaded));
+        // Log the transition once, not every retried read.
+        if (loadState == living::EventCacheLoadState::Unknown && previousState != living::EventCacheLoadState::Unknown)
+            sLog.outError("GetEventValue: bulk event load failed for bot %u; state stays unknown and will be retried", bot);
     }
 
     // Retry the reload of an individually dirty event even while sibling
-    // events keep the per-bot map nonempty (the whole-map-empty reload above
-    // can never reach it). Until a reload succeeds, the prior KNOWN value is
-    // served - a failed query is not absence.
+    // events keep the per-bot map populated (the bulk load above only runs
+    // while the load state demands it). Until a reload succeeds, the prior
+    // KNOWN value is served - a failed query is not absence.
     if (auto botDirty = dirtyEvents.find(bot); botDirty != dirtyEvents.end() && botDirty->second.count(event))
     {
         if (ReloadEventRow(bot, event) != living::EventReloadOutcome::QueryFailed)
@@ -3624,7 +3845,12 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
         }
     }
 
-    CachedEvent e = eventCache[bot][event];
+    // Plain lookup WITHOUT default-inserting: a fabricated zero entry is what
+    // used to turn "load failed" into permanent confirmed absence.
+    CachedEvent e;
+    if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
+        if (auto entry = botCache->second.find(event); entry != botCache->second.end())
+            e = entry->second;
 
     if ((time(0) - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink" && event != "init" && event != "current_time" && event != "always" && event != "selfbot")
         e.value = 0;
@@ -4549,9 +4775,10 @@ void RandomPlayerbotMgr::Remove(Player* bot)
 
     // Execution-confirmed delete: the cache is cleared only after the rows are
     // actually gone (a queued PExecute is not durable success, and clearing
-    // first published a state the DB might never reach).
+    // first published a state the DB might never reach). The load state is
+    // dropped with it so the next read re-establishes durable truth.
     if (CharacterDatabase.DirectPExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%d'", owner))
-        eventCache[owner].clear();
+        ForgetEventCache(owner);
     else
         sLog.outError("Remove: failed to delete random-bot events for bot %u; cache left for reload", owner);
 
@@ -5143,10 +5370,7 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleLoginDebug(std::string p
 
 uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error)
 {
-    uint32 maxCharsPerAccount = 9;
-#ifdef MANGOSBOT_TWO
-    maxCharsPerAccount = 10;
-#endif
+    uint32 const maxCharsPerAccount = MaxCharsPerAccount();
 
     auto accountNrQr = LoginDatabase.PQuery("SELECT max(replace(lower(username), lower('%s'), '') + 1 - 1) maxAccountNr FROM account WHERE replace(lower(username), lower('%s'), '') != 0", sPlayerbotAIConfig.randomBotAccountPrefix.c_str(), sPlayerbotAIConfig.randomBotAccountPrefix.c_str());
 
@@ -5202,7 +5426,10 @@ uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error
             return 0;        
         }
 
-        uint32 charCount = sAccountMgr.GetCharactersCount(accountId);
+        // Durable characters PLUS pending/quarantined creation reservations:
+        // a group loop selecting accounts here must not admit several
+        // creations against the same stale durable count.
+        uint32 charCount = EffectiveCharacterCount(accountId);
 
         if (charCount < maxCharsPerAccount)
         {

@@ -2,13 +2,19 @@
 
 #include "../util/LivingRelocation.h"
 
+#include <string>
+#include <vector>
+
 using namespace living;
 
-// RelocationTracker is the exact pending-relocation registry RandomPlayerbotMgr
-// uses: Begin on TeleportTo acceptance, Complete from the FINISHED teleport
-// acknowledgement, Cancel on logout/removal/relogin. Completion requires the
-// exact accepted destination (the pinned cores install the stored components
-// directly); any other finished landing terminally cancels the obsolete record.
+// RelocationTracker is the exact staged pending-relocation registry
+// RandomPlayerbotMgr uses: Begin on TeleportTo acceptance, Acknowledge from
+// the FINISHED teleport acknowledgement (exact landing -> Finalizing, any
+// other landing -> terminal cancellation), Advance for the owed completion
+// operations (retried until every durable write is confirmed; the record and
+// its destination reservation are released only then), Cancel on
+// logout/removal/relogin. These are fault-injection tests of that production
+// decision core; the live TeleportTo/MySQL wiring is exercised in-world only.
 
 namespace
 {
@@ -20,28 +26,70 @@ namespace
         record.y = y;
         record.z = z;
         record.orientation = o;
-        record.setHomebind = true;
-        record.homebindAreaId = 42;
         return record;
     }
+
+    // Ops whose durable writes always succeed and whose homebind path has
+    // nothing to write; counters observe each operation.
+    struct SpyOps
+    {
+        int runtimeResets = 0;
+        int rpgCooldowns = 0;
+        int markerClears = 0;
+        int homebindApplies = 0;
+        int homebindVerifyRequests = 0;
+        int scheduleAttempts = 0;
+
+        MarkerClearOutcome markerOutcome = MarkerClearOutcome::Cleared;
+        bool scheduleSucceeds = true;
+        bool homebindHasTarget = false;
+        HomebindWrite homebindTarget;
+
+        RelocationAdvanceOps Make()
+        {
+            RelocationAdvanceOps ops;
+            ops.runtimeReset = [this]() { ++runtimeResets; };
+            ops.applyRpgCooldown = [this]() { ++rpgCooldowns; };
+            ops.clearReviveMarkers = [this]() { ++markerClears; return markerOutcome; };
+            ops.applyHomebind = [this]() -> std::optional<HomebindWrite>
+            {
+                ++homebindApplies;
+                if (!homebindHasTarget)
+                    return std::nullopt;
+                return homebindTarget;
+            };
+            ops.requestHomebindVerify = [this]() { ++homebindVerifyRequests; };
+            ops.scheduleNextTeleport = [this]() { ++scheduleAttempts; return scheduleSucceeds; };
+            return ops;
+        }
+    };
 }
 
-LIVING_TEST(relocation_completes_exactly_once_on_exact_ack)
+LIVING_TEST(relocation_exact_ack_moves_to_finalizing_and_completes_through_advance)
 {
     RelocationTracker tracker;
     uint64_t const token = tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
     LIVING_CHECK(token != 0);
     LIVING_CHECK(tracker.HasPending(1001));
+    LIVING_CHECK(!tracker.IsFinalizing(1001));
 
-    // The acknowledged landing is exactly the accepted destination.
-    PendingRelocation completed;
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, completed) == RelocationCompleteResult::Completed);
-    LIVING_CHECK(completed.token == token);
-    LIVING_CHECK(completed.setHomebind && completed.homebindAreaId == 42);
+    // The acknowledged landing is exactly the accepted destination: the
+    // record is RETAINED (Finalizing), not consumed - completion work is owed.
+    PendingRelocation acked;
+    LIVING_CHECK(tracker.Acknowledge(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, acked) == RelocationAckResult::Landed);
+    LIVING_CHECK(acked.token == token);
+    LIVING_CHECK(tracker.HasPending(1001));
+    LIVING_CHECK(tracker.IsFinalizing(1001));
 
-    // Exactly once: the record is gone, a second acknowledgement finds nothing.
+    // A repeated acknowledgement resolves as AlreadyFinalizing (no erase).
+    LIVING_CHECK(tracker.Acknowledge(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, acked) == RelocationAckResult::AlreadyFinalizing);
+
+    // Advance with everything succeeding releases the record exactly once.
+    SpyOps spy;
+    LIVING_CHECK(tracker.Advance(1001, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.runtimeResets == 1);
     LIVING_CHECK(!tracker.HasPending(1001));
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, completed) == RelocationCompleteResult::NoPending);
+    LIVING_CHECK(tracker.Advance(1001, spy.Make()) == RelocationAdvanceResult::NoPending);
 }
 
 LIVING_TEST(relocation_any_displacement_is_a_terminal_mismatch)
@@ -57,9 +105,9 @@ LIVING_TEST(relocation_any_displacement_is_a_terminal_mismatch)
         tracker.Begin(7, MakeRecord(1, 100.0f, 200.0f, 30.0f));
 
         PendingRelocation record;
-        LIVING_CHECK(tracker.Complete(7, 1, 100.0f + offset, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::TerminalMismatch);
+        LIVING_CHECK(tracker.Acknowledge(7, 1, 100.0f + offset, 200.0f, 30.0f, 0.0f, record) == RelocationAckResult::TerminalMismatch);
         LIVING_CHECK(!tracker.HasPending(7));
-        LIVING_CHECK(tracker.Complete(7, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::NoPending);
+        LIVING_CHECK(tracker.Acknowledge(7, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationAckResult::NoPending);
     }
 }
 
@@ -70,25 +118,26 @@ LIVING_TEST(relocation_wrong_map_and_wrong_orientation_are_terminal)
     tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
 
     PendingRelocation record;
-    LIVING_CHECK(tracker.Complete(1001, 2, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::TerminalMismatch);
+    LIVING_CHECK(tracker.Acknowledge(1001, 2, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationAckResult::TerminalMismatch);
     LIVING_CHECK(!tracker.HasPending(1001));
 
     // Wrong orientation with identical coordinates is still a different landing.
     RelocationTracker byOrientation;
     byOrientation.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f, 0.0f));
-    LIVING_CHECK(byOrientation.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 1.5f, record) == RelocationCompleteResult::TerminalMismatch);
+    LIVING_CHECK(byOrientation.Acknowledge(1001, 1, 100.0f, 200.0f, 30.0f, 1.5f, record) == RelocationAckResult::TerminalMismatch);
     LIVING_CHECK(!byOrientation.HasPending(1001));
 
     // A different bot's acknowledgement never resolves this record.
     RelocationTracker other;
     other.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
-    LIVING_CHECK(other.Complete(2002, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::NoPending);
+    LIVING_CHECK(other.Acknowledge(2002, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationAckResult::NoPending);
     LIVING_CHECK(other.HasPending(1001));
 }
 
 LIVING_TEST(relocation_supersession_and_stale_ack)
 {
-    // One in-flight relocation per bot: a newer attempt explicitly supersedes.
+    // One in-flight relocation per bot: a newer attempt supersedes a record
+    // still awaiting its acknowledgement.
     RelocationTracker tracker;
     uint64_t const first = tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
     uint64_t const second = tracker.Begin(1001, MakeRecord(2, 700.0f, 800.0f, 90.0f));
@@ -100,16 +149,211 @@ LIVING_TEST(relocation_supersession_and_stale_ack)
     // The current attempt's own completion can then never falsely fire, and
     // retry markers (owned by the caller) drive a fresh attempt.
     PendingRelocation record;
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::TerminalMismatch);
+    LIVING_CHECK(tracker.Acknowledge(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationAckResult::TerminalMismatch);
     LIVING_CHECK(record.token == second); // the erased record was the current one
     LIVING_CHECK(!tracker.HasPending(1001));
 
-    // Clean supersession: the second attempt's own exact landing completes.
+    // Clean supersession: the second attempt's own exact landing lands.
     RelocationTracker clean;
     clean.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
     uint64_t const current = clean.Begin(1001, MakeRecord(2, 700.0f, 800.0f, 90.0f));
-    LIVING_CHECK(clean.Complete(1001, 2, 700.0f, 800.0f, 90.0f, 0.0f, record) == RelocationCompleteResult::Completed);
+    LIVING_CHECK(clean.Acknowledge(1001, 2, 700.0f, 800.0f, 90.0f, 0.0f, record) == RelocationAckResult::Landed);
     LIVING_CHECK(record.token == current);
+}
+
+LIVING_TEST(relocation_finalizing_blocks_new_attempts_until_released)
+{
+    // While a relocation is Finalizing (owed side effects unconfirmed) every
+    // path that could start another random relocation must refuse: Begin
+    // returns 0 and the production preflight rejects. Only completion (or
+    // cancellation) releases the bot for a new relocation.
+    RelocationTracker tracker;
+    tracker.Begin(1001, MakeRecord(1, 100.0f, 200.0f, 30.0f));
+
+    PendingRelocation acked;
+    tracker.Acknowledge(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, acked);
+    LIVING_CHECK(tracker.IsFinalizing(1001));
+
+    LIVING_CHECK(tracker.Begin(1001, MakeRecord(2, 5.0f, 6.0f, 7.0f)) == 0);
+    LIVING_CHECK(tracker.IsFinalizing(1001)); // the finalizing record survived
+
+    // Complete the owed work; a new attempt is then accepted again.
+    SpyOps spy;
+    LIVING_CHECK(tracker.Advance(1001, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(tracker.Begin(1001, MakeRecord(2, 5.0f, 6.0f, 7.0f)) != 0);
+}
+
+LIVING_TEST(relocation_failed_schedule_write_keeps_record_armed_and_retries)
+{
+    // The task-8 injection scenario: acknowledged landing, schedule write
+    // fails. The record must stay Finalizing (blocking a second teleport),
+    // the runtime reset must NOT re-run on retries, and a later successful
+    // write must complete and release the record.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.scheduleNextTeleport = true;
+    tracker.Begin(42, request);
+
+    PendingRelocation acked;
+    tracker.Acknowledge(42, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.scheduleSucceeds = false;
+    LIVING_CHECK(tracker.Advance(42, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.runtimeResets == 1);
+    LIVING_CHECK(spy.scheduleAttempts == 1);
+
+    // Still armed: a new relocation attempt is refused - no second teleport
+    // triggered by the old expired event.
+    LIVING_CHECK(tracker.Begin(42, MakeRecord(2, 1.0f, 2.0f, 3.0f)) == 0);
+
+    // Retry with the write still failing: no duplicate runtime reset.
+    LIVING_CHECK(tracker.Advance(42, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.runtimeResets == 1);
+    LIVING_CHECK(spy.scheduleAttempts == 2);
+
+    // The write recovers: durable completion, record released.
+    spy.scheduleSucceeds = true;
+    LIVING_CHECK(tracker.Advance(42, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.runtimeResets == 1);
+    LIVING_CHECK(!tracker.HasPending(42));
+}
+
+LIVING_TEST(relocation_marker_clear_write_failure_retries_but_still_dead_completes)
+{
+    // A FAILED marker write retries on later advances; a bot that is simply
+    // still dead keeps its markers deliberately (the event-driven revive
+    // retry owns recovery) and the operation completes.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.reviveRecovery = true;
+    tracker.Begin(7, request);
+
+    PendingRelocation acked;
+    tracker.Acknowledge(7, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.markerOutcome = MarkerClearOutcome::WriteFailed;
+    LIVING_CHECK(tracker.Advance(7, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.markerClears == 1);
+
+    spy.markerOutcome = MarkerClearOutcome::Cleared;
+    LIVING_CHECK(tracker.Advance(7, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.markerClears == 2);
+
+    // Still-dead completes without a marker write ever succeeding.
+    RelocationTracker stillDead;
+    stillDead.Begin(8, request);
+    stillDead.Acknowledge(8, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+    SpyOps deadSpy;
+    deadSpy.markerOutcome = MarkerClearOutcome::KeptStillDead;
+    LIVING_CHECK(stillDead.Advance(8, deadSpy.Make()) == RelocationAdvanceResult::Completed);
+}
+
+LIVING_TEST(relocation_homebind_write_is_verified_before_release)
+{
+    // The task-8 homebind chain: the write is issued once, an
+    // execution-ordered verification is requested, and the record is released
+    // only after the verification MATCHES. Verification callback results are
+    // ENQUEUED by OnHomebindVerifyResult (no decisions in callback context)
+    // and applied from the pump.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.setHomebind = true;
+    tracker.Begin(9, request);
+
+    PendingRelocation acked;
+    tracker.Acknowledge(9, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.homebindHasTarget = true;
+    spy.homebindTarget = HomebindWrite{ 1, 10.0f, 20.0f, 3.0f, 42 };
+
+    // First advance: write issued + verification requested; NOT complete.
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.homebindApplies == 1);
+    LIVING_CHECK(spy.homebindVerifyRequests == 1);
+
+    // While the verification is in flight, advancing neither re-writes nor
+    // completes.
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(spy.homebindApplies == 1);
+
+    // Callback delivers a match -> enqueue only; nothing changes until the
+    // event is drained and applied.
+    tracker.OnHomebindVerifyResult(9, HomebindVerifyOutcome::Match);
+    LIVING_CHECK(tracker.IsFinalizing(9));
+
+    auto events = tracker.DrainHomebindVerifyEvents();
+    LIVING_CHECK(events.size() == 1);
+    LIVING_CHECK(tracker.ApplyHomebindVerify(events[0].botGuid, events[0].outcome,
+        RelocationTracker::kMaxHomebindWriteAttempts) == HomebindVerifyAction::Confirmed);
+
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.homebindApplies == 1); // exactly one write
+}
+
+LIVING_TEST(relocation_homebind_mismatch_reissues_then_bounded_gives_up)
+{
+    // A failed/mismatched verification re-arms the write for the next
+    // advance; bounded attempts, then GaveUp completes the operation with an
+    // explicit error instead of blocking the bot's relocations forever.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.setHomebind = true;
+    tracker.Begin(9, request);
+
+    PendingRelocation acked;
+    tracker.Acknowledge(9, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.homebindHasTarget = true;
+    spy.homebindTarget = HomebindWrite{ 1, 10.0f, 20.0f, 3.0f, 42 };
+
+    uint32_t const maxAttempts = RelocationTracker::kMaxHomebindWriteAttempts;
+    for (uint32_t attempt = 1; attempt < maxAttempts; ++attempt)
+    {
+        LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Finalizing);
+        LIVING_CHECK(spy.homebindApplies == static_cast<int>(attempt));
+
+        tracker.OnHomebindVerifyResult(9, HomebindVerifyOutcome::Mismatch);
+        auto events = tracker.DrainHomebindVerifyEvents();
+        LIVING_CHECK(tracker.ApplyHomebindVerify(events[0].botGuid, events[0].outcome, maxAttempts)
+            == HomebindVerifyAction::Reissue);
+    }
+
+    // The final failed attempt exhausts the budget: GaveUp, then release.
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Finalizing);
+    tracker.OnHomebindVerifyResult(9, HomebindVerifyOutcome::QueryFailed);
+    auto events = tracker.DrainHomebindVerifyEvents();
+    LIVING_CHECK(tracker.ApplyHomebindVerify(events[0].botGuid, events[0].outcome, maxAttempts)
+        == HomebindVerifyAction::GaveUp);
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Completed);
+
+    // A stale verification result after release resolves to None.
+    tracker.OnHomebindVerifyResult(9, HomebindVerifyOutcome::Match);
+    events = tracker.DrainHomebindVerifyEvents();
+    LIVING_CHECK(tracker.ApplyHomebindVerify(events[0].botGuid, events[0].outcome, maxAttempts)
+        == HomebindVerifyAction::None);
+}
+
+LIVING_TEST(relocation_homebind_nothing_to_write_completes_by_absence)
+{
+    // bindInn with no eligible inn: the operation completes by absence, no
+    // verification is requested.
+    RelocationTracker tracker;
+    PendingRelocation request = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    request.bindInn = true;
+    tracker.Begin(9, request);
+
+    PendingRelocation acked;
+    tracker.Acknowledge(9, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked);
+
+    SpyOps spy;
+    spy.homebindHasTarget = false;
+    LIVING_CHECK(tracker.Advance(9, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(spy.homebindApplies == 1);
+    LIVING_CHECK(spy.homebindVerifyRequests == 0);
 }
 
 LIVING_TEST(relocation_cancellation_drops_without_completing)
@@ -126,7 +370,7 @@ LIVING_TEST(relocation_cancellation_drops_without_completing)
     LIVING_CHECK(tracker.PendingCount() == 1);
 
     PendingRelocation record;
-    LIVING_CHECK(tracker.Complete(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationCompleteResult::NoPending);
+    LIVING_CHECK(tracker.Acknowledge(1001, 1, 100.0f, 200.0f, 30.0f, 0.0f, record) == RelocationAckResult::NoPending);
 
     // Cancelling one bot never touches another's pending relocation.
     LIVING_CHECK(tracker.HasPending(2002));
@@ -134,12 +378,19 @@ LIVING_TEST(relocation_cancellation_drops_without_completing)
     // Cancelling a bot with nothing pending is a no-op.
     tracker.Cancel(9999);
     LIVING_CHECK(tracker.PendingCount() == 1);
+
+    // A Finalizing record is cancellable too (logout during finalization
+    // releases the reservation; retry markers stay with the caller).
+    tracker.Acknowledge(2002, 1, 300.0f, 400.0f, 50.0f, 0.0f, record);
+    LIVING_CHECK(tracker.IsFinalizing(2002));
+    tracker.Cancel(2002);
+    LIVING_CHECK(tracker.PendingCount() == 0);
 }
 
 LIVING_TEST(relocation_revive_flags_travel_with_the_record)
 {
     // The revive path defers marker clearing to completion: the flags must
-    // arrive intact in the completed record - there is no other channel.
+    // arrive intact in the acknowledged record - there is no other channel.
     RelocationTracker tracker;
     PendingRelocation record = MakeRecord(1, 10.0f, 20.0f, 3.0f);
     record.setHomebind = false;
@@ -149,13 +400,106 @@ LIVING_TEST(relocation_revive_flags_travel_with_the_record)
     record.rpgTravelCooldown = true;
     tracker.Begin(7, record);
 
-    PendingRelocation completed;
-    LIVING_CHECK(tracker.Complete(7, 1, 10.0f, 20.0f, 3.0f, 0.0f, completed) == RelocationCompleteResult::Completed);
-    LIVING_CHECK(completed.reviveRecovery);
-    LIVING_CHECK(completed.bindInn);
-    LIVING_CHECK(completed.scheduleNextTeleport);
-    LIVING_CHECK(completed.rpgTravelCooldown);
-    LIVING_CHECK(!completed.setHomebind);
+    PendingRelocation acked;
+    LIVING_CHECK(tracker.Acknowledge(7, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked) == RelocationAckResult::Landed);
+    LIVING_CHECK(acked.reviveRecovery);
+    LIVING_CHECK(acked.bindInn);
+    LIVING_CHECK(acked.scheduleNextTeleport);
+    LIVING_CHECK(acked.rpgTravelCooldown);
+    LIVING_CHECK(!acked.setHomebind);
+}
+
+LIVING_TEST(relocation_density_reservations_count_both_stages_and_exclude_self)
+{
+    // The task-9 scenario: destination capacity one, two bots attempting
+    // in-flight relocations to the same destination. The second bot's
+    // admission must see the first bot's reservation - in BOTH stages - while
+    // never counting its own record.
+    RelocationTracker tracker;
+    tracker.Begin(1, MakeRecord(0, 100.0f, 200.0f, 30.0f));
+
+    // Bot 2's admission: one reservation within the radius -> at a capacity
+    // of one, 1 (reserved) >= 1 (cap) rejects the second relocation.
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, /*exclude*/ 2) == 1);
+
+    // The same query for bot 1 itself excludes its own record.
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, /*exclude*/ 1) == 0);
+
+    // Outside the radius or on another map the reservation does not count
+    // (2D distance, matching the live scan's same-map fDist metric).
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 300.0f, 50.0f, 2) == 0);
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(1, 100.0f, 200.0f, 50.0f, 2) == 0);
+
+    // The reservation persists through Finalizing (landed, side effects
+    // unconfirmed)...
+    PendingRelocation acked;
+    tracker.Acknowledge(1, 0, 100.0f, 200.0f, 30.0f, 0.0f, acked);
+    LIVING_CHECK(tracker.IsFinalizing(1));
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 1);
+
+    // ...and is released only on confirmed completion.
+    SpyOps spy;
+    LIVING_CHECK(tracker.Advance(1, spy.Make()) == RelocationAdvanceResult::Completed);
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 0);
+
+    // Cancellation (logout) also releases.
+    tracker.Begin(3, MakeRecord(0, 100.0f, 200.0f, 30.0f));
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 1);
+    tracker.Cancel(3);
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 0);
+
+    // A terminal mismatch releases as well.
+    tracker.Begin(4, MakeRecord(0, 100.0f, 200.0f, 30.0f));
+    tracker.Acknowledge(4, 0, 999.0f, 200.0f, 30.0f, 0.0f, acked);
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(0, 100.0f, 200.0f, 50.0f, 2) == 0);
+}
+
+LIVING_TEST(relocation_override_is_tried_first_but_never_replaces_the_original)
+{
+    // The task-10 scenario: the Dark Portal override draw fires while map 0
+    // is disabled/inactive/full. The attempt's tuple order must still contain
+    // the original candidate AFTER the rejected override, so a validator that
+    // rejects map 0 falls back to the valid raw candidate in the SAME attempt
+    // - "optional override rejected" is structurally distinct from "active
+    // candidates exhausted".
+    struct Loc { uint32_t mapId; float x; };
+    Loc const portal{ 0, -11772.43f };
+    Loc const original{ 1, 500.0f };
+
+    // Deterministic drawn override: portal first, original second.
+    std::vector<Loc> drawn = OverrideThenOriginal(true, portal, original);
+    LIVING_CHECK(drawn.size() == 2);
+    LIVING_CHECK(drawn[0].mapId == 0);
+    LIVING_CHECK(drawn[1].mapId == 1);
+
+    // A validator rejecting map 0 (disabled/inactive/over-density) still
+    // reaches the valid original candidate within this attempt.
+    bool acceptedOriginal = false;
+    for (Loc const& loc : drawn)
+    {
+        if (loc.mapId == 0)
+            continue; // override rejected
+        acceptedOriginal = true;
+        break;
+    }
+    LIVING_CHECK(acceptedOriginal);
+
+    // No draw: the original is the only tuple.
+    std::vector<Loc> notDrawn = OverrideThenOriginal(false, portal, original);
+    LIVING_CHECK(notDrawn.size() == 1);
+    LIVING_CHECK(notDrawn[0].mapId == 1);
+}
+
+LIVING_TEST(relocation_homebind_verify_queue_is_bounded_and_drains_in_order)
+{
+    RelocationTracker tracker;
+    for (uint32_t i = 0; i < RelocationTracker::kMaxHomebindVerifyEvents + 10; ++i)
+        tracker.OnHomebindVerifyResult(i, HomebindVerifyOutcome::Match);
+
+    auto events = tracker.DrainHomebindVerifyEvents();
+    LIVING_CHECK(events.size() == RelocationTracker::kMaxHomebindVerifyEvents);
+    LIVING_CHECK(events.front().botGuid == 0);
+    LIVING_CHECK(tracker.DrainHomebindVerifyEvents().empty());
 }
 
 // Destination-eligibility policy: the SAME rules the one production validator

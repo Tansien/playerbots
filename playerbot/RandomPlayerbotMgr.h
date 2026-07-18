@@ -93,7 +93,10 @@ public:
         void Randomize(Player* bot);
         void RandomizeFirst(Player* bot);
         void UpdateGearSpells(Player* bot);
-        void ScheduleTeleport(uint32 bot, uint32 time = 0);
+        // Returns whether the schedule event was execution-confirmed persisted
+        // (relocation finalization retries a failed write; other callers may
+        // ignore the result as before).
+        bool ScheduleTeleport(uint32 bot, uint32 time = 0);
         void ScheduleChangeStrategy(uint32 bot, uint32 time = 0);
         void HandleCommand(uint32 type, const std::string& text, Player& fromPlayer, std::string channelName = "", Team team = TEAM_BOTH_ALLOWED, uint32 lang = LANG_UNIVERSAL);
         std::string HandleRemoteCommand(std::string request);
@@ -126,19 +129,40 @@ public:
         living::RelocationOutcome Revive(Player* player);
         // Resolves the bot's pending relocation after its teleport
         // acknowledgement: verifies the bot is in-world, no longer teleporting,
-        // and standing on the EXACT accepted destination, then (exactly once)
-        // runs the full AI reset, Refresh, homebind/inn binding, revive-marker
-        // clearing and event scheduling. A finished acknowledgement that landed
-        // anywhere else terminally cancels the obsolete record (retry markers
-        // stay) so no stale work remains armed for a later unrelated landing.
-        living::RelocationCompleteResult FinalizeRelocation(Player* bot);
+        // and standing on the EXACT accepted destination, then moves the
+        // record to Finalizing and advances its owed completion work (full AI
+        // reset and Refresh exactly once; revive-marker clearing; homebind
+        // write plus execution-ordered durability verification; RPG cooldown;
+        // next-teleport scheduling). The record is released only when EVERY
+        // owed operation is confirmed - failed writes are retried from
+        // PumpPendingRelocations, and while the record exists no new random
+        // relocation may start for the bot. A finished acknowledgement that
+        // landed anywhere else terminally cancels the obsolete record (retry
+        // markers stay) so no stale work remains armed for a later landing.
+        living::RelocationAdvanceResult FinalizeRelocation(Player* bot);
+        // Retries owed completion work of Finalizing relocations and applies
+        // drained homebind-verification callback events. Runs from the
+        // module's world-update hook, never from a SQL result callback.
+        void PumpPendingRelocations();
         // Drops a pending relocation without finalizing it (logout/removal/
         // relogin). Retry markers are untouched.
         void CancelPendingRelocation(uint32 botGuid);
+        // In-flight relocation reservations near a destination (density
+        // admission includes bots that ACCEPTED a move there but have not
+        // landed/completed yet).
+        uint32 CountPendingRelocationsNear(uint32 mapId, float x, float y, float radius, uint32 excludeBotGuid) const
+        {
+            return relocations.CountReservedDestinationsNear(mapId, x, y, radius, excludeBotGuid);
+        }
+        // Whether the bot has an in-flight relocation record (either stage);
+        // the live density scan skips such bots - they are counted through
+        // their reservation instead, so each bot contributes exactly once.
+        bool HasPendingRelocation(uint32 botGuid) const { return relocations.HasPending(botGuid); }
         // Drops the in-memory event cache for a GUID whose creation was
         // rejected before persistence, so a discarded transient character
-        // leaves no cache entry behind.
-        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); }
+        // leaves no cache entry behind (load state included - the next read
+        // reloads from durable truth).
+        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); }
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
@@ -211,6 +235,16 @@ public:
         // the prior cached value (the caller marks the entry dirty).
         living::EventReloadOutcome ReloadEventRow(uint32 bot, std::string const& event);
         bool IsEventDirty(uint32 bot, std::string const& event) const;
+        // COUNT-first canonical currentBots load (`add` active AND `logout`
+        // inactive): SuccessEmpty/SuccessRows replace the vector; QueryFailed
+        // leaves it untouched (a null row query is never confirmed absence).
+        living::CountedLoadOutcome LoadCurrentBotsFromDb();
+        // SQL result callback for the relocation homebind verification: parses
+        // the row into a match/mismatch outcome and enqueues it on the
+        // relocation tracker - no database work, no decisions.
+        void HandleHomebindVerify(QueryResult* result, uint32 botGuid);
+        // Advances one Finalizing relocation's owed completion work.
+        living::RelocationAdvanceResult AdvanceRelocation(Player* bot);
         std::list<uint32> GetBots();
         std::list<uint32> GetBgBots(uint32 bracket);
         time_t BgCheckTimer;
@@ -268,6 +302,11 @@ public:
         std::map<uint32, std::map<uint32, std::vector<std::pair<ObjectGuid, WorldLocation>> > > innCacheLevel;
         std::map<Team, std::map<BattleGroundTypeId, std::list<uint32> > > BattleMastersCache;
         std::map<uint32, std::map<std::string, CachedEvent> > eventCache;
+        // Explicit per-bot bulk-load state: Unloaded (never attempted),
+        // Loaded (authoritative, possibly empty) or Unknown (last load
+        // FAILED - retried on later reads; a sibling cached event or a
+        // default-inserted zero can no longer suppress the retry).
+        std::map<uint32, living::EventCacheLoadState> eventCacheLoadState;
         // Events whose durable state could not be re-established after a
         // failed write (reload query also failed): the cache keeps the prior
         // KNOWN value and GetEventValue retries the reload per event - the

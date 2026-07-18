@@ -1,10 +1,14 @@
 #include "LivingTest.h"
 
 #include "../events/LivingEvents.h"
+#include "../util/LivingEventSchema.h"
 
 #include <cstring>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 using namespace living;
 
@@ -302,4 +306,95 @@ LIVING_TEST(event_reload_query_failure_is_not_confirmed_absence)
     rows.erase("add");
     LIVING_CHECK(reload("add") == living::EventReloadOutcome::ConfirmedAbsent);
     LIVING_CHECK(cache.count("add") == 0);
+}
+
+LIVING_TEST(counted_load_separates_confirmed_empty_from_failure)
+{
+    // The COUNT-first discriminator behind both the per-bot event-cache bulk
+    // load and currentBots reconciliation: a null COUNT is a FAILED load, a
+    // zero COUNT is a confirmed empty set, and rows only count as loaded when
+    // the row query succeeded too.
+    LIVING_CHECK(ClassifyCountedLoad(std::nullopt, false) == CountedLoadOutcome::QueryFailed);
+    LIVING_CHECK(ClassifyCountedLoad(std::nullopt, true) == CountedLoadOutcome::QueryFailed);
+    LIVING_CHECK(ClassifyCountedLoad(0, false) == CountedLoadOutcome::SuccessEmpty);
+    LIVING_CHECK(ClassifyCountedLoad(3, true) == CountedLoadOutcome::SuccessRows);
+    // COUNT succeeded but the row query then failed: still a failure - the
+    // rows are NOT loaded and must not be claimed as such.
+    LIVING_CHECK(ClassifyCountedLoad(3, false) == CountedLoadOutcome::QueryFailed);
+}
+
+LIVING_TEST(event_cache_failed_first_load_stays_unknown_and_recovers)
+{
+    // The task-6 scenario driven through the exact production helpers: the
+    // first bulk load fails while ANOTHER event is already cached (a
+    // successful SetEventValue wrote it) - under the legacy map-empty
+    // heuristic that sibling entry suppressed every future bulk load. With
+    // the explicit load state the failed load stays Unknown, the next read
+    // retries, and a recovered DB with a nonzero add/logout/specNo row is
+    // discovered.
+    std::map<std::string, uint32_t> cache; // the per-bot cache map stand-in
+    cache["specNo"] = 1;                   // sibling event cached before the load
+
+    EventCacheLoadState state = EventCacheLoadState::Unloaded;
+    LIVING_CHECK(EventCacheNeedsBulkLoad(state));
+
+    // First load: COUNT query fails -> Unknown; the read serves zero for the
+    // missing event WITHOUT default-inserting a confirmed-absent entry.
+    state = ResolveEventCacheBulkLoad(ClassifyCountedLoad(std::nullopt, false));
+    LIVING_CHECK(state == EventCacheLoadState::Unknown);
+    LIVING_CHECK(cache.find("add") == cache.end());
+
+    // The sibling cached event does NOT prevent the retry: the state - not
+    // the map's emptiness - decides.
+    LIVING_CHECK(!cache.empty());
+    LIVING_CHECK(EventCacheNeedsBulkLoad(state));
+
+    // The DB recovers with a nonzero row; the next read's bulk load discovers
+    // it and the state becomes authoritative.
+    cache["add"] = 1; // the row query populates the cache
+    state = ResolveEventCacheBulkLoad(ClassifyCountedLoad(2, true));
+    LIVING_CHECK(state == EventCacheLoadState::Loaded);
+    LIVING_CHECK(!EventCacheNeedsBulkLoad(state));
+    LIVING_CHECK(cache["add"] == 1);
+
+    // A confirmed-empty load is also authoritative (Loaded), never retried.
+    LIVING_CHECK(ResolveEventCacheBulkLoad(ClassifyCountedLoad(0, false)) == EventCacheLoadState::Loaded);
+}
+
+LIVING_TEST(current_bots_reconciliation_zero_rows_is_success_not_failure)
+{
+    // The task-7 scenario: an uncertain activation left the list dirty; the
+    // canonical reconciliation then reports ZERO active bots. That is a
+    // successful reconciliation (clear the vector, clear the dirty flag,
+    // AddRandomBots may proceed) - only a FAILED query keeps the dirty flag
+    // and the last known vector.
+    std::vector<uint32_t> currentBots{ 11, 22 };
+    bool dirty = true;
+
+    // Failed reconciliation: vector preserved, still dirty, mutation refused.
+    switch (ClassifyCountedLoad(std::nullopt, false))
+    {
+        case CountedLoadOutcome::SuccessRows:
+        case CountedLoadOutcome::SuccessEmpty:
+            dirty = false;
+            break;
+        case CountedLoadOutcome::QueryFailed:
+            break;
+    }
+    LIVING_CHECK(dirty);
+    LIVING_CHECK(currentBots.size() == 2);
+
+    // Successful reconciliation to zero active rows: SuccessEmpty clears
+    // both the vector and the dirty flag.
+    switch (ClassifyCountedLoad(0, false))
+    {
+        case CountedLoadOutcome::SuccessEmpty:
+            currentBots.clear();
+            dirty = false;
+            break;
+        default:
+            break;
+    }
+    LIVING_CHECK(!dirty);
+    LIVING_CHECK(currentBots.empty());
 }
