@@ -211,6 +211,43 @@ namespace living
             return it == batches.end() ? nullptr : &it->second;
         }
 
+        // Outstanding group slots already owned by this initiator's batches:
+        // pending creations PLUS finalized members that have not yet joined
+        // the group (`isJoined(guid)` decides). A repeated group command must
+        // count these as effective membership - a finalized-but-not-joined
+        // member still occupies its slot, and only verified membership (or
+        // batch expiry, the bounded terminal path for joins that never
+        // happen) releases it.
+        template <typename JoinedFn>
+        uint32_t OutstandingSlotsForInitiator(uint32_t initiatorGuid, JoinedFn&& isJoined) const
+        {
+            uint32_t outstanding = 0;
+            for (auto const& [token, batch] : batches)
+            {
+                if (batch.initiatorGuid != initiatorGuid || initiatorGuid == 0)
+                    continue;
+
+                outstanding += static_cast<uint32_t>(batch.pending.size());
+                for (uint32_t const guid : batch.finalizedGuids)
+                    if (!isJoined(guid))
+                        ++outstanding;
+            }
+
+            return outstanding;
+        }
+
+        // The initiator's most recent still-tracked batch (0 when none): a
+        // repeated command coalesces onto it instead of enqueueing a second
+        // deficit.
+        uint64_t FindBatchTokenForInitiator(uint32_t initiatorGuid) const
+        {
+            uint64_t newest = 0;
+            for (auto const& [token, batch] : batches)
+                if (initiatorGuid != 0 && batch.initiatorGuid == initiatorGuid && token > newest)
+                    newest = token;
+            return newest;
+        }
+
         // Records a failure produced OUTSIDE the finalizer (immediate
         // replacement-creation failure, initiator offline).
         bool RecordFailure(uint64_t batchToken, std::string failure)

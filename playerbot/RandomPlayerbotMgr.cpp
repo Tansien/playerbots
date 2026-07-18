@@ -308,7 +308,10 @@ RandomPlayerbotMgr::RandomPlayerbotMgr()
 
         for (auto& bot : availableBots)
         {
-            if(GetEventValue(bot,"login"))
+            // Typed gate: only a KNOWN set login flag is swept; an unknown
+            // read must not trigger the write.
+            uint32 loginFlag = 0;
+            if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
                 SetEventValue(bot, "login", 0, 0);
         }
 
@@ -680,7 +683,15 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
         pmo.reset();
     }
 
-    uint32 maxAllowedBotCount = GetEventValue(0, "bot_count");
+    // Typed read: an unknown bot_count must not be rewritten (the failed
+    // read is not an expired value) - the bot-count-driven cycle defers.
+    uint32 maxAllowedBotCount = 0;
+    if (!TryGetEventValue(0, "bot_count", maxAllowedBotCount))
+    {
+        SetAIInternalUpdateDelay(sPlayerbotAIConfig.randomBotUpdateInterval);
+        return;
+    }
+
     if (!maxAllowedBotCount || ((uint32)maxAllowedBotCount < sPlayerbotAIConfig.minRandomBots || (uint32)maxAllowedBotCount > sPlayerbotAIConfig.maxRandomBots))
     {
         maxAllowedBotCount = urand(sPlayerbotAIConfig.minRandomBots, sPlayerbotAIConfig.maxRandomBots);
@@ -1173,7 +1184,12 @@ bool RandomPlayerbotMgr::GetNamedLocation(std::string const& name, WorldLocation
 
 uint32 RandomPlayerbotMgr::AddRandomBots()
 {
-    uint32 maxAllowedBotCount = GetEventValue(0, "bot_count");
+    // Typed read: an unknown bot_count defers additions instead of treating
+    // the failed read as zero.
+    uint32 maxAllowedBotCount = 0;
+    if (!TryGetEventValue(0, "bot_count", maxAllowedBotCount))
+        return currentBots.size();
+
     uint32 currentAllowedBotCount = maxAllowedBotCount;
 
     uint32 maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
@@ -1296,14 +1312,27 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                     uint32 race = fields[3].GetUInt32();
                     uint32 cls = fields[4].GetUInt32();
 
-                    if (GetEventValue(guid, "add"))
+                    // Typed reads: unknown activation state neither skips nor
+                    // activates this candidate - it ABORTS the whole batch.
+                    // The database is unavailable, every further probe is a
+                    // synchronous world-thread query, and (worse) a read that
+                    // fails here but recovers before the write below could
+                    // reactivate a durably logged-out bot.
+                    uint32 addActive = 0, logoutActive = 0;
+                    if (!TryReadRequiredEvents(guid, { {"add", &addActive}, {"logout", &logoutActive} }))
+                    {
+                        sLog.outError("AddRandomBots: activation state for bot %u unavailable; stopping the batch", guid);
+                        return currentBots.size();
+                    }
+
+                    if (addActive)
                     {
                         if (!noCriteria)
                             classRaceAllowed[cls][race]--;
                         continue;
                     }
 
-                    if (GetEventValue(guid, "logout"))
+                    if (logoutActive)
                         continue;
 
                     if (GetPlayerBot(guid))
@@ -1324,44 +1353,29 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                         continue;
 
                     // Persist the add/logout pair BEFORE any cache/quota/counter
-                    // update: the pair is ONE logical activation. A bot whose
-                    // pair cannot be fully persisted is skipped with the
-                    // half-written marker compensated; if even the compensation
-                    // fails, the durable pair is reconciled (the setter already
-                    // reloaded each event or marked it dirty) - an actually
-                    // active bot is counted, an unknown one dirties currentBots
+                    // update through the activation-plan executor: the pair is
+                    // ONE logical activation, the priors are KNOWN (typed reads
+                    // above: both zero), a failed write compensates the written
+                    // prefix, and an uncertain compensation dirties currentBots
                     // and stops the batch.
-                    if (!SetEventValue(guid, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
-                        continue;
+                    std::vector<living::PlannedEventWrite> activationPlan = {
+                        { "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime), 0, 0 },
+                        { "logout", 0, 0, 0, 0 },
+                    };
 
-                    if (!SetEventValue(guid, "logout", 0, 0))
+                    if (!RunActivationPlan(guid, activationPlan))
                     {
-                        if (!SetEventValue(guid, "add", 0, 0)) // compensate
+                        if (currentBotsDirty)
                         {
-                            if (IsEventDirty(guid, "add") || IsEventDirty(guid, "logout"))
-                            {
-                                // Durable activation state cannot be
-                                // established: the in-memory vector can no
-                                // longer be trusted, and continuing the batch
-                                // would compound the divergence.
-                                sLog.outError("AddRandomBots: durable activation state for bot %u unknown; marking bot list dirty and stopping the batch", guid);
-                                currentBotsDirty = true;
-                                return currentBots.size();
-                            }
-
-                            // Durable truth is known: count the bot if the pair
-                            // says it is actually active.
-                            if (GetEventValue(guid, "add") && !GetEventValue(guid, "logout"))
-                            {
-                                currentBots.push_back(guid);
-                                currentAllowedBotCount--;
-                                neededAddBots--;
-
-                                if (!currentAllowedBotCount)
-                                    break;
-                            }
+                            // Uncertain compensation: the in-memory vector can
+                            // no longer be trusted, and continuing the batch
+                            // would compound the divergence.
+                            sLog.outError("AddRandomBots: durable activation state for bot %u unknown; stopping the batch", guid);
+                            return currentBots.size();
                         }
 
+                        // Compensated back to the known inactive priors: this
+                        // candidate is skipped, the batch may continue.
                         continue;
                     }
 
@@ -2240,27 +2254,42 @@ bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
         return false;
     }
 
-    if (!GetEventValue(bot, "login"))
-    {
-        AddPlayerBot(bot, 0);
-        // The add/logout pair is one logical activation: if either durable
-        // write failed, the in-memory vector may diverge from durable truth,
-        // so mark it dirty - GetBots reconciles from the canonical query
-        // before the list is trusted again.
-        bool activationDurable = SetEventValue(bot, "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
-        activationDurable = SetEventValue(bot, "logout", 0, 0) && activationDurable;
-        SetEventValue(bot, "login", 1, -1);
-        uint32 randomTime = urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime);
-        SetEventValue(bot, "update", 1, randomTime);
-        currentBots.push_back(bot);
-        if (!activationDurable)
-        {
-            currentBotsDirty = true;
-            sLog.outError("AddRandomBot: activation writes for bot %u not confirmed; bot list marked dirty", bot);
-        }
-        sLog.outDetail("Random bot added #%d", bot);
-    }
+    // Typed reads for the login gate AND every prior value the activation
+    // plan may need to restore. Unknown state starts nothing and writes
+    // nothing - a transient load failure must not trigger a (possibly
+    // duplicate) login.
+    uint32 loginValue = 0, priorAdd = 0, priorLogout = 0, priorUpdate = 0;
+    if (!TryReadRequiredEvents(bot, { {"login", &loginValue}, {"add", &priorAdd},
+            {"logout", &priorLogout}, {"update", &priorUpdate} }))
+        return false;
 
+    if (loginValue)
+        return true; // a login is already in progress; duplicate attempt is a no-op
+
+    // The COMPLETE durable activation plan - add, logout, login, update - is
+    // persisted and checked BEFORE the login starts or the in-memory list
+    // changes. A failed write compensates the written prefix back to the
+    // known priors; an uncertain compensation dirties currentBots. Either
+    // way, NO login was started by a failure.
+    std::vector<living::PlannedEventWrite> plan = {
+        { "add", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime),
+          priorAdd, RemainingValidity(bot, "add") },
+        { "logout", 0, 0, priorLogout, RemainingValidity(bot, "logout") },
+        { "login", 1, static_cast<uint32>(-1), 0, 0 },
+        { "update", 1, urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime),
+          priorUpdate, RemainingValidity(bot, "update") },
+    };
+
+    if (!RunActivationPlan(bot, plan))
+        return false;
+
+    // Only after the full plan is execution-confirmed: start the login and
+    // insert into the list exactly once.
+    AddPlayerBot(bot, 0);
+    if (std::find(currentBots.begin(), currentBots.end(), bot) == currentBots.end())
+        currentBots.push_back(bot);
+
+    sLog.outDetail("Random bot added #%d", bot);
     return true;
 }
 
@@ -2333,9 +2362,11 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 
         if (sPlayerbotAIConfig.randomBotTimedOffline)
         {
-            uint32 logout = GetEventValue(bot, "logout");
-
-            if (!logout && !SetEventValue(bot, "logout", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
+            // Typed read: an unknown logout state must not trigger the write
+            // (the failed read is not a confirmed "no logout scheduled").
+            uint32 logout = 0;
+            if (TryGetEventValue(bot, "logout", logout) && !logout
+                && !SetEventValue(bot, "logout", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
             {
                 currentBotsDirty = true;
                 sLog.outError("ProcessBot: setting 'logout' for bot %u not confirmed; bot list marked dirty", bot);
@@ -2351,26 +2382,45 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         if (!botsAllowedInWorld)
             return false;
 
-        if (GetEventValue(bot, "login"))
+        // Typed reads: unknown login state must not start a login, and the
+        // full durable plan (login + update, with known priors) is confirmed
+        // BEFORE AddPlayerBot - the same activation boundary AddRandomBot
+        // uses.
+        uint32 loginValue = 0, priorUpdate = 0;
+        if (!TryReadRequiredEvents(bot, { {"login", &loginValue}, {"update", &priorUpdate} }))
+            return false;
+
+        if (loginValue)
             return true;
 
+        std::vector<living::PlannedEventWrite> plan = {
+            // Reset to 0 on server startup - see the RandomPlayerbotMgr
+            // constructor's login sweep.
+            { "login", 1, static_cast<uint32>(-1), 0, 0 },
+            { "update", 1, urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime),
+              priorUpdate, RemainingValidity(bot, "update") },
+        };
+
+        if (!RunActivationPlan(bot, plan))
+            return false;
+
         AddPlayerBot(bot, 0);
-
-        SetEventValue(bot, "login", 1, -1); // This will be reset to 0 on server startup. Check RandomPlayerbotMgr constructor
-
-        uint32 randomTime = urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime);
-        SetEventValue(bot, "update", 1, randomTime);
-
         return true;
     }
 
     if (!player->IsInWorld() || player->IsBeingTeleported() || player->GetSession()->isLogingOut()) //Skip bots that are in limbo.
         return false;
 
-    if(GetEventValue(bot, "login"))
+    uint32 loginFlag = 0;
+    if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
         SetEventValue(bot, "login", 0, 0); //Bot is no longer loggin in.
 
-    uint32 update = GetEventValue(bot, "update");
+    // Typed read: an unknown update state defers the AI update instead of
+    // treating the failed read as "due now" and rewriting the schedule.
+    uint32 update = 0;
+    if (!TryGetEventValue(bot, "update", update))
+        return false;
+
     //Update the bot
     if (!update)
     {
@@ -2434,7 +2484,14 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
 
     if (idleBot)
     {
-        uint32 randomize = GetEventValue(bot, "randomize");
+        // All-or-nothing typed read of every event this decision consumes: a
+        // failed load must not randomize, change strategy, relocate or write
+        // any schedule - the whole idle step defers until the state is known.
+        uint32 randomize = 0, changeStrategyValue = 0, teleportValue = 0;
+        if (!TryReadRequiredEvents(bot, { {"randomize", &randomize},
+                {"change_strategy", &changeStrategyValue}, {"teleport", &teleportValue} }))
+            return false;
+
         if (!randomize)
         {
             bool randomiser = true;
@@ -2456,8 +2513,7 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
             }
         }
 
-        uint32 changeStrategy = GetEventValue(bot, "change_strategy");
-        if (!changeStrategy)
+        if (!changeStrategyValue)
         {
             if (sPlayerbotAIConfig.enableRandomTeleports)
             {
@@ -2472,8 +2528,7 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
             return true;
         }
 
-        uint32 teleport = GetEventValue(bot, "teleport");
-        if (!teleport && players.size())
+        if (!teleportValue && players.size())
         {
             if (sPlayerbotAIConfig.enableRandomTeleports)
             {
@@ -2917,11 +2972,13 @@ namespace
             uint32 botsNearTeleportPoint = 0;
             sRandomPlayerbotMgr.ForEachPlayerbot([&](Player* otherBot)
             {
-                // Only check the bots that are in the same zone. A bot
-                // with an in-flight relocation record is skipped here and
-                // counted through its destination reservation below, so
+                // Only check the bots that are in the same zone. The
+                // RELOCATING bot itself never counts against its own
+                // destination (it leaves its current spot by moving there);
+                // a bot with an in-flight relocation record is skipped here
+                // and counted through its destination reservation below, so
                 // each bot contributes exactly once.
-                if (otherBot && !otherBot->IsBeingTeleported()
+                if (otherBot && otherBot != bot && !otherBot->IsBeingTeleported()
                     && !sRandomPlayerbotMgr.HasPendingRelocation(otherBot->GetGUIDLow())
                     && (zoneId ? zoneId : areaId) == otherBot->GetZoneId())
                 {
@@ -3957,6 +4014,42 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
     return value;
 }
 
+bool RandomPlayerbotMgr::TryReadRequiredEvents(uint32 bot, std::initializer_list<std::pair<char const*, uint32*>> reads)
+{
+    for (auto const& read : reads)
+        if (!TryGetEventValue(bot, read.first, *read.second))
+            return false;
+
+    return true;
+}
+
+uint32 RandomPlayerbotMgr::RemainingValidity(uint32 bot, std::string const& event)
+{
+    int32 const remaining = GetValueValidTime(bot, event);
+    return remaining > 0 ? static_cast<uint32>(remaining) : 0;
+}
+
+bool RandomPlayerbotMgr::RunActivationPlan(uint32 bot, std::vector<living::PlannedEventWrite> const& plan)
+{
+    switch (living::ExecuteActivationPlan(plan,
+        [this, bot](std::string const& event, uint32 value, uint32 validIn)
+        {
+            return SetEventValue(bot, event, value, validIn);
+        }))
+    {
+        case living::ActivationOutcome::Persisted:
+            return true;
+        case living::ActivationOutcome::FailedCompensated:
+            sLog.outError("Activation plan for bot %u failed; written values compensated - nothing was started", bot);
+            return false;
+        case living::ActivationOutcome::FailedCompensationUncertain:
+        default:
+            currentBotsDirty = true;
+            sLog.outError("Activation plan for bot %u failed AND compensation is uncertain; bot list marked dirty for reconciliation", bot);
+            return false;
+    }
+}
+
 int32 RandomPlayerbotMgr::GetValueValidTime(uint32 bot, std::string event)
 {
     if (eventCache.find(bot) == eventCache.end())
@@ -4748,7 +4841,12 @@ void RandomPlayerbotMgr::PrintStats(uint32 requesterGuid)
 double RandomPlayerbotMgr::GetBuyMultiplier(Player* bot)
 {
     uint32 id = bot->GetGUIDLow();
-    uint32 value = GetEventValue(id, "buymultiplier");
+    // Typed gate: an unknown read serves a neutral in-memory default without
+    // rewriting the durable multiplier.
+    uint32 value = 0;
+    if (!TryGetEventValue(id, "buymultiplier", value))
+        return 1.0;
+
     if (!value)
     {
         value = urand(50, 120);
@@ -4762,7 +4860,11 @@ double RandomPlayerbotMgr::GetBuyMultiplier(Player* bot)
 double RandomPlayerbotMgr::GetSellMultiplier(Player* bot)
 {
     uint32 id = bot->GetGUIDLow();
-    uint32 value = GetEventValue(id, "sellmultiplier");
+    // Typed gate, same rule as the buy multiplier.
+    uint32 value = 0;
+    if (!TryGetEventValue(id, "sellmultiplier", value))
+        return 1.0;
+
     if (!value)
     {
         value = urand(80, 250);
@@ -5467,7 +5569,7 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleLoginDebug(std::string p
     return messages;
 }
 
-uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error)
+AccountSelectOutcome RandomPlayerbotMgr::GetOrCreateAccount(Player* master, uint32& accountId, std::string& error)
 {
     uint32 const maxCharsPerAccount = MaxCharsPerAccount();
 
@@ -5476,7 +5578,7 @@ uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error
     if (!accountNrQr)
     {
         error = "Failed to find last " + sPlayerbotAIConfig.randomBotAccountPrefix + " account nr.";
-        return 0;
+        return AccountSelectOutcome::DatabaseUnavailable;
     }
 
     Field* fields = accountNrQr->Fetch();
@@ -5489,9 +5591,9 @@ uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error
         accountNameStr << sPlayerbotAIConfig.randomBotAccountPrefix << accountNumber;
         std::string accountName = accountNameStr.str();
 
-        uint32 accountId = sAccountMgr.GetId(accountName);
+        uint32 candidateId = sAccountMgr.GetId(accountName);
 
-        if (!accountId)
+        if (!candidateId)
         {
             std::string password;
             if (sPlayerbotAIConfig.randomBotRandomPassword)
@@ -5513,43 +5615,48 @@ uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error
 
             if (result == AOR_OK)
             {
-                uint32 accountId = sAccountMgr.GetId(accountName);
-                if (accountId)
+                uint32 createdId = sAccountMgr.GetId(accountName);
+                if (createdId)
                 {
-                    sPlayerbotAIConfig.randomBotAccounts.push_back(accountId);
-                    return accountId;
+                    sPlayerbotAIConfig.randomBotAccounts.push_back(createdId);
+                    accountId = createdId;
+                    return AccountSelectOutcome::Found;
                 }
             }
 
             error = "Failed to create account";
-            return 0;        
+            return AccountSelectOutcome::AccountCreationFailed;
         }
 
         // Durable characters PLUS pending/quarantined creation reservations:
         // a group loop selecting accounts here must not admit several
-        // creations against the same stale durable count. An UNKNOWN count
-        // (failed query) skips the account - fail closed, never "empty".
+        // creations against the same stale durable count. A FAILED count
+        // query aborts the WHOLE scan immediately: every probe is a
+        // synchronous world-thread query, and walking up to 10,000 further
+        // accounts into a database outage amplifies it - the caller reports a
+        // transient failure and retries with bounded tick-based backoff.
         uint32 charCount = 0;
-        if (!TryGetEffectiveCharacterCount(accountId, charCount))
+        if (!TryGetEffectiveCharacterCount(candidateId, charCount))
         {
-            accountNumber++;
-            continue;
+            error = "Database unavailable while checking bot account capacity";
+            return AccountSelectOutcome::DatabaseUnavailable;
         }
 
         if (charCount < maxCharsPerAccount)
         {
-            if (!sPlayerbotAIConfig.IsInRandomAccountList(accountId))
+            if (!sPlayerbotAIConfig.IsInRandomAccountList(candidateId))
             {
-                sPlayerbotAIConfig.randomBotAccounts.push_back(accountId);
+                sPlayerbotAIConfig.randomBotAccounts.push_back(candidateId);
             }
-            return accountId;
+            accountId = candidateId;
+            return AccountSelectOutcome::Found;
         }
 
         accountNumber++;
     }
 
     error = "Failed to find a suitable account.";
-    return 0;
+    return AccountSelectOutcome::CapacityExhausted;
 }
 
 void RandomPlayerbotMgr::OnBotDeleted(uint32 botGuid, uint32 accountId)

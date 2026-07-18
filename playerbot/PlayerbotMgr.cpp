@@ -2195,6 +2195,20 @@ namespace ai
             core.OnCallbackResult(guid, outcome, living::CreationCallbackKind::CleanupVerify);
         }
 
+        void HandleBulkCountVerify(QueryResult* result, uint32 accountId)
+        {
+            // Any successful readback releases the account's bulk
+            // reservations in the pump: the query executed AFTER the bulk
+            // saves on the same FIFO thread, so its completion is the
+            // durability barrier - the count value itself is not consulted.
+            living::RowVerifyOutcome const outcome = result
+                ? living::RowVerifyOutcome::Verified
+                : living::RowVerifyOutcome::QueryFailed;
+            delete result;
+
+            core.OnCallbackResult(accountId, outcome, living::CreationCallbackKind::BulkCount);
+        }
+
         living::CreationFinalizerOps Ops()
         {
             living::CreationFinalizerOps ops;
@@ -2260,6 +2274,21 @@ namespace ai
 
                 sLog.outDetail("Bot creation finalized: '%s' (guid %u)", name.c_str(), guid);
             };
+            ops.requestBulkCountVerify = [this](uint32 accountId)
+            {
+                // A failed ENQUEUE feeds back one QueryFailed attempt so the
+                // bounded retry/give-up path owns the outcome instead of the
+                // entry waiting forever for a query that was never queued.
+                if (!CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleBulkCountVerify, accountId,
+                        "SELECT COUNT(guid) FROM characters WHERE account = '%u'", accountId))
+                    core.OnCallbackResult(accountId, living::RowVerifyOutcome::QueryFailed,
+                        living::CreationCallbackKind::BulkCount);
+            };
+            ops.onBulkVerifyGaveUp = [](uint32 accountId, uint32 keptReservations)
+            {
+                sLog.outError("Bulk creation for account %u could not be verified; %u reserved slot(s) kept - capacity stays conservatively blocked",
+                    accountId, keptReservations);
+            };
             return ops;
         }
 
@@ -2322,6 +2351,35 @@ bool PlayerbotHolder::TryGetEffectiveCharacterCount(uint32 accountId, uint32& co
 
     count += ai::botCreationFinalizer.core.ReservedCount(accountId);
     return true;
+}
+
+living::SlotReservationOutcome PlayerbotHolder::TryReserveCharacterSlot(uint32 accountId)
+{
+    uint32 durableCount = 0;
+    if (!TryGetDurableCharacterCount(accountId, durableCount))
+        return living::SlotReservationOutcome::DatabaseUnavailable;
+
+    return TryReserveCharacterSlot(accountId, durableCount);
+}
+
+living::SlotReservationOutcome PlayerbotHolder::TryReserveCharacterSlot(uint32 accountId, uint32 durableCount)
+{
+    // The DURABLE count goes in; the ledger adds its own reservations exactly
+    // once inside TryReserveAccountSlot - passing an already-effective count
+    // here would double-charge existing reservations.
+    return ai::botCreationFinalizer.core.TryReserveAccountSlot(accountId, durableCount, MaxCharsPerAccount())
+        ? living::SlotReservationOutcome::Reserved
+        : living::SlotReservationOutcome::AtCapacity;
+}
+
+void PlayerbotHolder::ReleaseCharacterSlot(uint32 accountId)
+{
+    ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId);
+}
+
+void PlayerbotHolder::BeginBulkReservationVerify(uint32 accountId, uint32 reservedSlots)
+{
+    ai::botCreationFinalizer.core.BeginBulkVerify(accountId, reservedSlots, ai::botCreationFinalizer.Ops());
 }
 
 namespace ai
@@ -2628,37 +2686,48 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
     }
 
     std::string error;
-    uint32 accountId = GetOrCreateAccount(master, error);
-    if (accountId == 0)
+    uint32 accountId = 0;
+    switch (GetOrCreateAccount(master, accountId, error))
     {
-        result.status = living::BotCreateStatus::TerminalFailure;
-        result.messages.push_back(error);
-        return result;
+        case AccountSelectOutcome::Found:
+            break;
+        case AccountSelectOutcome::DatabaseUnavailable:
+            // Transient: the database could not answer. NOT terminal (capacity
+            // is unknown, not exhausted) and NOT retried inside this call -
+            // coordinators back off across ticks.
+            result.status = living::BotCreateStatus::TransientFailure;
+            result.messages.push_back("Database unavailable while selecting a bot account; try again later");
+            return result;
+        case AccountSelectOutcome::CapacityExhausted:
+        case AccountSelectOutcome::AccountCreationFailed:
+        default:
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back(error.empty() ? "No bot account available" : error);
+            return result;
     }
 
-    // Reserve one character slot BEFORE any GUID allocation or SaveToDB. The
-    // durable count alone cannot admit safely: a queued-but-unexecuted save is
-    // invisible to it, so a burst of creations (group loop, test runner) would
-    // all observe the same stale count and overfill the account. The count
-    // itself is typed: a FAILED count query rejects (fail closed) instead of
-    // reading as an empty account. The reservation is bound to the pending
-    // record by Begin and released only on a CONFIRMED terminal outcome; every
-    // failure path between here and Begin must release it explicitly because
-    // no save was queued.
-    uint32 durableCharacterCount = 0;
-    if (!TryGetDurableCharacterCount(accountId, durableCharacterCount))
+    // Reserve one character slot BEFORE any GUID allocation or SaveToDB,
+    // through the ONE shared reservation API (typed durable count + finalizer
+    // ledger, combined exactly once). A burst of creations (group loop, test
+    // runner) cannot observe the same stale count and overfill the account; a
+    // FAILED count query is transient unavailability - never "empty" (fail
+    // open) and never terminal. The reservation is bound to the pending
+    // record by Begin and released only on a CONFIRMED terminal outcome;
+    // every failure path between here and Begin must release it explicitly
+    // because no save was queued.
+    switch (TryReserveCharacterSlot(accountId))
     {
-        result.status = living::BotCreateStatus::TerminalFailure;
-        result.messages.push_back("Account character count could not be verified; refusing creation");
-        return result;
-    }
-
-    if (!ai::botCreationFinalizer.core.TryReserveAccountSlot(accountId,
-            durableCharacterCount, MaxCharsPerAccount()))
-    {
-        result.status = living::BotCreateStatus::TerminalFailure;
-        result.messages.push_back("Account has max characters");
-        return result;
+        case living::SlotReservationOutcome::Reserved:
+            break;
+        case living::SlotReservationOutcome::DatabaseUnavailable:
+            result.status = living::BotCreateStatus::TransientFailure;
+            result.messages.push_back("Database unavailable while verifying account capacity; try again later");
+            return result;
+        case living::SlotReservationOutcome::AtCapacity:
+        default:
+            result.status = living::BotCreateStatus::TerminalFailure;
+            result.messages.push_back("Account has max characters");
+            return result;
     }
 
     uint8 skin = 0, face = 0, hairStyle = 0, hairColor = 0, facialHair = 0;
@@ -2962,6 +3031,27 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     std::unordered_map<uint8, std::unordered_map<BotRoles, uint32>> allowedClassNr = LfgAction::AllowedClassRoleNr(master, static_cast<uint8>(groupSize));
 
     uint32 maxTries = 10*groupSize;
+
+    // Outstanding slots already owned by this initiator's in-flight batches:
+    // pending creations PLUS finalized members that have not yet joined the
+    // group. Effective membership counts them, so a repeated `.group`/
+    // `.rndbot group` enqueues only the residual deficit - never the same
+    // deficit twice. A slot stays reserved until membership is verified in
+    // the live group or the batch expires (the bounded terminal path for
+    // joins that never happen).
+    uint32 const outstandingSlots = ai::botCreationBatches.OutstandingSlotsForInitiator(master->GetGUIDLow(),
+        [group](uint32 guid) { return group && group->IsMember(ObjectGuid(HIGHGUID_PLAYER, guid)); });
+    currentGroupSize += outstandingSlots;
+
+    if (currentGroupSize >= groupSize && outstandingSlots)
+    {
+        // The requested size is already covered by live members plus the
+        // in-flight batch: coalesce onto it instead of enqueueing again.
+        batchToken = ai::botCreationBatches.FindBatchTokenForInitiator(master->GetGUIDLow());
+        messages.push_back("Group creation already in progress covers the requested size ("
+            + std::to_string(outstandingSlots) + " outstanding member slot(s)); no additional members queued");
+        return messages;
+    }
 
     living::GroupCreationLedger ledger;
     std::vector<living::CreationBatchMember> batchMembers;
@@ -3384,6 +3474,16 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
                     pt.completed = true;
                 }
                 break;
+            case living::BotCreateStatus::TransientFailure:
+                // Transient database unavailability: defer to a later tick
+                // (bounded backoff, separate from the creation retry budget)
+                // instead of failing the test or hammering the DB.
+                if (++pt.transientRetries >= 60)
+                {
+                    pt.result = "IMPOSSIBLE: database unavailable for bot creation (deferred attempts exhausted)";
+                    pt.completed = true;
+                }
+                break;
             case living::BotCreateStatus::TerminalFailure:
             default:
                 // An immediate parse/admission failure fails the test now.
@@ -3423,17 +3523,17 @@ void PlayerbotHolder::DepositTestResult(const std::string& testName, const std::
 }
 #endif
 
-uint32 PlayerbotHolder::GetOrCreateAccount(Player* master, std::string& error)
+AccountSelectOutcome PlayerbotHolder::GetOrCreateAccount(Player* master, uint32& accountId, std::string& error)
 {
     if (!master)
     {
         // For console/RA usage without master - delegate to derived class
         error = "GetOrCreateAccount requires master or override in derived class";
-        return 0;
+        return AccountSelectOutcome::AccountCreationFailed;
     }
-    
-    uint32 masterAccountId = master->GetSession()->GetAccountId();
-    return masterAccountId;
+
+    accountId = master->GetSession()->GetAccountId();
+    return AccountSelectOutcome::Found;
 }
 
 void PlayerbotHolder::OnBotDeleted(uint32 botGuid, uint32 accountId)

@@ -5,6 +5,7 @@
 #include "PlayerbotAIBase.h"
 #include "PlayerbotMgr.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/living/util/LivingActivation.h"
 #include "playerbot/living/util/LivingEventSchema.h"
 #include "playerbot/living/util/LivingRelocation.h"
 #include "WorldPosition.h"
@@ -234,6 +235,10 @@ public:
         // destructive callers (timed-logout deactivation) must skip their
         // mutation instead of consuming a load failure as an expired event.
         bool TryGetEventValue(uint32 bot, std::string const& event, uint32& value);
+        // All-or-nothing multi-event read: false when ANY value is unknown,
+        // so a multi-key mutation decision can never partially proceed on a
+        // mix of known and unknown state.
+        bool TryReadRequiredEvents(uint32 bot, std::initializer_list<std::pair<char const*, uint32*>> reads);
         std::string GetEventData(uint32 bot, std::string event);
         bool SetEventValue(uint32 bot, std::string event, uint32 value, uint32 validIn, std::string data = "");
         // Reloads ONE durable event row into the cache with a typed outcome:
@@ -245,6 +250,15 @@ public:
         // inactive): SuccessEmpty/SuccessRows replace the vector; QueryFailed
         // leaves it untouched (a null row query is never confirmed absence).
         living::CountedLoadOutcome LoadCurrentBotsFromDb();
+        // Runs one complete durable activation plan (checked writes with
+        // compensation to known priors) through the pure executor. Returns
+        // true only when EVERY write is execution-confirmed - only then may a
+        // login start or the in-memory list change. Uncertain compensation
+        // marks currentBots dirty.
+        bool RunActivationPlan(uint32 bot, std::vector<living::PlannedEventWrite> const& plan);
+        // Remaining validity of a cached event (compensation restores the
+        // prior value with its remaining window), zero when absent/expired.
+        uint32 RemainingValidity(uint32 bot, std::string const& event);
         // SQL result callback for the relocation homebind verification: parses
         // the row into a match/mismatch outcome and enqueues it on the
         // relocation tracker - no database work, no decisions. The parameter
@@ -283,7 +297,7 @@ public:
         std::list<std::string> HandleConsoleLoginDebug(std::string param);
         std::list<std::string> HandleConsolePathCheck(std::string param);
         // Override virtual methods from PlayerbotHolder
-        virtual uint32 GetOrCreateAccount(Player* master, std::string& error) override;
+        virtual AccountSelectOutcome GetOrCreateAccount(Player* master, uint32& accountId, std::string& error) override;
         virtual void OnBotDeleted(uint32 botGuid, uint32 accountId) override;
 
     public:

@@ -1,5 +1,6 @@
 #include "LivingTest.h"
 
+#include "../util/LivingActivation.h"
 #include "../util/LivingBotCreation.h"
 
 using namespace living;
@@ -278,4 +279,84 @@ LIVING_TEST(bounded_draw_rejection_sampling_is_unbiased)
     auto neverCalled = []() -> uint32_t { throw living::test::Failure{}; };
     LIVING_CHECK(DrawBounded64(1, neverCalled) == 0);
     LIVING_CHECK(DrawBounded64(0, neverCalled) == 0);
+}
+
+LIVING_TEST(activation_plan_confirms_all_writes_before_reporting_success)
+{
+    // The durable activation boundary: the complete plan (add, logout, login,
+    // update) must be execution-confirmed BEFORE any login starts. Each write
+    // failing independently compensates the already-written prefix back to
+    // the known priors; only an uncertain compensation reports the dirty
+    // outcome. A failure never leaves a partial plan in place.
+    auto makePlan = []()
+    {
+        return std::vector<PlannedEventWrite>{
+            { "add", 1, 600, 0, 0 },
+            { "logout", 0, 0, 0, 0 },
+            { "login", 1, 4294967295u, 0, 0 },
+            { "update", 1, 120, 0, 0 },
+        };
+    };
+
+    // All writes succeed: Persisted, in plan order, no compensation.
+    {
+        std::vector<std::string> writes;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const& event, uint32_t value, uint32_t) { writes.push_back(event + "=" + std::to_string(value)); return true; });
+        LIVING_CHECK(outcome == ActivationOutcome::Persisted);
+        LIVING_CHECK(writes.size() == 4);
+        LIVING_CHECK(writes[0] == "add=1" && writes[3] == "update=1");
+    }
+
+    // Independent failure of EACH of the four writes: the written prefix is
+    // compensated in reverse order, and the outcome is FailedCompensated.
+    for (size_t failAt = 0; failAt < 4; ++failAt)
+    {
+        std::vector<std::string> writes;
+        size_t attempt = 0;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const& event, uint32_t value, uint32_t)
+            {
+                writes.push_back(event + "=" + std::to_string(value));
+                return attempt++ != failAt; // the failAt-th write fails
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
+        // failAt writes succeeded, one failed, failAt compensations followed.
+        LIVING_CHECK(writes.size() == failAt + 1 + failAt);
+        if (failAt > 0)
+        {
+            // The LAST compensation restores the FIRST written event (reverse
+            // order), back to its prior value.
+            LIVING_CHECK(writes.back() == "add=0");
+        }
+    }
+
+    // Compensation itself failing: the dirty outcome - the caller must mark
+    // its in-memory view for reconciliation, and still must not start.
+    {
+        size_t attempt = 0;
+        auto outcome = ExecuteActivationPlan(makePlan(),
+            [&](std::string const&, uint32_t, uint32_t)
+            {
+                ++attempt;
+                return attempt == 1; // first write ok, everything after fails
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensationUncertain);
+    }
+
+    // Priors are restored as PRIOR values, not blindly zero: a plan over a
+    // previously-active event compensates back to that active value.
+    {
+        std::vector<PlannedEventWrite> plan = { { "update", 1, 120, /*prior*/ 7, /*priorValidIn*/ 55 }, { "login", 1, 1, 0, 0 } };
+        std::vector<std::string> writes;
+        size_t attempt = 0;
+        auto outcome = ExecuteActivationPlan(plan,
+            [&](std::string const& event, uint32_t value, uint32_t validIn)
+            {
+                writes.push_back(event + "=" + std::to_string(value) + "/" + std::to_string(validIn));
+                return attempt++ != 1; // only the second plan write fails
+            });
+        LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
+        LIVING_CHECK(writes.back() == "update=7/55");
+    }
 }

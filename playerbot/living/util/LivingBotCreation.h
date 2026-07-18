@@ -47,6 +47,12 @@ namespace living
         // This attempt failed for a reason another attempt may avoid
         // (e.g. a random name collision). The caller may try again.
         RetryableFailure,
+        // The database is transiently unavailable (a count/selection query
+        // failed). NOT terminal - capacity is unknown, not exhausted - and
+        // NOT same-call retryable: hammering the database inside the failing
+        // call amplifies the outage. Coordinators may retry only with
+        // bounded tick-based backoff.
+        TransientFailure,
         // No further attempt can succeed (invalid arguments, no account
         // capacity, infrastructure error). The caller must stop retrying.
         TerminalFailure,
@@ -64,7 +70,9 @@ namespace living
         std::map<uint8_t, uint32_t> createdByClass;
 
         // Records one attempt with the planned/persisted class. Returns true
-        // when the run must stop (terminal failure).
+        // when the run must stop (terminal failure, or a transient database
+        // failure - continuing the loop would hammer the unavailable DB with
+        // synchronous queries inside one call).
         bool Record(BotCreateStatus status, uint8_t actualClass = 0)
         {
             if (status == BotCreateStatus::Created)
@@ -78,7 +86,8 @@ namespace living
                 ++createdByClass[actualClass];
             }
 
-            return status == BotCreateStatus::TerminalFailure;
+            return status == BotCreateStatus::TerminalFailure
+                || status == BotCreateStatus::TransientFailure;
         }
 
         // A slot is consumed for composition PLANNING by both confirmed and
