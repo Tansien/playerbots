@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <set>
+#include <vector>
 
 namespace living
 {
@@ -45,15 +48,21 @@ namespace living
     // normal invariant: one account cannot have two characters online), and
     // playerbots deliberately pack 9/10 characters per account and log several
     // in - an online sibling would bypass the core protection and spend the
-    // account's budget on its own auction. Returns true when the bid must be
-    // REJECTED:
+    // account's budget on its own auction.
+    //
+    // The bidder's account membership is resolved ONCE per AH action into a
+    // sibling GUID set (resolving the owner's account per listing performed a
+    // synchronous CharacterDatabase round trip for every offline owner while
+    // the AH mutex and world thread were held). Returns true when the bid must
+    // be REJECTED:
     //   - the owner is the bidder itself;
-    //   - the owner's account is the bidder's account;
-    //   - the owner's account cannot be resolved (fail closed) -
+    //   - the owner is one of the bidder account's characters (online or
+    //     offline - the set covers both);
+    //   - the sibling set could not be loaded (fail closed) -
     // except that ownerless listings (ownerGuidLow == 0, the auction-house-bot
     // convention) are always admissible.
     inline bool RejectAuctionBidder(uint32_t ownerGuidLow, uint32_t bidderGuidLow,
-        bool ownerAccountKnown, uint32_t ownerAccount, uint32_t bidderAccount)
+        bool siblingsKnown, bool ownerIsAccountSibling)
     {
         if (ownerGuidLow == 0)
             return false;
@@ -61,11 +70,44 @@ namespace living
         if (ownerGuidLow == bidderGuidLow)
             return true;
 
-        if (!ownerAccountKnown || ownerAccount == 0)
+        if (!siblingsKnown)
             return true;
 
-        return ownerAccount == bidderAccount;
+        return ownerIsAccountSibling;
     }
+
+    // The bidder account's character GUIDs, loaded once at the start of an AH
+    // bid action and reused for every scan, revalidation and the BidItem
+    // packet boundary - admission is a pure set check, never a per-auction
+    // account query. `loader` performs the ONE lookup and returns nullopt on
+    // failure, in which case the identity fails closed (every owned listing is
+    // rejected) and the caller fails the whole action.
+    struct AuctionBidderSiblings
+    {
+        uint32_t bidderGuidLow = 0;
+        bool loaded = false;
+        std::set<uint32_t> siblingGuidLows;
+
+        template <typename LoaderFn>
+        static AuctionBidderSiblings Load(uint32_t bidderGuidLow, LoaderFn&& loader)
+        {
+            AuctionBidderSiblings identity;
+            identity.bidderGuidLow = bidderGuidLow;
+            if (std::optional<std::vector<uint32_t>> guids = loader())
+            {
+                identity.loaded = true;
+                identity.siblingGuidLows.insert(guids->begin(), guids->end());
+            }
+
+            return identity;
+        }
+
+        bool Rejects(uint32_t ownerGuidLow) const
+        {
+            return RejectAuctionBidder(ownerGuidLow, bidderGuidLow, loaded,
+                siblingGuidLows.count(ownerGuidLow) > 0);
+        }
+    };
 
     // Active standing-bid budget for the automatic bid pass. A bot may hold at
     // most `cap` simultaneous standing bids: `>= cap` existing bids is AT

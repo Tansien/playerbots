@@ -28,6 +28,12 @@
 class LoginQueryHolder;
 class CharacterHandler;
 
+namespace ai
+{
+    // Defined below with the creation finalizer; hooked into UpdateSessions.
+    void PumpBotCreation();
+}
+
 PlayerbotHolder::PlayerbotHolder() : PlayerbotAIBase()
 {
     m_holderHandlers["list"] = &PlayerbotHolder::HandleList;
@@ -131,6 +137,15 @@ void PlayerbotHolder::UpdateAIInternal(uint32 elapsed, bool minimal)
 
 void PlayerbotHolder::UpdateSessions(uint32 elapsed)
 {
+    // Deferred SQL-callback work (creation finalization, relocation homebind
+    // verification and finalization retries) runs here: a normal world update
+    // that every pinned core executes BEFORE World::UpdateResultQueue in the
+    // tick, so it can never run inside the SQL result-queue mutex. Several
+    // holders pumping per tick is harmless - the queues drain on the first
+    // call and the remaining pumps are no-ops.
+    ai::PumpBotCreation();
+    sRandomPlayerbotMgr.PumpPendingRelocations();
+
     ForEachPlayerbot([&](Player* bot)
     {
         if (bot->GetPlayerbotAI() && bot->IsBeingTeleported())
@@ -2089,8 +2104,22 @@ namespace ai
     // execution-ordered signal available is an AsyncQuery on the SAME FIFO
     // delay thread: it executes after the queued transaction, and its callback
     // (delivered by CharacterDatabase.ProcessResultQueue on the world thread)
-    // observes the durable outcome. The finalizer drives the pure
-    // living::CreationLifecycle from those callbacks:
+    // observes the durable outcome.
+    //
+    // CRITICAL constraint (verified against all three pinned cores): the SQL
+    // worker still holds the async DB connection when it calls
+    // SqlResultQueue::Add, and ProcessResultQueue holds the result-queue mutex
+    // while executing callbacks. A callback that performs ANY database work
+    // (DirectPExecute, another query) can therefore deadlock the world thread
+    // against the worker. HandleVerify/HandleCleanupVerify below only parse
+    // the result into a small in-memory event, delete the QueryResult and
+    // return; every lifecycle transition, metadata write, cleanup, retry and
+    // follow-up query runs in PumpBotCreation(), executed from the module's
+    // world-update hook - which all three cores call BEFORE
+    // World::UpdateResultQueue in a tick, so a queued event is always pumped
+    // on a LATER tick, strictly after the result-queue mutex was released.
+    //
+    // The lifecycle itself lives in living::CreationFinalizer:
     //   SaveToDB queued -> PendingPersistence (no metadata, no quota, no GUID
     //   exposure) -> row + identity verified -> execution-confirmed metadata
     //   writes -> Created (GUID exposed: freeAltBots). Metadata failure ->
@@ -2099,176 +2128,58 @@ namespace ai
     class BotCreationFinalizer
     {
     public:
-        struct PendingCreation
+        // Deferred metadata payload, captured before SaveToDB and written only
+        // after the durable row is verified (from the pump, never a callback).
+        struct CreationPayload
         {
-            living::CreationLifecycle lifecycle;
-            uint32 guid = 0;
-            uint32 accountId = 0;
-            std::string name;
-            // Deferred metadata payload, captured before SaveToDB and written
-            // only after the durable row is verified.
             ai::ChangeTalentsAction::TalentSelectionResult talents;
             uint32 level = 1;
             std::string gear;
             std::string groupTargetData;
             std::string testName;
             std::string temporaryName;
-            bool autoAdd = false;
         };
 
-        static uint32 const kMaxRecords = 64;
-        static uint32 const kMaxVerifyAttempts = 5;
-        static uint32 const kMaxCleanupAttempts = 5;
+        living::CreationFinalizer core;
+        std::map<uint32, CreationPayload> payloads;
 
-        // Bounded registry: quarantined records occupy capacity forever by
-        // design - a full registry refuses new creations rather than reusing
-        // uncertain state.
-        bool CanAdmit() const { return records.size() < kMaxRecords; }
-
-        bool HasPendingName(std::string const& name) const
+        uint64 Begin(living::CreationFinalizer::Record record, CreationPayload payload)
         {
-            for (auto const& [guid, record] : records)
-                if (record.name == name)
-                    return true;
-
-            return false;
+            payloads[record.guid] = std::move(payload);
+            return core.Begin(std::move(record), Ops());
         }
 
-        void Begin(PendingCreation record)
-        {
-            uint32 const guid = record.guid;
-            records[guid] = std::move(record);
-            RequestVerify(guid);
-        }
-
-    private:
-        void RequestVerify(uint32 guid)
-        {
-            // COUNT + identity aggregates always yield one row on success, so
-            // a null callback result is a FAILED query, never absence.
-            // AsyncPQuery is the one async-query form all three pinned cores
-            // share.
-            CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleVerify, guid,
-                "SELECT COUNT(*), MIN(account), MIN(name) FROM characters WHERE guid = '%u'", guid);
-        }
-
-        void RequestCleanupVerify(uint32 guid)
-        {
-            CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleCleanupVerify, guid,
-                "SELECT COUNT(*) FROM characters WHERE guid = '%u'", guid);
-        }
-
+        // SQL result callbacks: parse + copy + return. Nothing here may touch
+        // the database or the lifecycle.
         void HandleVerify(QueryResult* result, uint32 guid)
         {
-            auto it = records.find(guid);
-            if (it == records.end())
-            {
-                delete result;
-                return;
-            }
-
-            PendingCreation& record = it->second;
-
             living::RowVerifyOutcome outcome = living::RowVerifyOutcome::QueryFailed;
             if (result)
             {
+                // Identity fields are compared here (pure in-memory reads of
+                // the already-materialized result) so the queued event stays
+                // small; the decision what to DO with the outcome is deferred.
                 Field* fields = result->Fetch();
                 if (fields[0].GetUInt32() == 0)
                     outcome = living::RowVerifyOutcome::Absent;
-                else if (fields[1].GetUInt32() != record.accountId || fields[2].GetCppString() != record.name)
-                    outcome = living::RowVerifyOutcome::IdentityMismatch;
                 else
-                    outcome = living::RowVerifyOutcome::Verified;
+                {
+                    uint32 expectedAccount = 0;
+                    std::string expectedName;
+                    if (ExpectedIdentity(guid, expectedAccount, expectedName)
+                        && (fields[1].GetUInt32() != expectedAccount || fields[2].GetCppString() != expectedName))
+                        outcome = living::RowVerifyOutcome::IdentityMismatch;
+                    else
+                        outcome = living::RowVerifyOutcome::Verified;
+                }
             }
             delete result;
 
-            switch (record.lifecycle.OnCharacterVerify(outcome, kMaxVerifyAttempts))
-            {
-                case living::CreationStage::PendingPersistence:
-                    if (outcome == living::RowVerifyOutcome::Verified)
-                        FinalizeVerified(record);
-                    else
-                        RequestVerify(guid); // bounded retry of a failed query
-                    break;
-                case living::CreationStage::FailedRetryable:
-                    // The character transaction executed and rolled back; no
-                    // dependent state was ever written.
-                    sLog.outError("Bot creation for '%s' (guid %u) rolled back in the character transaction; nothing persisted",
-                        record.name.c_str(), guid);
-                    records.erase(it);
-                    break;
-                case living::CreationStage::Quarantined:
-                    sLog.outError("Bot creation for '%s' (guid %u) quarantined: durable state could not be established (%s)",
-                        record.name.c_str(), guid,
-                        outcome == living::RowVerifyOutcome::IdentityMismatch ? "identity mismatch" : "verify queries kept failing");
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        void FinalizeVerified(PendingCreation& record)
-        {
-            uint32 const guid = record.guid;
-
-            // Every dependent write below is execution-confirmed (SetValue ->
-            // SetEventValue -> DirectPExecute).
-            bool metadataOk = ai::ChangeTalentsAction::PersistTalentSpec(guid, record.talents);
-
-            if (record.level > 1)
-            {
-                metadataOk = sRandomPlayerbotMgr.SetValue(guid, "create levelup", 1) && metadataOk;
-                metadataOk = sRandomPlayerbotMgr.SetValue(guid, "create gear", 1, record.gear) && metadataOk;
-            }
-
-            if (!record.groupTargetData.empty())
-                metadataOk = sRandomPlayerbotMgr.SetValue(guid, "create group", 1, record.groupTargetData) && metadataOk;
-
-            if (!record.testName.empty())
-                metadataOk = sRandomPlayerbotMgr.SetValue(guid, "test", 1, record.testName) && metadataOk;
-
-            if (!record.temporaryName.empty())
-                metadataOk = sRandomPlayerbotMgr.SetValue(guid, "temporary", 1, record.temporaryName) && metadataOk;
-
-            if (record.lifecycle.OnMetadataResult(metadataOk) == living::CreationStage::Created)
-            {
-                // Only now is the GUID exposed and the creation complete.
-                if (record.autoAdd)
-                    sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(record.accountId, guid));
-
-                sLog.outDetail("Bot creation finalized: '%s' (guid %u)", record.name.c_str(), guid);
-                records.erase(guid);
-                return;
-            }
-
-            // Metadata failed after character durability: clean up, and only a
-            // CONFIRMED cleanup may make this attempt retryable.
-            bool const eventsGone = CharacterDatabase.DirectPExecute(
-                "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid);
-            sRandomPlayerbotMgr.ForgetEventCache(guid);
-
-            if (record.lifecycle.OnEventCleanupResult(eventsGone) == living::CreationStage::Quarantined)
-            {
-                sLog.outError("Bot creation for '%s' (guid %u) quarantined: event cleanup failed after metadata failure",
-                    record.name.c_str(), guid);
-                return;
-            }
-
-            Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), record.accountId, true, true);
-            RequestCleanupVerify(guid);
+            core.OnCallbackResult(guid, outcome, living::CreationCallbackKind::Verify);
         }
 
         void HandleCleanupVerify(QueryResult* result, uint32 guid)
         {
-            auto it = records.find(guid);
-            if (it == records.end())
-            {
-                delete result;
-                return;
-            }
-
-            PendingCreation& record = it->second;
-
             living::RowVerifyOutcome outcome = living::RowVerifyOutcome::QueryFailed;
             if (result)
                 outcome = result->Fetch()[0].GetUInt32() == 0
@@ -2276,33 +2187,266 @@ namespace ai
                     : living::RowVerifyOutcome::Verified; // still present
             delete result;
 
-            switch (record.lifecycle.OnCleanupVerify(outcome, kMaxCleanupAttempts))
-            {
-                case living::CreationStage::FailedRetryable:
-                    sLog.outError("Bot creation for '%s' (guid %u) failed after metadata errors; character and events verifiably removed",
-                        record.name.c_str(), guid);
-                    records.erase(it);
-                    break;
-                case living::CreationStage::PendingCleanup:
-                    // Still present or unknown: re-issue the (idempotent)
-                    // deletion and verify again, bounded by the lifecycle.
-                    if (outcome == living::RowVerifyOutcome::Verified)
-                        Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), record.accountId, true, true);
-                    RequestCleanupVerify(guid);
-                    break;
-                case living::CreationStage::Quarantined:
-                    sLog.outError("Bot creation for '%s' (guid %u) quarantined: cleanup could not be confirmed",
-                        record.name.c_str(), guid);
-                    break;
-                default:
-                    break;
-            }
+            core.OnCallbackResult(guid, outcome, living::CreationCallbackKind::CleanupVerify);
         }
 
-        std::map<uint32, PendingCreation> records;
+        living::CreationFinalizerOps Ops()
+        {
+            living::CreationFinalizerOps ops;
+            ops.requestVerify = [this](uint32 guid)
+            {
+                // COUNT + identity aggregates always yield one row on success,
+                // so a null callback result is a FAILED query, never absence.
+                // AsyncPQuery is the one async-query form all three pinned
+                // cores share.
+                CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleVerify, guid,
+                    "SELECT COUNT(*), MIN(account), MIN(name) FROM characters WHERE guid = '%u'", guid);
+            };
+            ops.requestCleanupVerify = [this](uint32 guid)
+            {
+                CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleCleanupVerify, guid,
+                    "SELECT COUNT(*) FROM characters WHERE guid = '%u'", guid);
+            };
+            ops.writeMetadata = [this](uint32 guid)
+            {
+                auto it = payloads.find(guid);
+                if (it == payloads.end())
+                    return false;
+
+                CreationPayload const& payload = it->second;
+
+                // Every dependent write is execution-confirmed (SetValue ->
+                // SetEventValue -> DirectPExecute).
+                bool metadataOk = ai::ChangeTalentsAction::PersistTalentSpec(guid, payload.talents);
+
+                if (payload.level > 1)
+                {
+                    metadataOk = sRandomPlayerbotMgr.SetValue(guid, "create levelup", 1) && metadataOk;
+                    metadataOk = sRandomPlayerbotMgr.SetValue(guid, "create gear", 1, payload.gear) && metadataOk;
+                }
+
+                if (!payload.groupTargetData.empty())
+                    metadataOk = sRandomPlayerbotMgr.SetValue(guid, "create group", 1, payload.groupTargetData) && metadataOk;
+
+                if (!payload.testName.empty())
+                    metadataOk = sRandomPlayerbotMgr.SetValue(guid, "test", 1, payload.testName) && metadataOk;
+
+                if (!payload.temporaryName.empty())
+                    metadataOk = sRandomPlayerbotMgr.SetValue(guid, "temporary", 1, payload.temporaryName) && metadataOk;
+
+                return metadataOk;
+            };
+            ops.deleteEventRows = [](uint32 guid)
+            {
+                bool const eventsGone = CharacterDatabase.DirectPExecute(
+                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid);
+                sRandomPlayerbotMgr.ForgetEventCache(guid);
+                return eventsGone;
+            };
+            ops.deleteCharacter = [](uint32 guid, uint32 accountId)
+            {
+                Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), accountId, true, true);
+            };
+            ops.onCreated = [](uint32 guid, uint32 accountId, std::string const& name, bool autoAdd)
+            {
+                // Only now is the GUID exposed and the creation complete.
+                if (autoAdd)
+                    sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(accountId, guid));
+
+                sLog.outDetail("Bot creation finalized: '%s' (guid %u)", name.c_str(), guid);
+            };
+            return ops;
+        }
+
+    private:
+        bool ExpectedIdentity(uint32 guid, uint32& accountId, std::string& name) const;
     };
 
     static BotCreationFinalizer botCreationFinalizer;
+    static living::CreationBatchRegistry botCreationBatches;
+
+    bool BotCreationFinalizer::ExpectedIdentity(uint32 guid, uint32& accountId, std::string& name) const
+    {
+        // Reading the in-memory record from the callback is safe (world
+        // thread, in-memory map only); this const helper exists so the
+        // callback cannot accidentally reach mutating members.
+        return core.WithRecord(guid, [&](living::CreationFinalizer::Record const& record)
+        {
+            accountId = record.accountId;
+            name = record.name;
+        });
+    }
+}
+
+living::CreationPollResult PlayerbotHolder::PollBotCreation(uint64 creationToken, bool acknowledgeTerminal)
+{
+    return ai::botCreationFinalizer.core.Poll(creationToken, acknowledgeTerminal);
+}
+
+living::BatchPollResult PlayerbotHolder::PollBotCreationBatch(uint64 batchToken, bool acknowledgeComplete)
+{
+    return ai::botCreationBatches.Poll(batchToken, acknowledgeComplete);
+}
+
+uint32 PlayerbotHolder::MaxCharsPerAccount()
+{
+#ifdef MANGOSBOT_TWO
+    return 10;
+#else
+    return 9;
+#endif
+}
+
+uint32 PlayerbotHolder::EffectiveCharacterCount(uint32 accountId)
+{
+    return sAccountMgr.GetCharactersCount(accountId)
+        + ai::botCreationFinalizer.core.ReservedCount(accountId);
+}
+
+namespace ai
+{
+    static void NotifyBatchInitiator(living::CreationBatchRegistry::Batch const& batch, std::string const& message, bool isError = true)
+    {
+        if (isError)
+            sLog.outError("Group creation for %s: %s", batch.initiatorName.c_str(), message.c_str());
+        else
+            sLog.outString("Group creation for %s: %s", batch.initiatorName.c_str(), message.c_str());
+
+        if (batch.initiatorGuid)
+            if (Player* initiator = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, batch.initiatorGuid)))
+                ChatHandler(initiator).PSendSysMessage("Group creation: %s", message.c_str());
+    }
+
+    // Drains the deferred SQL-callback events and drives ALL creation
+    // lifecycle work (metadata writes, cleanup, retries, follow-up queries),
+    // then propagates terminal results to group/test batches - including
+    // bounded replacement of retryably failed members. Runs from
+    // PlayerbotHolder::UpdateSessions: a normal world update that all three
+    // pinned cores execute BEFORE World::UpdateResultQueue, so nothing here
+    // ever runs inside the SQL result-queue mutex.
+    void PumpBotCreation()
+    {
+        struct Replacement
+        {
+            uint64 batchToken = 0;
+            uint8 role = 0;
+        };
+        std::vector<Replacement> replacements;
+
+        botCreationFinalizer.core.Pump(botCreationFinalizer.Ops(),
+            [&replacements](living::CreationCompletion const& completion)
+        {
+            switch (completion.status)
+            {
+                case living::CreationPollStatus::Created:
+                    break; // onCreated already logged
+                case living::CreationPollStatus::FailedRetryable:
+                case living::CreationPollStatus::FailedTerminal:
+                case living::CreationPollStatus::Quarantined:
+                default:
+                    sLog.outError("Bot creation for '%s' (guid %u): %s",
+                        completion.name.c_str(), completion.guid, completion.message.c_str());
+                    break;
+            }
+
+            botCreationFinalizer.payloads.erase(completion.guid);
+
+            // Publish to the batch coordinator BEFORE the finalizer removes
+            // the record (this observer runs inside PublishTerminal).
+            if (std::optional<living::BatchMemberResolution> resolution = botCreationBatches.OnCreationTerminal(completion))
+            {
+                if (resolution->enqueueReplacement)
+                    replacements.push_back(Replacement{ resolution->batchToken, resolution->role });
+                else if (!resolution->failure.empty())
+                    if (living::CreationBatchRegistry::Batch const* batch = botCreationBatches.Find(resolution->batchToken))
+                        NotifyBatchInitiator(*batch, resolution->failure);
+            }
+        });
+
+        // Replacements run AFTER the pump drained (CreateBot re-enters the
+        // finalizer via Begin; keeping that outside the drain loop keeps the
+        // flow single-level). A replacement re-plans the failed slot's ROLE
+        // with the run's own creation parameters.
+        for (Replacement const& replacement : replacements)
+        {
+            living::CreationBatchRegistry::Batch const* batch = botCreationBatches.Find(replacement.batchToken);
+            if (!batch)
+                continue;
+
+            Player* master = batch->initiatorGuid
+                ? sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, batch->initiatorGuid)) : nullptr;
+            if (!master)
+            {
+                botCreationBatches.RecordFailure(replacement.batchToken,
+                    "replacement for a failed member skipped: initiator is offline");
+                continue;
+            }
+
+            uint8 race = 0;
+            uint8 cls = 0;
+            if (!RandomPlayerbotFactory::GetRandomTuple(master->GetTeam(), static_cast<BotRoles>(replacement.role), 0, 0, race, cls))
+            {
+                botCreationBatches.RecordFailure(replacement.batchToken,
+                    "replacement for a failed member skipped: no compatible race/class tuple");
+                continue;
+            }
+
+            CreateBotOptions options;
+            options.level = master->GetLevel();
+            options.race = race;
+            options.cls = cls;
+            options.role = replacement.role;
+            options.requireRoleMatch = true;
+            options.groupWith = master->GetName();
+            options.explicitGroup = true;
+            options.gear = batch->memberGear;
+            options.autoAdd = batch->memberAutoAdd;
+            options.temporary = batch->memberTemporary;
+
+            // A real master (chat-initiated run) allocates on its own holder;
+            // a test-bot initiator has no PlayerbotMgr and uses the random
+            // holder's account allocation - the same holders the original run
+            // used.
+            PlayerbotHolder* holder = master->GetPlayerbotMgr()
+                ? static_cast<PlayerbotHolder*>(master->GetPlayerbotMgr())
+                : static_cast<PlayerbotHolder*>(&sRandomPlayerbotMgr);
+
+            BotCreationResult result = holder->CreateBot(master, options);
+            if (result.status == living::BotCreateStatus::PendingPersistence)
+            {
+                living::CreationBatchMember member;
+                member.creationToken = result.creationToken;
+                member.cls = result.createdClass;
+                member.role = replacement.role;
+                botCreationBatches.AddPendingMember(replacement.batchToken, member);
+            }
+            else
+            {
+                std::string reason = result.messages.empty() ? "unknown" : result.messages.front();
+                botCreationBatches.RecordFailure(replacement.batchToken,
+                    "replacement creation failed immediately: " + reason);
+                NotifyBatchInitiator(*batch, "replacement creation failed: " + reason);
+            }
+        }
+
+        // Surface completed batches exactly once - the requested group is
+        // never left silently undersized.
+        for (living::CreationBatchRegistry::Batch const* batch : botCreationBatches.TakeNewlyCompleted())
+        {
+            std::ostringstream summary;
+            summary << "batch complete: " << batch->finalizedGuids.size() << " member(s) finalized";
+            uint32 const wanted = batch->desiredSize > batch->preexistingMembers
+                ? batch->desiredSize - batch->preexistingMembers : 0;
+            if (batch->finalizedGuids.size() < wanted)
+                summary << " of " << wanted << " requested";
+            if (!batch->failures.empty())
+                summary << ", " << batch->failures.size() << " failure(s), first: " << batch->failures.front();
+            NotifyBatchInitiator(*batch, summary.str(), !batch->failures.empty());
+        }
+
+        static uint64 pumpCount = 0;
+        botCreationBatches.PruneExpired(++pumpCount);
+    }
 }
 
 BotCreationResult PlayerbotHolder::CreateBot(Player* master, const std::string param)
@@ -2405,7 +2549,7 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
     // Bounded pending registry: while any creation's durability or cleanup is
     // unknown its record occupies capacity, and a full registry refuses new
     // work instead of reusing uncertain state.
-    if (!botCreationFinalizer.CanAdmit())
+    if (!ai::botCreationFinalizer.core.CanAdmit())
     {
         result.status = living::BotCreateStatus::TerminalFailure;
         result.messages.push_back("Bot creation pipeline is at capacity (pending/quarantined creations); try again later");
@@ -2454,12 +2598,15 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         return result;
     }
 
-    uint32 maxCharsPerAccount = 9;
-#ifdef MANGOSBOT_TWO
-    maxCharsPerAccount = 10;
-#endif
-
-    if (sAccountMgr.GetCharactersCount(accountId) >= maxCharsPerAccount)
+    // Reserve one character slot BEFORE any GUID allocation or SaveToDB. The
+    // durable count alone cannot admit safely: a queued-but-unexecuted save is
+    // invisible to it, so a burst of creations (group loop, test runner) would
+    // all observe the same stale count and overfill the account. The
+    // reservation is bound to the pending record by Begin and released only on
+    // a CONFIRMED terminal outcome; every failure path between here and Begin
+    // must release it explicitly because no save was queued.
+    if (!ai::botCreationFinalizer.core.TryReserveAccountSlot(accountId,
+            sAccountMgr.GetCharactersCount(accountId), MaxCharsPerAccount()))
     {
         result.status = living::BotCreateStatus::TerminalFailure;
         result.messages.push_back("Account has max characters");
@@ -2479,8 +2626,9 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
 
     // A name whose creation is still pending durability confirmation is not
     // reusable: the durable row may materialize at any moment.
-    if (botCreationFinalizer.HasPendingName(name))
+    if (ai::botCreationFinalizer.core.HasPendingName(name))
     {
+        ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
         result.status = explicitName
             ? living::BotCreateStatus::TerminalFailure
             : living::BotCreateStatus::RetryableFailure;
@@ -2512,6 +2660,7 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         {
             delete botSession;
             delete newBot;
+            ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
             // Only a randomly GENERATED name/appearance may roll differently on a
             // retry; an explicit name fails deterministically and retrying it
             // would just burn account capacity on the same failure.
@@ -2574,6 +2723,7 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
                     delete newBot;
                     delete botSession;
                     sRandomPlayerbotMgr.ForgetEventCache(botGuid);
+                    ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
                     result.guid = ObjectGuid();
                     result.status = living::BotCreateStatus::RetryableFailure;
                     result.messages.push_back("Talent selection did not produce the requested role");
@@ -2590,6 +2740,7 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
                 delete newBot;
                 delete botSession;
                 sRandomPlayerbotMgr.ForgetEventCache(botGuid);
+                ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
                 result.guid = ObjectGuid();
                 result.status = living::BotCreateStatus::RetryableFailure;
                 result.messages.push_back("Selected talent link exceeds the metadata schema limit");
@@ -2627,22 +2778,29 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         delete botSession;
 
         // Stage 5: register the bounded pending record (GUID, account,
-        // normalized name, required metadata and composition context) and let
-        // the finalizer confirm the durable row before any dependent write.
-        BotCreationFinalizer::PendingCreation pending;
-        pending.guid = botGuid;
-        pending.accountId = accountId;
-        pending.name = name;
-        pending.talents = talents;
-        pending.level = options.level;
-        pending.gear = options.gear;
-        pending.groupTargetData = wantsGroupEvent ? groupTargetData : "";
-        pending.testName = options.testName;
-        pending.temporaryName = options.temporary ? name : "";
-        pending.autoAdd = options.autoAdd;
-        botCreationFinalizer.Begin(std::move(pending));
+        // normalized name, deferred metadata and composition context) and let
+        // the finalizer confirm the durable row before any dependent write -
+        // from the pump, never from the SQL result callback. The record
+        // adopts the account reservation taken above.
+        living::CreationFinalizer::Record record;
+        record.guid = botGuid;
+        record.accountId = accountId;
+        record.name = name;
+        record.autoAdd = options.autoAdd;
+        record.holdsAccountReservation = true;
 
-        // The GUID is NOT exposed while durability is unknown.
+        ai::BotCreationFinalizer::CreationPayload payload;
+        payload.talents = talents;
+        payload.level = options.level;
+        payload.gear = options.gear;
+        payload.groupTargetData = wantsGroupEvent ? groupTargetData : "";
+        payload.testName = options.testName;
+        payload.temporaryName = options.temporary ? name : "";
+
+        result.creationToken = ai::botCreationFinalizer.Begin(std::move(record), std::move(payload));
+
+        // The GUID is NOT exposed while durability is unknown; callers observe
+        // the creation through the opaque token.
         result.guid = ObjectGuid();
         result.status = living::BotCreateStatus::PendingPersistence;
         result.messages.push_back("Bot creation queued: " + name + " (finalized once the character transaction is confirmed)");
@@ -2661,7 +2819,14 @@ std::list<std::string> PlayerbotHolder::HandleCreate(Player* master, const std::
 
 std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::string param, AccountTypes security)
 {
+    uint64 batchToken = 0;
+    return HandleGroup(master, param, security, batchToken);
+}
+
+std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::string param, AccountTypes security, uint64& batchToken)
+{
     std::list<std::string> messages;
+    batchToken = 0;
 
     if (!master)
     {
@@ -2751,6 +2916,8 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     uint32 maxTries = 10*groupSize;
 
     living::GroupCreationLedger ledger;
+    std::vector<living::CreationBatchMember> batchMembers;
+    uint32 const preexistingMembers = currentGroupSize;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     bool stoppedOnTerminalFailure = false;
 
@@ -2821,6 +2988,18 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         bool const terminal = ledger.Record(result.status, result.createdClass);
         messages.splice(messages.end(), result.messages);
 
+        // A pending member joins the run's completion batch: its terminal
+        // result (confirmed, rolled back, quarantined) is propagated back to
+        // this run instead of dying in a log line.
+        if (result.status == living::BotCreateStatus::PendingPersistence && result.creationToken)
+        {
+            living::CreationBatchMember member;
+            member.creationToken = result.creationToken;
+            member.cls = result.createdClass;
+            member.role = static_cast<uint8>(role);
+            batchMembers.push_back(member);
+        }
+
         if (living::GroupCreationLedger::CountsTowardComposition(result.status))
         {
             currentGroupSize++;
@@ -2844,6 +3023,30 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             stoppedOnTerminalFailure = true;
             break;
         }
+    }
+
+    // Register the completion batch: the finalizer publishes each member's
+    // terminal result to it, retryable failures are replaced within the
+    // bounded budget, and the initiator/test queue is told the real outcome
+    // instead of the group staying silently undersized.
+    if (!batchMembers.empty())
+    {
+        living::CreationBatchRegistry::Batch batch;
+        batch.initiatorName = master->GetName();
+        batch.initiatorGuid = master->GetGUIDLow();
+        batch.desiredSize = groupSize;
+        batch.preexistingMembers = preexistingMembers;
+        batch.pending = batchMembers;
+        // Bounded replacement: at most one replacement per requested slot.
+        batch.replacementBudget = groupSize;
+        batch.memberGear = gear;
+        batch.memberAutoAdd = autoAdd;
+        batch.memberTemporary = temporary;
+        batchToken = ai::botCreationBatches.Begin(std::move(batch));
+        if (!batchToken)
+            messages.push_back("Warning: creation batch registry is full; asynchronous member failures will be logged but not replaced");
+        else
+            messages.push_back("Group creation queued; members are confirmed asynchronously and failures are replaced or reported");
     }
 
     std::ostringstream debugInfo;
@@ -3028,6 +3231,40 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
         if (pt.completed)
             continue;
 
+        // Poll an outstanding asynchronous creation to a REAL terminal result
+        // before anything else: enqueueing was never success. A retryable
+        // failure re-attempts within a bounded budget; terminal/quarantined
+        // failure fails the test with the real reason instead of leaving it
+        // pending forever.
+        if (pt.creationToken)
+        {
+            living::CreationPollResult poll = PollBotCreation(pt.creationToken, true);
+            switch (poll.status)
+            {
+                case living::CreationPollStatus::Pending:
+                    continue;
+                case living::CreationPollStatus::Created:
+                    pt.creationToken = 0;
+                    // The finalized bot carries the test event and deposits
+                    // its result after login.
+                    pt.pending = true;
+                    continue;
+                case living::CreationPollStatus::FailedRetryable:
+                    pt.creationToken = 0;
+                    if (++pt.creationRetries >= 3)
+                    {
+                        pt.result = "IMPOSSIBLE: bot creation kept failing retryably (" + poll.message + ")";
+                        pt.completed = true;
+                    }
+                    continue; // else fall through to a fresh attempt next update
+                default: // FailedTerminal, Quarantined, Unknown
+                    pt.creationToken = 0;
+                    pt.result = "IMPOSSIBLE: bot creation failed (" + poll.message + ")";
+                    pt.completed = true;
+                    continue;
+            }
+        }
+
         if (!TestRegistry::HasTest(pt.testName))
         {
             pt.result = "Test not found";
@@ -3037,15 +3274,13 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
 
         if (dynamic_cast<PlayerbotMgr*>(this))
         {
-            uint32 maxCharsPerAccount = 9;
-#ifdef MANGOSBOT_TWO
-            maxCharsPerAccount = 10;
-#endif
             uint32 accountId = sObjectMgr.GetPlayerAccountIdByGUID((dynamic_cast<PlayerbotMgr*>(this))->GetMaster()->GetObjectGuid());
                 if (accountId == 0) continue;
 
-            uint32 currentChars = sAccountMgr.GetCharactersCount(accountId);
-            if (currentChars >= maxCharsPerAccount)
+            // Effective occupancy: durable characters plus pending/quarantined
+            // creation reservations - several queued tests must not all admit
+            // against the same stale durable count.
+            if (EffectiveCharacterCount(accountId) >= MaxCharsPerAccount())
                 continue;
         }
 
@@ -3053,7 +3288,8 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
         uint32 activeTestBots = 0;
         for (const auto& test : pendingTests)
         {
-            if (test.pending && !test.completed)
+            // A test whose creation is still in flight occupies its bots too.
+            if ((test.pending || test.creationToken) && !test.completed)
                 activeTestBots += std::max<uint32>(1, test.expectedBotSpawnCount);
         }
 
@@ -3063,11 +3299,33 @@ void PlayerbotHolder::UpdatePendingTests(uint32 elapsed)
 
         std::string createParams = TestRegistry::GetBotCreationRequirement(pt.testName);
 
-        createParams += " login=0 temporary=1 test=" + pt.testName;       
+        createParams += " login=0 temporary=1 test=" + pt.testName;
 
-        std::list<std::string> createMsgs = HandleCreate(nullptr, createParams, SEC_PLAYER);
-
-        pt.pending = true;
+        BotCreationResult createResult = CreateBot(nullptr, createParams);
+        switch (createResult.status)
+        {
+            case living::BotCreateStatus::PendingPersistence:
+                pt.creationToken = createResult.creationToken;
+                break;
+            case living::BotCreateStatus::Created:
+                pt.pending = true; // defensive: creation is normally asynchronous
+                break;
+            case living::BotCreateStatus::RetryableFailure:
+                if (++pt.creationRetries >= 3)
+                {
+                    pt.result = "IMPOSSIBLE: bot creation kept failing ("
+                        + (createResult.messages.empty() ? std::string("unknown") : createResult.messages.front()) + ")";
+                    pt.completed = true;
+                }
+                break;
+            case living::BotCreateStatus::TerminalFailure:
+            default:
+                // An immediate parse/admission failure fails the test now.
+                pt.result = "IMPOSSIBLE: bot creation rejected ("
+                    + (createResult.messages.empty() ? std::string("unknown") : createResult.messages.front()) + ")";
+                pt.completed = true;
+                break;
+        }
     }
 }
 
