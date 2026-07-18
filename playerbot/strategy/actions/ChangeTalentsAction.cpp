@@ -389,13 +389,16 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
     selection.specId = specId;
     selection.specLink = specLink;
     selection.hadExistingSpec = specNo != 0;
-    // The APPLIED talents decide the intended role capability mask, through
-    // the canonical spec-tab mapping - aura/form state plays no part. When no
-    // concrete path was applied (none found, or several merely listed with
-    // auto-pick disabled), the roles stay ZERO: a blank-talent character's
-    // default tab must never satisfy an explicit role request.
+    // The APPLIED talents decide the CONCRETE verified role - the exact role
+    // stored and charged in creation/batch accounting - through the learned-
+    // talent distinction, NOT the capability mask (which would let a DPS Feral
+    // build satisfy a tank request) and NOT a transient form/aura (a fresh bot
+    // has none). When no concrete path was applied (none found, or several
+    // merely listed with auto-pick disabled), the role stays ZERO: a
+    // blank-talent character's default tab must never satisfy an explicit
+    // role request.
     selection.selectedRoles = selection.applied
-        ? static_cast<uint8>(AiFactory::GetSpecRoleCapabilities(cls, static_cast<uint8>(AiFactory::GetPlayerSpecTab(bot))))
+        ? static_cast<uint8>(AiFactory::GetAppliedSpecRole(bot))
         : 0;
     return selection;
 }

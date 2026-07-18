@@ -935,18 +935,34 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     // groups and failed invites keep it for a bounded retry.
                     std::string const groupWith = sRandomPlayerbotMgr.GetData(botGuid, "create group");
 
-                    bool targetExists = false;
+                    // COUNT-first typed existence: GetPlayerAccountIdByGUID and
+                    // GetPlayerGuidByName both return zero/empty for BOTH "row
+                    // absent" and "query failed", so a bool would let a transient
+                    // outage look like a deletion and terminally clear the join
+                    // intent. A COUNT yields exactly one row on success, so a null
+                    // result is UNKNOWN (retry later), zero is confirmed missing.
+                    living::TargetExistence existence = living::TargetExistence::Unavailable;
                     Player* target = nullptr;
                     uint32 targetGuidLow = 0;
                     if (living::TryParseUInt32InRange(groupWith, 1, 0xFFFFFFFFu, targetGuidLow))
                     {
                         ObjectGuid const targetGuid(HIGHGUID_PLAYER, targetGuidLow);
-                        targetExists = sObjectMgr.GetPlayerAccountIdByGUID(targetGuid) != 0;
+                        std::optional<uint64> count;
+                        if (auto result = CharacterDatabase.PQuery(
+                                "SELECT COUNT(*) FROM characters WHERE guid = '%u'", targetGuidLow))
+                            count = result->Fetch()[0].GetUInt32();
+                        existence = living::ClassifyTargetExistence(count);
                         target = sObjectMgr.GetPlayer(targetGuid);
                     }
                     else if (!groupWith.empty())
                     {
-                        targetExists = bool(sObjectMgr.GetPlayerGuidByName(groupWith));
+                        std::string escapedName = groupWith;
+                        CharacterDatabase.escape_string(escapedName);
+                        std::optional<uint64> count;
+                        if (auto result = CharacterDatabase.PQuery(
+                                "SELECT COUNT(*) FROM characters WHERE name = '%s'", escapedName.c_str()))
+                            count = result->Fetch()[0].GetUInt32();
+                        existence = living::ClassifyTargetExistence(count);
                         target = sObjectAccessor.FindPlayerByName(groupWith.c_str());
                     }
 
@@ -961,7 +977,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     }
 
                     living::GroupJoinPlan const plan = living::PlanGroupJoinAttempt(
-                        targetExists, target != nullptr, membershipVerified,
+                        existence, target != nullptr, membershipVerified,
                         joinAttempts - 1, /*maxAttempts*/ 10, /*baseDelaySeconds*/ 30);
 
                     if (plan.decision == living::GroupJoinDecision::RetryLater)
@@ -973,7 +989,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     {
                         if (plan.decision == living::GroupJoinDecision::ClearTerminal)
                             sLog.outDetail("Bot %s: giving up on group target '%s' (%s)", bot->GetName(), groupWith.c_str(),
-                                targetExists ? "retry budget exhausted" : "target deleted");
+                                existence == living::TargetExistence::ConfirmedMissing ? "target deleted" : "retry budget exhausted");
 
                         sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
                         groupJoinBackoffUntil.erase(botGuid);

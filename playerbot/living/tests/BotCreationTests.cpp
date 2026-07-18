@@ -193,33 +193,137 @@ LIVING_TEST(creation_metadata_validated_before_any_mutation)
     LIVING_CHECK(FindOversizedCreationValue("", "", "", "").empty());
 }
 
+// FillAccount is the pure driver behind the fixed-count bulk-creation fill
+// (finding 4). The production nested loop broke only the inner sweep on a
+// refused shared reservation, so the outer loop respun forever with no progress
+// once the ledger blocked a slot the durable-only maxAllowed still counted free.
+
+LIVING_TEST(bulk_fill_stops_when_reservation_is_blocked)
+{
+    // The finding's exact repro: durable 8/9 plus one pre-existing manual/group
+    // reservation, so the very first reservation is refused. The fill must
+    // return immediately after ONE round, never respin.
+    uint32_t rounds = 0;
+    AccountFillResult const fill = FillAccount(1, [&](uint32_t) -> AccountFillRound
+    {
+        ++rounds;
+        AccountFillRound round;
+        round.reservationBlocked = true; // ledger refuses the slot
+        return round;
+    });
+    LIVING_CHECK(fill.created == 0);
+    LIVING_CHECK(fill.reservationBlocked);
+    LIVING_CHECK(rounds == 1); // terminated cleanly; did not respin forever
+}
+
+LIVING_TEST(bulk_fill_reaches_cap_without_overfilling)
+{
+    uint32_t rounds = 0;
+    AccountFillResult const fill = FillAccount(3, [&](uint32_t allowance) -> AccountFillRound
+    {
+        ++rounds;
+        LIVING_CHECK(allowance >= 1); // never invoked past the cap
+        AccountFillRound round;
+        round.created = 1;
+        return round;
+    });
+    LIVING_CHECK(fill.created == 3);        // exactly the cap, never more
+    LIVING_CHECK(!fill.reservationBlocked);
+    LIVING_CHECK(rounds == 3);
+}
+
+LIVING_TEST(bulk_fill_stops_on_zero_progress_round)
+{
+    // A round that queues nothing without a reservation refusal (every key
+    // class-filtered, or CreateRandomBot failing for all of them) must also
+    // terminate instead of respinning.
+    uint32_t rounds = 0;
+    AccountFillResult const fill = FillAccount(5, [&](uint32_t) -> AccountFillRound
+    {
+        ++rounds;
+        return AccountFillRound{}; // created 0, not blocked
+    });
+    LIVING_CHECK(fill.created == 0);
+    LIVING_CHECK(!fill.reservationBlocked);
+    LIVING_CHECK(rounds == 1);
+}
+
+LIVING_TEST(bulk_fill_partial_progress_then_blocked_terminates)
+{
+    int call = 0;
+    AccountFillResult const fill = FillAccount(5, [&](uint32_t) -> AccountFillRound
+    {
+        AccountFillRound round;
+        if (call++ == 0)
+            round.created = 2;               // first sweep queues two
+        else
+            round.reservationBlocked = true; // then the ledger fills
+        return round;
+    });
+    LIVING_CHECK(fill.created == 2);
+    LIVING_CHECK(fill.reservationBlocked);
+}
+
 LIVING_TEST(group_join_plan_clears_only_on_success_or_terminal)
 {
     // Verified membership: clear as completed work.
-    auto joined = PlanGroupJoinAttempt(true, true, true, 0, 10, 30);
+    auto joined = PlanGroupJoinAttempt(TargetExistence::Found, true, true, 0, 10, 30);
     LIVING_CHECK(joined.decision == GroupJoinDecision::ClearJoined);
 
-    // Deleted target: deliberately terminal, clear.
-    auto deleted = PlanGroupJoinAttempt(false, false, false, 0, 10, 30);
+    // Confirmed-missing target: deliberately terminal, clear.
+    auto deleted = PlanGroupJoinAttempt(TargetExistence::ConfirmedMissing, false, false, 0, 10, 30);
     LIVING_CHECK(deleted.decision == GroupJoinDecision::ClearTerminal);
 
     // Offline target: keep the event, retry with backoff.
-    auto offline = PlanGroupJoinAttempt(true, false, false, 0, 10, 30);
+    auto offline = PlanGroupJoinAttempt(TargetExistence::Found, false, false, 0, 10, 30);
     LIVING_CHECK(offline.decision == GroupJoinDecision::RetryLater);
     LIVING_CHECK(offline.attemptNumber == 1);
     LIVING_CHECK(offline.retryDelaySeconds == 30);
 
     // Online but membership not verified (full group, declined/failed invite):
     // keep the event, retry.
-    auto fullGroup = PlanGroupJoinAttempt(true, true, false, 3, 10, 30);
+    auto fullGroup = PlanGroupJoinAttempt(TargetExistence::Found, true, false, 3, 10, 30);
     LIVING_CHECK(fullGroup.decision == GroupJoinDecision::RetryLater);
     LIVING_CHECK(fullGroup.attemptNumber == 4);
     LIVING_CHECK(fullGroup.retryDelaySeconds == 120); // backoff grows with attempts
 
     // Bounded: the retry budget exhausts into a terminal clear, so login
     // processing cannot spam attempts forever.
-    auto exhausted = PlanGroupJoinAttempt(true, true, false, 9, 10, 30);
+    auto exhausted = PlanGroupJoinAttempt(TargetExistence::Found, true, false, 9, 10, 30);
     LIVING_CHECK(exhausted.decision == GroupJoinDecision::ClearTerminal);
+}
+
+LIVING_TEST(group_join_target_existence_classifier)
+{
+    // COUNT(*) yields one row on success, so a null result is a FAILED query
+    // (unknown), never a confirmed absence.
+    LIVING_CHECK(ClassifyTargetExistence(std::nullopt) == TargetExistence::Unavailable);
+    LIVING_CHECK(ClassifyTargetExistence(std::optional<uint64_t>(0)) == TargetExistence::ConfirmedMissing);
+    LIVING_CHECK(ClassifyTargetExistence(std::optional<uint64_t>(1)) == TargetExistence::Found);
+    LIVING_CHECK(ClassifyTargetExistence(std::optional<uint64_t>(5)) == TargetExistence::Found);
+}
+
+LIVING_TEST(group_join_db_unavailable_retries_without_consuming_budget)
+{
+    // Finding 8: a transient outage during the target lookup must NOT be read as
+    // a deletion. It retries and preserves the attempt budget and the marker.
+    auto down = PlanGroupJoinAttempt(TargetExistence::Unavailable, false, false, 3, 10, 30);
+    LIVING_CHECK(down.decision == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(down.attemptNumber == 3); // budget NOT consumed (stays at attemptsSoFar)
+
+    // Even on what would be the last attempt, an outage must not terminally clear.
+    auto downLast = PlanGroupJoinAttempt(TargetExistence::Unavailable, false, false, 9, 10, 30);
+    LIVING_CHECK(downLast.decision == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(downLast.attemptNumber == 9);
+
+    // Recovery -> confirmed missing -> a legitimate terminal clear.
+    auto recoveredMissing = PlanGroupJoinAttempt(TargetExistence::ConfirmedMissing, false, false, 3, 10, 30);
+    LIVING_CHECK(recoveredMissing.decision == GroupJoinDecision::ClearTerminal);
+
+    // Recovery -> found but offline -> a normal budgeted retry (budget consumed).
+    auto recoveredFound = PlanGroupJoinAttempt(TargetExistence::Found, false, false, 3, 10, 30);
+    LIVING_CHECK(recoveredFound.decision == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(recoveredFound.attemptNumber == 4);
 }
 
 LIVING_TEST(weighted_draw_stays_in_uint64_at_and_past_uint32_max)
@@ -427,4 +531,14 @@ LIVING_TEST(activation_plan_confirms_all_writes_before_reporting_success)
             });
         LIVING_CHECK(outcome == ActivationOutcome::FailedCompensationUncertain);
     }
+}
+
+LIVING_TEST(always_toggle_applies_only_on_confirmed_write)
+{
+    // Finding 9: `.bot always` may mutate freeAltBots and log the bot in/out
+    // ONLY when the durable `always` write is confirmed. A rejected/ambiguous
+    // write (SetValue == false) must leave runtime state unchanged and report
+    // failure/retry. The same gate guards both the enable and disable branches.
+    LIVING_CHECK(AlwaysToggleMayApply(true));   // confirmed -> apply runtime side effects
+    LIVING_CHECK(!AlwaysToggleMayApply(false)); // unconfirmed -> leave runtime unchanged, report failure
 }

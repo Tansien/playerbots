@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,49 @@ namespace living
         }
     };
 
+    // One reshuffled fixed-count fill sweep's outcome: how many characters it
+    // queued, and whether a shared-slot reservation was refused during it.
+    struct AccountFillRound
+    {
+        uint32_t created = 0;
+        bool reservationBlocked = false;
+    };
+
+    struct AccountFillResult
+    {
+        uint32_t created = 0;
+        bool reservationBlocked = false;
+    };
+
+    // Pure driver for ONE account's fixed-count bulk fill. `runRound` performs a
+    // single reshuffled sweep, queuing up to `allowance` characters and reporting
+    // whether a shared reservation was refused. The fill terminates when the cap
+    // is reached, a reservation is refused, OR a whole round makes no progress.
+    //
+    // The production nested loop broke only the INNER sweep on a refused
+    // reservation, so once the shared ledger blocked a slot that the durable-only
+    // maxAllowed still counted as free, the OUTER loop respun forever with no
+    // progress - hanging the world thread. Terminating on any non-Reserved
+    // outcome (and on a zero-progress round) fixes that at the root.
+    template <typename RunRoundFn>
+    inline AccountFillResult FillAccount(uint32_t maxAllowed, RunRoundFn&& runRound)
+    {
+        AccountFillResult result;
+        while (result.created < maxAllowed)
+        {
+            AccountFillRound const round = runRound(maxAllowed - result.created);
+            result.created += round.created;
+            if (round.reservationBlocked)
+            {
+                result.reservationBlocked = true;
+                break;
+            }
+            if (round.created == 0)
+                break; // no progress this round: stop instead of respinning forever
+        }
+        return result;
+    }
+
     // Outcome planning for one requested-group join attempt at bot login. The
     // `create group` event is cleared ONLY on verified group membership or a
     // deliberately terminal outcome (deleted target, retry budget exhausted).
@@ -122,13 +166,44 @@ namespace living
         uint32_t retryDelaySeconds = 0; // backoff before the next attempt
     };
 
-    inline GroupJoinPlan PlanGroupJoinAttempt(bool targetExists, bool targetOnline, bool membershipVerified,
+    // Typed existence of a group-join target. The core lookups
+    // (GetPlayerAccountIdByGUID / GetPlayerGuidByName) return zero/empty for BOTH
+    // "row absent" and "query failed", so a bool cannot express "unknown": a
+    // COUNT-first probe (which yields exactly one row on success) separates a
+    // confirmed absence from an unanswerable one.
+    enum class TargetExistence
+    {
+        Found,           // COUNT > 0: the target row exists
+        ConfirmedMissing,// COUNT succeeded and returned zero: really deleted
+        Unavailable,     // the COUNT query itself failed: existence is UNKNOWN
+    };
+
+    inline TargetExistence ClassifyTargetExistence(std::optional<uint64_t> count)
+    {
+        if (!count)
+            return TargetExistence::Unavailable;
+        return *count > 0 ? TargetExistence::Found : TargetExistence::ConfirmedMissing;
+    }
+
+    inline GroupJoinPlan PlanGroupJoinAttempt(TargetExistence existence, bool targetOnline, bool membershipVerified,
         uint32_t attemptsSoFar, uint32_t maxAttempts, uint32_t baseDelaySeconds)
     {
         GroupJoinPlan plan;
+
+        // A database outage cannot be distinguished from a real deletion by the
+        // core lookups, so it must NEVER terminally clear the join intent: retry
+        // later WITHOUT consuming the attempt budget or clearing the marker.
+        if (existence == TargetExistence::Unavailable)
+        {
+            plan.decision = GroupJoinDecision::RetryLater;
+            plan.attemptNumber = attemptsSoFar;        // budget NOT consumed
+            plan.retryDelaySeconds = baseDelaySeconds;  // short fixed backoff
+            return plan;
+        }
+
         plan.attemptNumber = attemptsSoFar + 1;
 
-        if (!targetExists)
+        if (existence == TargetExistence::ConfirmedMissing)
         {
             plan.decision = GroupJoinDecision::ClearTerminal;
             return plan;

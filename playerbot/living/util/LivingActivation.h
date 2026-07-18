@@ -95,4 +95,14 @@ namespace living
         return restoresConfirmed ? ActivationOutcome::FailedCompensated
                                  : ActivationOutcome::FailedCompensationUncertain;
     }
+
+    // A `.bot always` toggle may mutate freeAltBots and start/stop the bot's
+    // login ONLY after its durable `always` write is CONFIRMED. An unconfirmed
+    // write - rejected (DefinitelyNotApplied) or ambiguous (StateUnknown), both
+    // collapsed into `false` by SetValue - must leave runtime state unchanged
+    // and report failure, so a restart cannot diverge from the running state.
+    inline bool AlwaysToggleMayApply(bool alwaysWriteConfirmed)
+    {
+        return alwaysWriteConfirmed;
+    }
 }

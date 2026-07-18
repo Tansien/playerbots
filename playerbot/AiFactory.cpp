@@ -175,7 +175,33 @@ BotRoles AiFactory::GetPlayerRoles(const Player* player)
             break;
     }
 
-    return static_cast<BotRoles>(living::ConcreteRuntimeRole(cls, tab, tankFormActive));
+    // Living Realm resolves ONE concrete runtime role; with the feature disabled
+    // the legacy classification mask is restored, so autonomous role/LFG behavior
+    // is unchanged from the pre-Living fork (the disabled-mode parity contract).
+    // The only class/tab this gate affects is a WotLK Frost DK outside Frost
+    // Presence: legacy TANK|DPS vs the resolver's DPS.
+    return static_cast<BotRoles>(
+        living::RuntimeRoleForMode(cls, tab, tankFormActive, sPlayerbotAIConfig.livingRealmEnabled));
+}
+
+BotRoles AiFactory::GetAppliedSpecRole(Player* player)
+{
+    // Concrete role of the APPLIED talent build for creation-time role
+    // verification. A freshly created bot has no combat auras yet, so the
+    // runtime form/aura signal GetPlayerRoles relies on is unavailable; instead
+    // this reuses the SAME learned-talent distinction as strategy selection
+    // (the feral tank talents at AiFactory.cpp:311 et al). Only Druid Feral
+    // (tab 1) has a same-tab tank/dps split; every other hybrid resolves through
+    // its tab (Blood DK tank is tab 0, Frost/Unholy DK are DPS), so a DPS feral
+    // build can no longer satisfy or consume a tank quota.
+    uint8 const cls = player->getClass();
+    uint8 const tab = static_cast<uint8>(GetPlayerSpecTab(player));
+
+    bool tankBuild = false;
+    if (cls == CLASS_DRUID && tab == 1)
+        tankBuild = player->HasSpell(16961) || player->HasSpell(16958); // learned feral tank talents
+
+    return static_cast<BotRoles>(living::ConcreteRuntimeRole(cls, tab, tankBuild));
 }
 
 void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const facade, Engine* combatEngine)

@@ -1,5 +1,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/living/config/LivingRealmConfig.h"
+#include "playerbot/living/util/LivingActivation.h"
+#include "playerbot/living/util/LivingCreationCleanup.h"
 #include "playerbot/living/util/LivingCreationLifecycle.h"
 #include "playerbot/living/util/LivingKeyValueArgs.h"
 #include "playerbot/living/util/LivingNumericParse.h"
@@ -1302,7 +1304,14 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
 
     if (always == BotAlwaysOnline::DISABLED || always == BotAlwaysOnline::DISABLED_BY_COMMAND)
     {
-        sRandomPlayerbotMgr.SetValue(guid.GetCounter(), "always", (uint32)BotAlwaysOnline::ACTIVE);
+        // Persist FIRST and gate every runtime side effect on a CONFIRMED write:
+        // a rejected/ambiguous `always` write must leave freeAltBots and the
+        // login untouched, or the running state diverges from what a restart
+        // would rebuild from the durable row.
+        if (!living::AlwaysToggleMayApply(
+                sRandomPlayerbotMgr.SetValue(guid.GetCounter(), "always", (uint32)BotAlwaysOnline::ACTIVE)))
+            return "Could not persist always-online for " + alwaysName + "; state unchanged, try again.";
+
         sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(accountId, guid.GetCounter()));
 
         Player* existingBot = sRandomPlayerbotMgr.GetPlayerBot(guid);
@@ -1324,7 +1333,11 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
     }
     else
     {
-        sRandomPlayerbotMgr.SetValue(guid.GetCounter(), "always", (uint32)BotAlwaysOnline::DISABLED_BY_COMMAND);
+        // Same durable-write gate for disable: an unconfirmed write must not log
+        // the bot out or drop it from freeAltBots.
+        if (!living::AlwaysToggleMayApply(
+                sRandomPlayerbotMgr.SetValue(guid.GetCounter(), "always", (uint32)BotAlwaysOnline::DISABLED_BY_COMMAND)))
+            return "Could not persist always-online change for " + alwaysName + "; state unchanged, try again.";
 
         Player* onlineBot = sObjectMgr.GetPlayer(guid, false);
         if (onlineBot && onlineBot->GetPlayerbotAI())
@@ -2302,6 +2315,11 @@ namespace ai
 
     static BotCreationFinalizer botCreationFinalizer;
     static living::CreationBatchRegistry botCreationBatches;
+    // Owns creation tokens abandoned by a test-context reset until they reach a
+    // terminal state, deleting each finalized temporary character exactly once
+    // (see LivingCreationCleanup.h). Pumped from PumpBotCreation, it survives
+    // TestContext::Reset - which the old poll-once-and-clear did not.
+    static living::AbandonedCreationCleanup botCreationCleanup;
 
     bool BotCreationFinalizer::ExpectedIdentity(uint32 guid, uint32& accountId, std::string& name) const
     {
@@ -2324,6 +2342,20 @@ living::CreationPollResult PlayerbotHolder::PollBotCreation(uint64 creationToken
 living::BatchPollResult PlayerbotHolder::PollBotCreationBatch(uint64 batchToken, bool acknowledgeComplete)
 {
     return ai::botCreationBatches.Poll(batchToken, acknowledgeComplete);
+}
+
+void PlayerbotHolder::AbandonCreationToken(uint64 creationToken)
+{
+    // Transfer a still-pending single-creation token to the deferred owner so a
+    // later finalization still has a cleanup owner (no leaked temporary bot).
+    ai::botCreationCleanup.AdoptSingle(creationToken);
+}
+
+void PlayerbotHolder::AbandonBatchToken(uint64 batchToken)
+{
+    // Transfer a still-pending group-batch token to the deferred owner; it will
+    // delete the finalized members only once the batch is Complete.
+    ai::botCreationCleanup.AdoptBatch(batchToken);
 }
 
 uint32 PlayerbotHolder::MaxCharsPerAccount()
@@ -2546,7 +2578,7 @@ namespace ai
             // failures are recorded.
             BotCreationResult result = holder->CreateBot(master, options);
             botCreationBatches.OnAttemptResult(attempt.batchToken, attempt.memberIndex,
-                result.status, result.creationToken, result.createdClass, pumpCount);
+                result.status, result.creationToken, result.createdClass, pumpCount, result.createdRole);
         }
 
         // Surface completed batches exactly once - the requested group is
@@ -2570,6 +2602,18 @@ namespace ai
         }
 
         botCreationBatches.PruneExpired(pumpCount);
+
+        // Drive deferred cleanup of tokens abandoned by a test-context reset:
+        // each is polled to terminal and every finalized temporary character is
+        // deleted exactly once (a still-live batch's members are never touched).
+        living::CreationCleanupOps cleanupOps;
+        cleanupOps.pollSingle = [](uint64 token, bool ack) { return PlayerbotHolder::PollBotCreation(token, ack); };
+        cleanupOps.pollBatch = [](uint64 token, bool ack) { return PlayerbotHolder::PollBotCreationBatch(token, ack); };
+        cleanupOps.deleteCharacter = [](uint32 guid)
+        {
+            sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
+        };
+        botCreationCleanup.Pump(cleanupOps);
     }
 }
 
@@ -2909,13 +2953,14 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         newBot->SaveToDB();
 
         // Report the PLANNED composition (class from the character, role from
-        // the selected spec's capability mask - never from aura-dependent
-        // runtime roles). For group planning this is a reservation, not a
-        // persistence claim: the status below stays PendingPersistence.
+        // the CONCRETE applied talent build - never the capability mask, which
+        // would let a DPS Feral pass as a tank, and never aura-dependent runtime
+        // roles). For group planning this is a reservation, not a persistence
+        // claim: the status below stays PendingPersistence.
         result.createdClass = newBot->getClass();
         result.createdRole = talents.evaluated
             ? static_cast<uint8>(talents.selectedRoles)
-            : static_cast<uint8>(AiFactory::GetSpecRoleCapabilities(newBot->getClass(), AiFactory::GetPlayerSpecTab(newBot)));
+            : static_cast<uint8>(AiFactory::GetAppliedSpecRole(newBot));
 
         botSession->LogoutPlayer();
         sObjectAccessor.RemoveObject(newBot);
@@ -3209,7 +3254,7 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             living::CreationBatchMember member;
             member.creationToken = result.creationToken;
             member.cls = result.createdClass;
-            member.role = static_cast<uint8>(role);
+            member.role = result.createdRole; // the VERIFIED role (== requested, enforced by requireRoleMatch)
             batchMembers.push_back(member);
         }
 
@@ -3220,7 +3265,8 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             // Quotas shrink only when a slot was filled (persisted or
             // pending-verified). Class is the planned class; the role slot is
             // the selected role, which requireRoleMatch verified against the
-            // applied spec's capability mask before SaveToDB was queued.
+            // applied build's CONCRETE role (not the capability mask) before
+            // SaveToDB was queued - so the drawn role equals the stored role.
             uint8 const actualClass = result.createdClass;
 
             living::TryConsumeQuota(allowedClassNr[0][role]);

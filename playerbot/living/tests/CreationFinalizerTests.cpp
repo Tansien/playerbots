@@ -709,6 +709,92 @@ LIVING_TEST(creation_batch_extension_shares_one_ledger_and_cannot_pass_after_mem
     LIVING_CHECK(result.undersized);
 }
 
+LIVING_TEST(creation_batch_planned_slot_persists_drawn_role)
+{
+    // Finding 7a: a planned/transient slot is created role-0 and the pump draws
+    // its role at attempt time. If OnAttemptResult drops that role, quota
+    // accounting (which skips role-0 outstanding members) charges the wrong
+    // role and a retryable rollback redraws it. The role must persist.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batch;
+    batch.initiatorGuid = 91;
+    batch.desiredSize = 3;
+    batch.preexistingMembers = 1;
+    batch.replacementBudget = 2;
+    uint64_t const token = registry.Begin(std::move(batch));
+    LIVING_CHECK(registry.AddPlannedSlots(token, 1, 0));
+
+    auto nobodyJoined = [](uint32_t) { return false; };
+    auto countTanks = [&]() {
+        uint32_t tanks = 0;
+        registry.ForEachOutstandingMember(91, nobodyJoined,
+            [&tanks](CreationBatchMember const& m) { if (m.role == 1) ++tanks; });
+        return tanks;
+    };
+
+    // Before the attempt the planned slot's role is unknown (0): outstanding,
+    // but not yet counted as a tank.
+    LIVING_CHECK(countTanks() == 0);
+
+    auto due = registry.TakeDueAttempts(CreationBatchRegistry::kTransientBackoffPumps);
+    LIVING_CHECK(due.size() == 1);
+    LIVING_CHECK(due[0].role == 0); // planned slot: role is drawn by the pump
+
+    // The pump draws a tank role (1) and reports the queued attempt.
+    registry.OnAttemptResult(due[0].batchToken, due[0].memberIndex,
+        BotCreateStatus::PendingPersistence, /*creationToken*/55, /*cls*/1, /*pump*/1, /*role*/1);
+    LIVING_CHECK(countTanks() == 1); // pre-fix: 0 (role dropped) -> quota over-allocation
+
+    // A retryable rollback returns the slot to AwaitingAttempt with its class
+    // AND role preserved for the paced replacement (pre-fix: redrawn as 0).
+    registry.OnCreationTerminal(MakeCompletion(55, CreationPollStatus::FailedRetryable, 0), 2);
+    auto retry = registry.TakeDueAttempts(3);
+    LIVING_CHECK(retry.size() == 1);
+    LIVING_CHECK(retry[0].role == 1);
+    LIVING_CHECK(retry[0].cls == 1);
+}
+
+LIVING_TEST(creation_batch_completed_batch_is_not_extended)
+{
+    // Finding 7b: a completed batch is retained for pollers but must NOT be
+    // extended - reviving it keeps a stale completionReported flag (so a later
+    // completion never surfaces) and an expired retention timer. A repeat
+    // request must start a FRESH batch.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batchA;
+    batchA.initiatorGuid = 92;
+    batchA.desiredSize = 2;
+    batchA.preexistingMembers = 1;
+    batchA.members.push_back(PendingMember(41, 1, 1));
+    uint64_t const tokenA = registry.Begin(std::move(batchA));
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(92) == tokenA); // active -> extendable
+
+    registry.OnCreationTerminal(MakeCompletion(41, CreationPollStatus::Created, 4001), 1);
+    LIVING_CHECK(registry.Poll(tokenA, false).status == BatchPollStatus::Complete);
+    LIVING_CHECK(registry.TakeNewlyCompleted().size() == 1); // completionReported now set
+
+    // Retained but no longer extendable: a repeat request cannot revive A.
+    LIVING_CHECK(registry.Find(tokenA) != nullptr);
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(92) == 0); // pre-fix: returned tokenA
+
+    CreationBatchRegistry::Batch batchB;
+    batchB.initiatorGuid = 92;
+    batchB.desiredSize = 2;
+    batchB.preexistingMembers = 1;
+    batchB.members.push_back(PendingMember(42, 2, 2));
+    uint64_t const tokenB = registry.Begin(std::move(batchB));
+    LIVING_CHECK(tokenB != tokenA);
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(92) == tokenB);
+
+    // B's completion surfaces on its own (pre-fix, extending A left A's
+    // completionReported=true and swallowed the second completion).
+    registry.OnCreationTerminal(MakeCompletion(42, CreationPollStatus::Created, 4002), 2);
+    LIVING_CHECK(registry.Poll(tokenB, false).status == BatchPollStatus::Complete);
+    LIVING_CHECK(registry.TakeNewlyCompleted().size() == 1);
+}
+
 LIVING_TEST(creation_batch_outstanding_slots_hold_the_group_deficit)
 {
     // Back-to-back accounting: outstanding slots count BEFORE creation
