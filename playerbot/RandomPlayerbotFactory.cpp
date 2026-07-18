@@ -899,6 +899,11 @@ void RandomPlayerbotFactory::CreateRandomBots()
     // Shallow copy of the fixed config so we can modify it
     std::map<std::pair<uint8, uint8>, uint32> remaining = sPlayerbotAIConfig.fixedClassRaceCounts;
 
+    // Shared character-slot reservations taken by THIS bulk run, per account:
+    // released only by the execution-ordered per-account readback registered
+    // after the save barrier (never merely because SaveToDB returned).
+    std::map<uint32, uint32> bulkReservedSlots;
+
     for (uint32 accountNumber = 0; accountNumber < sPlayerbotAIConfig.randomBotAccountCount; ++accountNumber)
     {
         std::ostringstream out; out << sPlayerbotAIConfig.randomBotAccountPrefix << accountNumber;
@@ -913,12 +918,21 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
         sPlayerbotAIConfig.randomBotAccounts.push_back(accountId);
 
-        int count = sAccountMgr.GetCharactersCount(accountId);
-#ifdef MANGOSBOT_TWO
-        if (count >= 10)
-#else
-        if (count >= 9)
-#endif
+        // Typed durable count: a FAILED count query is transient database
+        // unavailability, not an empty account - creating "up to cap"
+        // characters against a false zero would overfill it. The first
+        // failure aborts the WHOLE bulk run (each probe is a synchronous
+        // query; scanning further amplifies the outage) - the next
+        // startup/reload retries.
+        uint32 durableCount = 0;
+        if (!PlayerbotHolder::TryGetDurableCharacterCount(accountId, durableCount))
+        {
+            sLog.outError("CreateRandomBots: character count for account %u unavailable; aborting bulk creation until the next reload", accountId);
+            break;
+        }
+
+        uint32 count = durableCount;
+        if (count >= PlayerbotHolder::MaxCharsPerAccount())
         {
             totalRandomBotChars += count;
             continue;
@@ -964,14 +978,24 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	                continue;
 #endif
 
-	            if (factory.CreateRandomBot(cls, race))
-	            {
-	                created++;
-	                botsCreated++;
-	                bar1.step();
-	                if (--remaining[key] == 0)
-	                    remaining.erase(key);
-	            }
+                    // One shared reservation per queued character (the ledger
+                    // also counts pending manual/group creations, so an
+                    // overlapping runtime reload cannot overfill the account).
+                    if (PlayerbotHolder::TryReserveCharacterSlot(accountId, durableCount)
+                        != living::SlotReservationOutcome::Reserved)
+                        break;
+
+                    if (factory.CreateRandomBot(cls, race))
+                    {
+                        bulkReservedSlots[accountId]++;
+                        created++;
+                        botsCreated++;
+                        bar1.step();
+                        if (--remaining[key] == 0)
+                            remaining.erase(key);
+                    }
+                    else
+                        PlayerbotHolder::ReleaseCharacterSlot(accountId); // nothing was queued
 	        }
 	    }
 	}
@@ -989,9 +1013,19 @@ void RandomPlayerbotFactory::CreateRandomBots()
                 if (cls != 10 && cls != 6)
 #endif
                 {
+                    // Same shared reservation rule as the fixed-count branch.
+                    if (PlayerbotHolder::TryReserveCharacterSlot(accountId, durableCount)
+                        != living::SlotReservationOutcome::Reserved)
+                        break;
+
                     uint8 rclss = factory.GetRandomClass();
-                    botsCreated++;
-                    factory.CreateRandomBot(rclss);
+                    if (factory.CreateRandomBot(rclss))
+                    {
+                        bulkReservedSlots[accountId]++;
+                        botsCreated++;
+                    }
+                    else
+                        PlayerbotHolder::ReleaseCharacterSlot(accountId); // nothing was queued
                     bar1.step();
                 }
             }
@@ -1044,6 +1078,14 @@ void RandomPlayerbotFactory::CreateRandomBots()
         bar2.step();
         account_creations[i].wait();
     }
+
+    // Every queued character above occupies one shared reservation. Register
+    // the execution-ordered per-account readback (issued after the saves were
+    // queued on the same FIFO thread): the creation-finalizer pump releases
+    // the reservations when it returns, and KEEPS them on bounded failure -
+    // never merely because SaveToDB returned.
+    for (auto const& [reservedAccountId, reservedSlots] : bulkReservedSlots)
+        PlayerbotHolder::BeginBulkReservationVerify(reservedAccountId, reservedSlots);
 
     std::vector<Player*> players;
 

@@ -50,4 +50,6 @@ void TestContext::Reset()
             sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
         spawnGroupBatchToken = 0;
     }
+
+    spawnTransientRetries = 0;
 }

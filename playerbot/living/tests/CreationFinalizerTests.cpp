@@ -465,3 +465,118 @@ LIVING_TEST(creation_batch_preserves_allocation_mode_and_slot_class_for_replacem
     LIVING_CHECK(resolution->role == 2);
     LIVING_CHECK(registry.Find(resolution->batchToken)->useRandomAccounts);
 }
+
+LIVING_TEST(creation_finalizer_bulk_reservations_release_only_on_verified_readback)
+{
+    // Legacy bulk creation reserves one shared slot per queued character and
+    // registers ONE execution-ordered count readback per account. Any
+    // successful readback releases the account's bulk reservations (the
+    // barrier property: it executed after the saves on the same FIFO thread);
+    // failed readbacks retry bounded, and exhaustion KEEPS the reservations -
+    // capacity stays conservatively blocked, never released because
+    // "SaveToDB returned".
+    CreationFinalizer finalizer;
+    SpyOps spy;
+    std::vector<uint32_t> bulkVerifyRequests;
+    auto ops = spy.Make();
+    ops.requestBulkCountVerify = [&](uint32_t accountId) { bulkVerifyRequests.push_back(accountId); };
+    uint32_t gaveUpAccount = 0, gaveUpKept = 0;
+    ops.onBulkVerifyGaveUp = [&](uint32_t accountId, uint32_t kept) { gaveUpAccount = accountId; gaveUpKept = kept; };
+
+    // Three characters bulk-queued on account 70: three shared reservations.
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
+    LIVING_CHECK(finalizer.ReservedCount(70) == 3);
+
+    finalizer.BeginBulkVerify(70, 3, ops);
+    LIVING_CHECK(bulkVerifyRequests.size() == 1);
+
+    // The reservations survive until the readback returns - a mid-flight
+    // manual creation still sees the occupied capacity.
+    LIVING_CHECK(finalizer.ReservedCount(70) == 3);
+
+    // Successful readback (delivered via callback, processed by Pump).
+    finalizer.OnCallbackResult(70, RowVerifyOutcome::Verified, CreationCallbackKind::BulkCount);
+    finalizer.Pump(ops);
+    LIVING_CHECK(finalizer.ReservedCount(70) == 0);
+    LIVING_CHECK(finalizer.PendingBulkVerifyCount() == 0);
+
+    // Failed readbacks: bounded retries, then give-up KEEPS the reservations.
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(71, 0, 9));
+    finalizer.BeginBulkVerify(71, 1, ops);
+    for (uint32_t i = 0; i < CreationFinalizer::kMaxBulkVerifyAttempts; ++i)
+    {
+        finalizer.OnCallbackResult(71, RowVerifyOutcome::QueryFailed, CreationCallbackKind::BulkCount);
+        finalizer.Pump(ops);
+    }
+    LIVING_CHECK(gaveUpAccount == 71 && gaveUpKept == 1);
+    LIVING_CHECK(finalizer.ReservedCount(71) == 1); // conservatively blocked
+    LIVING_CHECK(finalizer.PendingBulkVerifyCount() == 0);
+}
+
+LIVING_TEST(creation_finalizer_bulk_and_manual_reservations_share_one_ledger)
+{
+    // The task-3 overlap scenario: legacy reload creation and a queued
+    // manual/group creation admit against the SAME ledger. With cap 9 and a
+    // durable count of 7, one bulk slot plus one manual pending reservation
+    // fill the account: the next attempt - from either path - is refused.
+    CreationFinalizer finalizer;
+
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(80, 7, 9));  // bulk slot
+    LIVING_CHECK(finalizer.TryReserveAccountSlot(80, 7, 9));  // manual pending
+    LIVING_CHECK(!finalizer.TryReserveAccountSlot(80, 7, 9)); // 7 + 2 >= 9: refused
+    LIVING_CHECK(finalizer.ReservedCount(80) == 2);
+}
+
+LIVING_TEST(creation_batch_outstanding_slots_hold_the_group_deficit)
+{
+    // The task-6 back-to-back scenario: a second group command must count the
+    // first batch's outstanding slots as effective membership - BEFORE
+    // creation finalizes (pending members) and AFTER finalization but before
+    // the member joined the group (finalized-not-joined). Verified membership
+    // releases the slot; batch expiry is the bounded terminal path.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batch;
+    batch.initiatorGuid = 42;
+    batch.desiredSize = 5;
+    batch.preexistingMembers = 1;
+    batch.pending = { CreationBatchMember{ 61, 1, 1 }, CreationBatchMember{ 62, 2, 2 } };
+    uint64_t const token = registry.Begin(std::move(batch));
+
+    auto nobodyJoined = [](uint32_t) { return false; };
+
+    // Before finalization: both pending members hold their slots.
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(42, nobodyJoined) == 2);
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(42) == token);
+    // Another initiator owns nothing here.
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(43, nobodyJoined) == 0);
+
+    // One member finalizes but has not joined: still 2 outstanding.
+    CreationCompletion created;
+    created.token = 61;
+    created.guid = 6001;
+    created.status = CreationPollStatus::Created;
+    registry.OnCreationTerminal(created);
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(42, nobodyJoined) == 2);
+
+    // The finalized member JOINS the group: its slot is released; the still-
+    // pending member keeps holding.
+    auto joined6001 = [](uint32_t guid) { return guid == 6001; };
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(42, joined6001) == 1);
+
+    // The second member finalizes and joins too: no outstanding slots left.
+    created.token = 62;
+    created.guid = 6002;
+    registry.OnCreationTerminal(created);
+    auto bothJoined = [](uint32_t guid) { return guid == 6001 || guid == 6002; };
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(42, bothJoined) == 0);
+
+    // Batch expiry is the bounded terminal path for joins that never happen:
+    // after the retention window the slots stop counting.
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(42, nobodyJoined) == 2);
+    registry.PruneExpired(1);
+    registry.PruneExpired(1 + CreationBatchRegistry::kRetentionPumps);
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(42, nobodyJoined) == 0);
+}

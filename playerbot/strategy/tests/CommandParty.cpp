@@ -50,6 +50,16 @@ TestResult CommandPartySpawnBot::Execute(const std::string& params, Player* bot,
                 }
                 message = "Creation reported Created without a GUID";
                 return TestResult::IMPOSSIBLE;
+            case living::BotCreateStatus::TransientFailure:
+                // Database transiently unavailable: defer with bounded
+                // tick-based backoff (the DSL re-executes PENDING commands).
+                if (++ctx.spawnTransientRetries >= 30)
+                {
+                    message = "Database unavailable for bot creation (deferred attempts exhausted)";
+                    return TestResult::IMPOSSIBLE;
+                }
+                message = "Database unavailable; deferring bot creation";
+                return TestResult::PENDING;
             default:
                 message = "Failed to spawn bot with params '" + params + "': "
                     + (result.messages.empty() ? "unknown" : result.messages.front());

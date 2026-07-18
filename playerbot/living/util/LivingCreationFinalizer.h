@@ -77,7 +77,26 @@ namespace living
         std::string message;
     };
 
-    enum class CreationCallbackKind { Verify, CleanupVerify };
+    enum class CreationCallbackKind
+    {
+        Verify,
+        CleanupVerify,
+        // Bulk-reservation count verification: the event's guid field carries
+        // the ACCOUNT id, and the outcome is only Verified (count readback
+        // succeeded) or QueryFailed.
+        BulkCount,
+    };
+
+    // Outcome of the ONE shared character-slot reservation API. Capacity that
+    // cannot be verified is transient unavailability - never "empty" (which
+    // fails admission open) and never "full"/terminal (which misreports an
+    // outage as exhaustion).
+    enum class SlotReservationOutcome
+    {
+        Reserved,
+        AtCapacity,
+        DatabaseUnavailable,
+    };
 
     // Database/world boundary. Every callable is executed from Pump()/Begin()
     // on the world thread, never from a SQL result callback.
@@ -95,6 +114,14 @@ namespace living
         std::function<void(uint32_t /*guid*/, uint32_t /*accountId*/)> deleteCharacter;
         // The one place a confirmed GUID is exposed (freeAltBots etc.).
         std::function<void(uint32_t /*guid*/, uint32_t /*accountId*/, std::string const& /*name*/, bool /*autoAdd*/)> onCreated;
+        // Schedules the execution-ordered bulk-reservation count readback for
+        // one account (issued AFTER the bulk saves were queued on the same
+        // FIFO thread, so its execution is a durability barrier for them).
+        std::function<void(uint32_t /*accountId*/)> requestBulkCountVerify;
+        // Observes a bulk verification giving up after bounded attempts: the
+        // account's bulk reservations are KEPT (conservative direction) and
+        // the caller logs the stuck capacity.
+        std::function<void(uint32_t /*accountId*/, uint32_t /*keptReservations*/)> onBulkVerifyGaveUp;
     };
 
     class CreationFinalizer
@@ -181,6 +208,34 @@ namespace living
 
         // -------------------------------------------------------------------
 
+        // --- Bulk-reservation verification (legacy mass factory) -----------
+        // The bulk factory reserves one shared slot per queued character but
+        // cannot register hundreds of records in this bounded registry.
+        // Instead it registers ONE execution-ordered count readback per
+        // touched account, issued AFTER all its saves were queued on the same
+        // FIFO thread: when that readback returns (any successful readback -
+        // the barrier property is what matters, not the value), the account's
+        // bulk reservations are released; failed readbacks retry bounded, and
+        // exhaustion KEEPS the reservations - capacity stays blocked in the
+        // conservative direction, never released on "SaveToDB returned".
+
+        static constexpr uint32_t kMaxBulkVerifyAttempts = 5;
+
+        void BeginBulkVerify(uint32_t accountId, uint32_t reservedSlots, CreationFinalizerOps const& ops)
+        {
+            if (reservedSlots == 0)
+                return;
+
+            bool const alreadyPending = bulkVerifies.find(accountId) != bulkVerifies.end();
+            bulkVerifies[accountId].reservedSlots += reservedSlots;
+            if (!alreadyPending && ops.requestBulkCountVerify)
+                ops.requestBulkCountVerify(accountId);
+        }
+
+        uint32_t PendingBulkVerifyCount() const { return static_cast<uint32_t>(bulkVerifies.size()); }
+
+        // -------------------------------------------------------------------
+
         // Registers the record (adopting the caller's account reservation when
         // record.holdsAccountReservation is set) and schedules the first
         // verification. Returns the creation token.
@@ -223,6 +278,12 @@ namespace living
             {
                 CreationCallbackEvent const event = queue.front();
                 queue.pop_front();
+
+                if (event.kind == CreationCallbackKind::BulkCount)
+                {
+                    ProcessBulkCount(event.guid /*accountId*/, event.outcome, ops);
+                    continue;
+                }
 
                 auto it = records.find(event.guid);
                 if (it == records.end())
@@ -375,6 +436,40 @@ namespace living
                 ops.requestCleanupVerify(record.guid);
         }
 
+        void ProcessBulkCount(uint32_t accountId, RowVerifyOutcome outcome, CreationFinalizerOps const& ops)
+        {
+            auto it = bulkVerifies.find(accountId);
+            if (it == bulkVerifies.end())
+                return;
+
+            if (outcome != RowVerifyOutcome::QueryFailed)
+            {
+                // The execution-ordered readback returned: every bulk save for
+                // this account has executed (success or rollback), so the
+                // durable count now reflects reality and the reservations are
+                // released - a rolled-back save occupies nothing, a landed one
+                // is in the durable count.
+                for (uint32_t i = 0; i < it->second.reservedSlots; ++i)
+                    ReleaseAccountSlot(accountId);
+                bulkVerifies.erase(it);
+                return;
+            }
+
+            if (++it->second.attempts >= kMaxBulkVerifyAttempts)
+            {
+                // Bounded give-up KEEPS the reservations: unknown durable
+                // occupancy stays charged (the conservative direction) and the
+                // caller logs the stuck capacity.
+                if (ops.onBulkVerifyGaveUp)
+                    ops.onBulkVerifyGaveUp(accountId, it->second.reservedSlots);
+                bulkVerifies.erase(it);
+                return;
+            }
+
+            if (ops.requestBulkCountVerify)
+                ops.requestBulkCountVerify(accountId);
+        }
+
         void ProcessCleanupVerify(Record& record, RowVerifyOutcome outcome, CreationFinalizerOps const& ops,
             std::function<void(CreationCompletion const&)> const& onTerminal)
         {
@@ -446,8 +541,15 @@ namespace living
             }
         }
 
+        struct BulkVerify
+        {
+            uint32_t reservedSlots = 0;
+            uint32_t attempts = 0;
+        };
+
         std::map<uint32_t, Record> records;        // by character GUID
         std::map<uint64_t, uint32_t> tokenToGuid;  // erased with the record
+        std::map<uint32_t, BulkVerify> bulkVerifies; // by account id
         std::deque<CreationCallbackEvent> queue;
         std::map<uint64_t, StoredCompletion> completions;
         std::map<uint32_t, uint32_t> reservedSlots; // account -> reserved character slots

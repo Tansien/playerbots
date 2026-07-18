@@ -19,6 +19,18 @@ class Item;
 typedef std::map<uint32, Player*> PlayerBotMap;
 typedef std::map<std::string, std::set<std::string> > PlayerBotErrorMap;
 
+// Typed outcome of bot-account selection. A failed character-count query is
+// transient DATABASE unavailability: the scan must abort on the first failure
+// (never walk thousands of further synchronous queries into the outage) and
+// the caller reports a transient - not terminal - creation failure.
+enum class AccountSelectOutcome
+{
+    Found,
+    CapacityExhausted,
+    DatabaseUnavailable,
+    AccountCreationFailed,
+};
+
 // Typed outcome of PlayerbotHolder::CreateBot. Callers must branch on `status`
 // (and use `guid` for the created character); `messages` is display text only
 // and must never be parsed to infer success. `createdClass`/`createdRole` are
@@ -136,6 +148,22 @@ public:
     // invisible to the durable count. Returns false when the durable count
     // could not be established (callers reject or defer, never assume empty).
     static bool TryGetEffectiveCharacterCount(uint32 accountId, uint32& count);
+    // THE shared character-slot reservation API: obtains the typed durable
+    // count, combines it with the finalizer reservation ledger exactly once,
+    // and reserves atomically on the world thread. Every queued character -
+    // manual, group, test, or legacy bulk - occupies exactly one reservation
+    // in this single ledger. The second overload reuses a count the caller
+    // already fetched (bulk loops), avoiding per-character query
+    // amplification.
+    static living::SlotReservationOutcome TryReserveCharacterSlot(uint32 accountId);
+    static living::SlotReservationOutcome TryReserveCharacterSlot(uint32 accountId, uint32 durableCount);
+    // Releases one reservation that never queued a save (pre-save failure).
+    static void ReleaseCharacterSlot(uint32 accountId);
+    // Registers the execution-ordered bulk-reservation readback for one
+    // account (issued after the bulk saves were queued on the same FIFO
+    // thread); the pump releases the account's bulk reservations when it
+    // returns, keeps them on bounded failure.
+    static void BeginBulkReservationVerify(uint32 accountId, uint32 reservedSlots);
     static uint32 MaxCharsPerAccount();
 
     std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security);
@@ -146,8 +174,8 @@ public:
 protected:
     virtual void OnBotLoginInternal(Player * const bot) = 0;
     virtual void OnBotDeleted(uint32 botGuid, uint32 accountId);
-    virtual uint32 GetOrCreateAccount(Player* master, std::string& error);
-    void Cleanup();   
+    virtual AccountSelectOutcome GetOrCreateAccount(Player* master, uint32& accountId, std::string& error);
+    void Cleanup();
 private:
     typedef std::list<std::string> (PlayerbotHolder::*HolderCommandHandler)(Player* master, const std::string param, AccountTypes security);
     typedef std::string (PlayerbotHolder::*BotCommandHandler)(Player* bot, Player* master, const std::string param);
@@ -185,6 +213,9 @@ private:
         // async failure retries within the bounded budget).
         uint64 creationToken = 0;
         uint8 creationRetries = 0;
+        // Transient database-unavailability deferrals (bounded tick-based
+        // backoff, separate from the creation retry budget).
+        uint8 transientRetries = 0;
     };
 
     void UpdatePendingTests(uint32 elapsed);
