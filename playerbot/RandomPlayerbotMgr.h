@@ -164,10 +164,17 @@ public:
         // rejected before persistence, so a discarded transient character
         // leaves no cache entry behind (load state included - the next read
         // reloads from durable truth).
-        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); oneShotMarkers.erase(bot); }
+        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); oneShotMarkers.erase(bot); durableOneShotMarkers.erase(bot); }
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
+        // Typed read: returns whether the value is KNOWN (cached entry, or a
+        // completed bulk load confirming absence). While the bulk-load state
+        // is Unloaded/Unknown an absent event reads as value 0 but NOT known -
+        // destructive callers (`.bot always`, the always-online loader, the
+        // post-create marker consume) must skip their mutation instead of
+        // consuming a load failure as confirmed state.
+        bool TryGetEventValue(uint32 bot, std::string const& event, uint32& value);
         int32 GetValueValidTime(uint32 bot, std::string event);
         std::string GetData(uint32 bot, std::string type);
         // Returns false when the value could not be persisted (schema limits or
@@ -230,12 +237,6 @@ public:
         float activityMod = 0.25;
         std::map<std::string, uint32> databaseDelay;
         uint32 GetEventValue(uint32 bot, std::string event);
-        // Typed read: returns whether the value is KNOWN (cached entry, or a
-        // completed bulk load confirming absence). While the bulk-load state
-        // is Unloaded/Unknown an absent event reads as value 0 but NOT known -
-        // destructive callers (timed-logout deactivation) must skip their
-        // mutation instead of consuming a load failure as an expired event.
-        bool TryGetEventValue(uint32 bot, std::string const& event, uint32& value);
         // All-or-nothing multi-event read: false when ANY value is unknown,
         // so a multi-key mutation decision can never partially proceed on a
         // mix of known and unknown state.
@@ -353,6 +354,33 @@ public:
         // every manager pass. In-memory only; a confirmed clear removes the
         // durable marker, and ForgetEventCache drops the ledger on guid reuse.
         std::map<uint32, std::map<std::string, living::OneShotMarker> > oneShotMarkers;
+        // Per-(bot, marker) ledger for the DESTRUCTIVE post-create markers
+        // (create gear / create levelup): a durable phase (marker value 1->2,
+        // confirmed before the effect) plus an execution-ordered save barrier
+        // make the consume crash-safe - the durable intent is cleared only
+        // after the character save provably executed, and a fresh process
+        // never replays a phase-2 (ambiguous) effect. ForgetEventCache drops
+        // the ledger on guid reuse.
+        std::map<uint32, std::map<std::string, living::DurableOneShotMarker> > durableOneShotMarkers;
+        // Save-barrier bookkeeping: token -> (bot, marker) for the async
+        // barrier query queued BEHIND the effect's SaveToDB on the same FIFO
+        // thread; results are only enqueued by the SQL callback and drained
+        // from LoginFreeBots on the world thread.
+        struct PostCreateSaveBarrier
+        {
+            uint32 botGuid = 0;
+            std::string marker;
+        };
+        std::map<uint64, PostCreateSaveBarrier> saveBarrierTokens;
+        uint64 nextSaveBarrierToken = 1;
+        std::vector<std::pair<uint64, bool>> saveBarrierResults;
+        // Enqueues the execution-ordered save barrier query for (bot, marker);
+        // returns whether it was actually enqueued.
+        bool RequestPostCreateSaveBarrier(uint32 botGuid, std::string const& marker);
+        // SQL result callback: parse + enqueue only (deadlock contract).
+        void HandlePostCreateSaveBarrier(QueryResult* result, uint64 barrierToken);
+        // Applies drained barrier results to the durable marker ledgers.
+        void DrainPostCreateSaveBarriers();
         // True after an activation pair (add/logout) whose durable state could
         // not be established: GetBots must reconcile from durable truth before
         // trusting the in-memory vector again.

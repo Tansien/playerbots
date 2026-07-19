@@ -1,6 +1,7 @@
 
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/living/config/EffectiveConfigReport.h"
+#include "playerbot/living/util/LivingActivation.h"
 #include "playerbot/playerbot.h"
 #include "RandomPlayerbotFactory.h"
 #include "Accounts/AccountMgr.h"
@@ -447,7 +448,11 @@ bool PlayerbotAIConfig::Initialize()
 		    std::string key = "AiPlayerbot.ClassRaceProb." + std::to_string(cls) + "." + std::to_string(race);
 		    int count = config.GetIntDefault(key, -1);
 
-		    if (count >= 0 && factory.isAvailableRace(cls, race))
+            // A configured zero means DISABLED and never enters the quota
+            // map: the bulk fill decrements per created bot, so a zero
+            // entry used to wrap to UINT_MAX and mass-create the disabled
+            // combination.
+            if (count > 0 && factory.isAvailableRace(cls, race))
 		    {
 		        fixedClassRaceCounts[{cls, race}] = count;
 		    }
@@ -1032,11 +1037,6 @@ void PlayerbotAIConfig::loadFreeAltBotAccounts()
                 std::string charName = fields[0].GetString();
                 uint32 guid = fields[1].GetUInt32();
 
-                BotAlwaysOnline always = BotAlwaysOnline(sRandomPlayerbotMgr.GetValue(guid, "always"));
-
-                if (always == BotAlwaysOnline::DISABLED_BY_COMMAND)
-                    continue;
-
                 if (std::find(toggleAlwaysOnlineChars.begin(), toggleAlwaysOnlineChars.end(), charName) != toggleAlwaysOnlineChars.end())
                     charToggle = true;
 
@@ -1045,7 +1045,17 @@ void PlayerbotAIConfig::loadFreeAltBotAccounts()
                 if (accountToggle || charToggle)
                     thisCharAlwaysOnline = !thisCharAlwaysOnline;
 
-                if ((thisCharAlwaysOnline && always != BotAlwaysOnline::DISABLED_BY_COMMAND) || always == BotAlwaysOnline::ACTIVE)
+                // TYPED read: a failed event load used to collapse to DISABLED,
+                // which both scheduled always-online bots for removal and - worse -
+                // re-included DISABLED_BY_COMMAND characters during a reload while
+                // the database blipped. Unknown or invalid state schedules nothing.
+                uint32 alwaysRaw = 0;
+                bool const alwaysKnown = sRandomPlayerbotMgr.TryGetEventValue(guid, "always", alwaysRaw);
+                if (!alwaysKnown)
+                    sLog.outError("loadFreeAltBotAccounts: always-online state for %s (guid %u) could not be read; not scheduled this reload",
+                        charName.c_str(), guid);
+
+                if (living::ShouldScheduleAlwaysOnline(alwaysKnown, alwaysRaw, thisCharAlwaysOnline))
                 {
                     sLog.outString("Enabling always online for %s", charName.c_str());
                     freeAltBots.push_back(std::make_pair(accountId, guid));

@@ -696,7 +696,20 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     //Delete temporary bots.
 
-    auto temporarybots = CharacterDatabase.Query("SELECT characters.guid, characters.account FROM ai_playerbot_random_bots JOIN characters ON (characters.guid = ai_playerbot_random_bots.bot AND characters.name = ai_playerbot_random_bots.data) WHERE ai_playerbot_random_bots.event = 'temporary'");
+    // Markers whose character is verifiably gone (or whose guid was reused by
+    // a DIFFERENT character - the marker data holds the temporary bot's name)
+    // are purged by statements whose predicates enforce that state at
+    // execution time. Markers of a still-present temporary character are NOT
+    // touched here: the old flow deleted the event rows and only then QUEUED
+    // DeleteFromDB, so a failed or lost deletion left a permanent character
+    // with no marker and nothing ever retried it.
+    CharacterDatabase.PExecute(
+        "DELETE FROM ai_playerbot_random_bots WHERE event = 'temporary' AND bot NOT IN (SELECT guid FROM characters)");
+    CharacterDatabase.PExecute(
+        "DELETE apr FROM ai_playerbot_random_bots apr JOIN characters c ON c.guid = apr.bot "
+        "WHERE apr.event = 'temporary' AND c.name <> apr.data");
+
+    auto temporarybots = CharacterDatabase.Query("SELECT characters.guid FROM ai_playerbot_random_bots JOIN characters ON (characters.guid = ai_playerbot_random_bots.bot AND characters.name = ai_playerbot_random_bots.data) WHERE ai_playerbot_random_bots.event = 'temporary'");
 
     if (temporarybots)
     {
@@ -706,23 +719,16 @@ void RandomPlayerbotFactory::CreateRandomBots()
         {
             Field* fields = temporarybots->Fetch();
             uint32 guid = fields[0].GetUInt32();
-            uint32 accountId = fields[1].GetUInt32();
 
-            CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE bot = %d", guid);
-            Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), accountId, true, true);
-
-            // Typed count: a FAILED count query must not read as an empty
-            // account - DeleteAccount would take its remaining characters
-            // with it.
-            uint32 remainingCharacters = 0;
-            if (PlayerbotHolder::TryGetDurableCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
-            {
-                sAccountMgr.DeleteAccount(accountId);
-            }
+            // DeleteBot queues the deletion and ADOPTS it into the durable
+            // confirmer: the 'temporary' marker (with the bot's other event
+            // rows) is removed - and the empty-account cleanup runs - only
+            // once an execution-ordered readback confirms the character row
+            // absent. A crash or failed deletion leaves the marker for the
+            // next startup to retry instead of orphaning the character.
+            sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
         } while (temporarybots->NextRow());
     }
-
-    CharacterDatabase.PExecute("DELETE FROM ai_playerbot_random_bots WHERE ai_playerbot_random_bots.event = 'temporary'");
 
     //Loop over randombot accounts that have no characters and delete them as well, to clean up after temporary bots.
     auto temporaryAccounts = LoginDatabase.PQuery("SELECT id FROM account WHERE username like '%s%%' and id >= %u", sPlayerbotAIConfig.randomBotAccountPrefix.c_str(), sPlayerbotAIConfig.randomBotAccountCount);
@@ -963,8 +969,6 @@ void RandomPlayerbotFactory::CreateRandomBots()
 #endif
             living::FillAccount(maxAllowed, [&](uint32 allowance) -> living::AccountFillRound
             {
-                living::AccountFillRound round;
-
                 std::vector<std::pair<uint8, uint8>> shuffledKeys;
                 for (const auto& entry : remaining)
                     shuffledKeys.push_back(entry.first);
@@ -974,23 +978,24 @@ void RandomPlayerbotFactory::CreateRandomBots()
                 std::mt19937 rng(rnd()); // Mersenne Twister RNG
                 std::shuffle(shuffledKeys.begin(), shuffledKeys.end(), rng);
 
-                for (const auto& key : shuffledKeys)
+                // The sweep itself (zero = disabled, checked quota consumption,
+                // reservation-block termination) is the shared helper the host
+                // tests exercise; this callable only performs the attempt.
+                return living::RunFixedCountRound(remaining, shuffledKeys, allowance,
+                    [&](std::pair<uint8, uint8> const& key) -> living::FixedCountAttempt
                 {
-                    if (round.created >= allowance)
-                        break;
-
                     uint8 cls = key.first;
                     uint8 race = key.second;
 
                     if (!((1 << (cls - 1)) & CLASSMASK_ALL_PLAYABLE) || !sChrClassesStore.LookupEntry(cls))
-                        continue;
+                        return living::FixedCountAttempt::Skipped;
 
 #ifdef MANGOSBOT_TWO
                     if (cls == 10)
-                        continue;
+                        return living::FixedCountAttempt::Skipped;
 #else
                     if (cls == 10 || cls == 6)
-                        continue;
+                        return living::FixedCountAttempt::Skipped;
 #endif
 
                     // One shared reservation per queued character (the ledger also
@@ -1001,25 +1006,19 @@ void RandomPlayerbotFactory::CreateRandomBots()
                     // respinning the outer loop on a refusal never makes progress.
                     if (PlayerbotHolder::TryReserveCharacterSlot(accountId, durableCount)
                         != living::SlotReservationOutcome::Reserved)
-                    {
-                        round.reservationBlocked = true;
-                        break;
-                    }
+                        return living::FixedCountAttempt::ReservationBlocked;
 
-                    if (factory.CreateRandomBot(cls, race))
+                    if (!factory.CreateRandomBot(cls, race))
                     {
-                        bulkReservedSlots[accountId]++;
-                        round.created++;
-                        botsCreated++;
-                        bar1.step();
-                        if (--remaining[key] == 0)
-                            remaining.erase(key);
-                    }
-                    else
                         PlayerbotHolder::ReleaseCharacterSlot(accountId); // nothing was queued
-                }
+                        return living::FixedCountAttempt::CreateFailed;
+                    }
 
-                return round;
+                    bulkReservedSlots[accountId]++;
+                    botsCreated++;
+                    bar1.step();
+                    return living::FixedCountAttempt::Created;
+                });
             });
 	}
 	else

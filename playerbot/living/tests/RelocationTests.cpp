@@ -527,6 +527,49 @@ LIVING_TEST(relocation_cancellation_drops_without_completing)
     LIVING_CHECK(tracker.PendingCount() == 0);
 }
 
+LIVING_TEST(relocation_offline_delete_force_cancels_finalizing_and_ignores_stale_verify)
+{
+    // The offline-deletion flow: a Finalizing record survives an ordinary
+    // logout (NoteBotAbsent retains it for a relogin), but a character
+    // deletion - live or OFFLINE - force-cancels by GUID and must immediately
+    // release both the record and its destination density reservation. A
+    // homebind verification result still in flight for the cancelled record
+    // resolves to None and can never resurrect or mutate the cancelled state.
+    RelocationTracker tracker;
+    PendingRelocation record = MakeRecord(1, 10.0f, 20.0f, 3.0f);
+    record.setHomebind = true;
+    uint64_t const token = tracker.Begin(7, record);
+
+    PendingRelocation acked;
+    LIVING_CHECK(tracker.Acknowledge(7, 1, 10.0f, 20.0f, 3.0f, 0.0f, acked) == RelocationAckResult::Landed);
+
+    // Advance far enough that a verification request is genuinely in flight.
+    SpyOps ops;
+    ops.homebindHasTarget = true;
+    ops.homebindTarget = HomebindWrite{ 1, 10.0f, 20.0f, 3.0f, 42 };
+    RelocationAdvanceOps advanceOps = ops.Make();
+    LIVING_CHECK(tracker.Advance(7, advanceOps) == RelocationAdvanceResult::Finalizing);
+    LIVING_CHECK(ops.homebindVerifyRequests == 1);
+
+    // Ordinary absence sweeps (bot logged out normally) RETAIN the record.
+    LIVING_CHECK(!tracker.NoteBotAbsent(7));
+    LIVING_CHECK(tracker.IsFinalizing(7));
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(1, 10.0f, 20.0f, 100.0f, 0) == 1);
+
+    // Offline delete: force-cancel by GUID with no live Player involved.
+    LIVING_CHECK(tracker.Cancel(7, RelocationCancelMode::Force));
+    LIVING_CHECK(!tracker.HasPending(7));
+    LIVING_CHECK(tracker.CountReservedDestinationsNear(1, 10.0f, 20.0f, 100.0f, 0) == 0);
+
+    // The stale in-flight verification result matches no live record: ignored.
+    tracker.OnHomebindVerifyResult(token, HomebindVerifyOutcome::Match);
+    for (auto const& event : tracker.DrainHomebindVerifyEvents())
+        LIVING_CHECK(tracker.ApplyHomebindVerify(event.relocationToken, event.outcome,
+            RelocationTracker::kMaxHomebindWriteAttempts) == HomebindVerifyAction::None);
+    LIVING_CHECK(!tracker.HasPending(7));
+    LIVING_CHECK(tracker.PendingCount() == 0);
+}
+
 LIVING_TEST(relocation_revive_flags_travel_with_the_record)
 {
     // The revive path defers marker clearing to completion: the flags must

@@ -1302,9 +1302,18 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
         return "Unable to find player.";
 
 
-    BotAlwaysOnline always = BotAlwaysOnline(sRandomPlayerbotMgr.GetValue(guid.GetCounter(), "always"));
+    // TYPED prior-state read: an untrusted read (failed bulk load, dirty row)
+    // or an invalid stored value used to collapse to DISABLED and flip the
+    // durable row - and the bot's login - against unknown state. Refuse the
+    // toggle instead; nothing durable or runtime changes.
+    uint32 alwaysRaw = 0;
+    bool const alwaysKnown = sRandomPlayerbotMgr.TryGetEventValue(guid.GetCounter(), "always", alwaysRaw);
+    living::AlwaysToggleDecision const decision = living::PlanAlwaysToggle(alwaysKnown, alwaysRaw);
 
-    if (always == BotAlwaysOnline::DISABLED || always == BotAlwaysOnline::DISABLED_BY_COMMAND)
+    if (decision == living::AlwaysToggleDecision::RefuseUnknown)
+        return "Always-online state for " + alwaysName + " could not be read; nothing changed, try again.";
+
+    if (decision == living::AlwaysToggleDecision::Enable)
     {
         // Persist FIRST and gate every runtime side effect on a CONFIRMED write:
         // a rejected/ambiguous `always` write must leave freeAltBots and the
@@ -1314,7 +1323,11 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
                 sRandomPlayerbotMgr.SetValue(guid.GetCounter(), "always", (uint32)BotAlwaysOnline::ACTIVE)))
             return "Could not persist always-online for " + alwaysName + "; state unchanged, try again.";
 
-        sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(accountId, guid.GetCounter()));
+        // Deduplicated insert: the guid may already be scheduled (a finalized
+        // auto-add, or a repeated command) and a duplicate entry would make
+        // every LoginFreeBots pass process the bot twice.
+        if (!sPlayerbotAIConfig.IsFreeAltBot(guid.GetCounter()))
+            sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(accountId, guid.GetCounter()));
 
         Player* existingBot = sRandomPlayerbotMgr.GetPlayerBot(guid);
         if (existingBot)
@@ -2289,7 +2302,9 @@ namespace ai
             ops.onCreated = [](uint32 guid, uint32 accountId, std::string const& name, bool autoAdd)
             {
                 // Only now is the GUID exposed and the creation complete.
-                if (autoAdd)
+                // Deduplicated: a `.bot always` issued while the creation was
+                // pending may already have scheduled this guid.
+                if (autoAdd && !sPlayerbotAIConfig.IsFreeAltBot(guid))
                     sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(accountId, guid));
 
                 sLog.outDetail("Bot creation finalized: '%s' (guid %u)", name.c_str(), guid);
@@ -2322,6 +2337,72 @@ namespace ai
     // (see LivingCreationCleanup.h). Pumped from PumpBotCreation, it survives
     // TestContext::Reset - which the old poll-once-and-clear did not.
     static living::AbandonedCreationCleanup botCreationCleanup;
+
+    // Durable per-GUID deletion owner (see DurableCharacterDeletions): every
+    // DeleteBot adoption is confirmed by an execution-ordered absence readback
+    // before its metadata is cleared or its account cleanup runs. The same
+    // callback contract as the creation finalizer applies: HandleAbsenceVerify
+    // only parses into the mailbox; all decisions run in PumpBotCreation.
+    class BotDeletionConfirmer
+    {
+    public:
+        living::DurableCharacterDeletions core;
+
+        void HandleAbsenceVerify(QueryResult* result, uint32 guid)
+        {
+            living::RowVerifyOutcome outcome = living::RowVerifyOutcome::QueryFailed;
+            if (result)
+                outcome = result->Fetch()[0].GetUInt32() == 0
+                    ? living::RowVerifyOutcome::Absent
+                    : living::RowVerifyOutcome::Verified; // still present
+            delete result;
+
+            core.OnAbsenceVerify(guid, outcome);
+        }
+
+        living::CharacterDeletionOps Ops()
+        {
+            living::CharacterDeletionOps ops;
+            ops.deleteCharacter = [](uint32 guid, uint32 accountId)
+            {
+                Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), accountId, true, true);
+            };
+            ops.requestAbsenceVerify = [this](uint32 guid) -> bool
+            {
+                // COUNT always yields one row on success, so a null callback
+                // result is a FAILED query, never absence. The query is queued
+                // on the same FIFO thread as the deletion transaction, so its
+                // execution is ordered behind it.
+                return CharacterDatabase.AsyncPQuery(this, &BotDeletionConfirmer::HandleAbsenceVerify, guid,
+                    "SELECT COUNT(*) FROM characters WHERE guid = '%u'", guid);
+            };
+            ops.clearMetadata = [](uint32 guid) -> bool
+            {
+                bool const cleared = CharacterDatabase.DirectPExecute(
+                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid);
+                sRandomPlayerbotMgr.ForgetEventCache(guid);
+                return cleared;
+            };
+            ops.revokeLogin = [](uint32 guid)
+            {
+                auto it = std::remove_if(sPlayerbotAIConfig.freeAltBots.begin(), sPlayerbotAIConfig.freeAltBots.end(),
+                    [guid](std::pair<uint32, uint32> entry) { return entry.second == guid; });
+                sPlayerbotAIConfig.freeAltBots.erase(it, sPlayerbotAIConfig.freeAltBots.end());
+            };
+            ops.onConfirmedDeleted = [](uint32 guid, uint32 accountId)
+            {
+                PlayerbotHolder::OnCharacterDeletionConfirmed(guid, accountId);
+            };
+            ops.onQuarantined = [](uint32 guid)
+            {
+                sLog.outError("Character deletion for guid %u could not be confirmed after bounded attempts; "
+                    "its event rows are kept so a later restart retries the deletion", guid);
+            };
+            return ops;
+        }
+    };
+
+    static BotDeletionConfirmer botDeletionConfirmer;
 
     bool BotCreationFinalizer::ExpectedIdentity(uint32 guid, uint32& accountId, std::string& name) const
     {
@@ -2358,6 +2439,18 @@ void PlayerbotHolder::AbandonBatchToken(uint64 batchToken)
     // Transfer a still-pending group-batch token to the deferred owner; it will
     // delete the finalized members only once the batch is Complete.
     ai::botCreationCleanup.AdoptBatch(batchToken);
+}
+
+void PlayerbotHolder::AdoptCharacterDeletion(uint32 guid, uint32 accountId)
+{
+    ai::botDeletionConfirmer.core.Adopt(guid, accountId, ai::botDeletionConfirmer.Ops());
+}
+
+void PlayerbotHolder::OnCharacterDeletionConfirmed(uint32 guid, uint32 accountId)
+{
+    // Absence is confirmed: the durable character count now reflects the
+    // deletion, so the account-cleanup hook can act on truthful occupancy.
+    static_cast<PlayerbotHolder&>(sRandomPlayerbotMgr).OnBotDeleted(guid, accountId);
 }
 
 uint32 PlayerbotHolder::MaxCharsPerAccount()
@@ -2613,9 +2706,17 @@ namespace ai
         cleanupOps.pollBatch = [](uint64 token, bool ack) { return PlayerbotHolder::PollBotCreationBatch(token, ack); };
         cleanupOps.deleteCharacter = [](uint32 guid)
         {
+            // DeleteBot revokes login eligibility and ADOPTS the deletion into
+            // the durable confirmer, so acknowledging the creation token here
+            // is safe: per-GUID ownership continues until an execution-ordered
+            // readback confirms the character row absent.
             sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
         };
         botCreationCleanup.Pump(cleanupOps);
+
+        // Drive the durable deletion confirmations (absence readbacks, bounded
+        // re-issues, metadata clears, account cleanup).
+        botDeletionConfirmer.core.Pump(botDeletionConfirmer.Ops());
     }
 }
 
@@ -3107,41 +3208,51 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
 
     uint32 maxTries = 10*groupSize;
 
-    // ONE batch owns a target group's deficit at a time. A repeated command
-    // with COMPATIBLE options extends the initiator's existing batch (same
-    // token, one shared pending/finalized/join ledger); incompatible options
-    // are refused without enqueueing anything - an independent residual batch
-    // could otherwise report success using members owned by an older batch
-    // that later fails.
+    // ONE consistent ownership/accounting rule for repeated requests, decided
+    // by the shared planner: outstanding dependencies - planned, pending, or
+    // finalized-but-unjoined members of ANY of this initiator's batches,
+    // including completed retained ones - are credited as effective
+    // membership, so a request whose options differ from theirs is refused
+    // explicitly (the old flow checked only the ACTIVE batch and could
+    // silently queue nothing under changed options), and a fresh batch
+    // explicitly credits them in its completion baseline.
     bool const wantRandomAccounts = dynamic_cast<RandomPlayerbotMgr*>(this) != nullptr;
-    uint64 const existingToken = ai::botCreationBatches.FindBatchTokenForInitiator(master->GetGUIDLow());
-    if (existingToken)
-    {
-        living::CreationBatchRegistry::Batch const* existing = ai::botCreationBatches.Find(existingToken);
-        bool const compatible = existing
-            && existing->memberGear == gear
-            && existing->memberAutoAdd == autoAdd
-            && existing->memberTemporary == temporary
-            && existing->useRandomAccounts == wantRandomAccounts;
-
-        if (!compatible)
-        {
-            messages.push_back("A group creation with different options is already in progress for you; wait for it to complete before requesting different options");
-            return messages;
-        }
-    }
-
-    // Outstanding slots already owned by this initiator's batch: planned and
-    // pending creations PLUS finalized members that have not yet joined the
-    // group. Effective membership counts them, so a repeated command enqueues
-    // only the residual deficit. Their planned classes/roles also consume the
-    // composition quotas below, so older allocations constrain this
-    // selection. A slot stays owned until membership is verified in the live
-    // group or the batch expires (the bounded terminal path for joins that
-    // never happen).
     auto const isJoined = [group](uint32 guid) { return group && group->IsMember(ObjectGuid(HIGHGUID_PLAYER, guid)); };
     uint32 const liveMembers = currentGroupSize;
-    uint32 const outstandingSlots = ai::botCreationBatches.OutstandingSlotsForInitiator(master->GetGUIDLow(), isJoined);
+
+    living::GroupBatchOptions requestedOptions;
+    requestedOptions.gear = gear;
+    requestedOptions.autoAdd = autoAdd;
+    requestedOptions.temporary = temporary;
+    requestedOptions.useRandomAccounts = wantRandomAccounts;
+
+    living::GroupBatchRequestPlan const requestPlan = living::PlanGroupBatchRequest(
+        ai::botCreationBatches, master->GetGUIDLow(), isJoined, liveMembers, groupSize, requestedOptions);
+
+    if (requestPlan.action == living::GroupBatchRequestAction::RejectIncompatible)
+    {
+        messages.push_back("A group creation with different options still owns "
+            + std::to_string(requestPlan.outstandingSlots)
+            + " outstanding member slot(s); wait for those members to join or the batch to expire before requesting different options");
+        return messages;
+    }
+
+    if (requestPlan.action == living::GroupBatchRequestAction::AlreadyCovered
+        && requestPlan.outstandingSlots > 0)
+    {
+        messages.push_back(std::to_string(requestPlan.outstandingSlots)
+            + " outstanding member slot(s) from a previous group creation already cover the requested size; no additional members queued");
+        return messages;
+    }
+
+    // The credited slots also count toward effective membership, so this run
+    // enqueues only the residual deficit; their planned classes/roles consume
+    // the composition quotas below, so older allocations constrain this
+    // selection. A slot stays owned until membership is verified in the live
+    // group or its batch expires (the bounded terminal path for joins that
+    // never happen).
+    uint64 const existingToken = requestPlan.existingToken;
+    uint32 const outstandingSlots = requestPlan.outstandingSlots;
     currentGroupSize += outstandingSlots;
 
     ai::botCreationBatches.ForEachOutstandingMember(master->GetGUIDLow(), isJoined,
@@ -3162,7 +3273,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     if (existingToken)
     {
         batchToken = existingToken;
-        ai::botCreationBatches.ExtendDesiredSize(existingToken, groupSize);
+        // The extension refreshes the batch's live-membership baseline from
+        // THIS observation: unrelated members who joined since the batch began
+        // no longer leave a stale baseline that completion reports as a false
+        // undersize.
+        ai::botCreationBatches.ExtendDesiredSize(existingToken, groupSize, liveMembers, isJoined);
 
         if (currentGroupSize >= groupSize)
         {
@@ -3176,7 +3291,12 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
 
     living::GroupCreationLedger ledger;
     std::vector<living::CreationBatchMember> batchMembers;
-    uint32 const preexistingMembers = liveMembers;
+    // A fresh batch's baseline EXPLICITLY credits the outstanding dependencies
+    // it coalesced over (live members plus older batches' unjoined slots):
+    // its completion invariant then measures only the slots THIS batch owns,
+    // instead of reporting a false undersize for members another batch's
+    // ledger already tracks.
+    uint32 const preexistingMembers = requestPlan.creditedPreexisting;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     bool stoppedOnTerminalFailure = false;
     bool stoppedOnTransientFailure = false;
@@ -3328,8 +3448,10 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         if (!stoppedOnTransientFailure && currentGroupSize < groupSize)
         {
             std::ostringstream shortfall;
-            shortfall << "initial run queued only " << (currentGroupSize - preexistingMembers - outstandingSlots)
-                << " of " << (groupSize - preexistingMembers - outstandingSlots) << " requested members";
+            // preexistingMembers already credits the outstanding slots, so the
+            // residual this run owed is measured against it alone.
+            shortfall << "initial run queued only " << (currentGroupSize - preexistingMembers)
+                << " of " << (groupSize - preexistingMembers) << " requested members";
             if (stoppedOnTerminalFailure)
                 shortfall << " (stopped on a terminal failure)";
             else if (maxTries == 0)
@@ -3714,14 +3836,30 @@ bool PlayerbotHolder::DeleteBot(ObjectGuid guid, bool allowInstant)
 {
     uint32 botAccount = sObjectMgr.GetPlayerAccountIdByGUID(guid);
 
+    // Force-cancel any tracked relocation BY GUID before anything else: an
+    // OFFLINE deletion has no live Player, so the logout path below never runs
+    // and a retained Finalizing record (with its destination density
+    // reservation) would outlive the character. The tracker ignores stale
+    // verification callbacks by relocation token, so a cancelled record cannot
+    // be resurrected or mutated by an in-flight result.
+    sRandomPlayerbotMgr.CancelPendingRelocation(guid.GetCounter(), living::RelocationCancelMode::Force);
+
     if (Player* player = sObjectMgr.GetPlayer(guid, true))
     {
         //Attempt instant logout.
-        player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING); 
+        player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING);
         LogoutPlayerBot(guid, allowInstant, true);
     }
 
     Player::DeleteFromDB(guid, botAccount, true, true);
+
+    // DeleteFromDB only QUEUED the transaction. Adopt the deletion into the
+    // durable confirmer: login eligibility (freeAltBots) is revoked NOW, and
+    // event rows/markers are cleared - and account cleanup runs - only after
+    // the execution-ordered readback confirms the character row absent.
+    // Still-present and failed readbacks retry bounded; exhaustion fails
+    // closed (rows kept, a restart retries).
+    AdoptCharacterDeletion(guid.GetCounter(), botAccount);
 
     OnBotDeleted(guid, botAccount);
 

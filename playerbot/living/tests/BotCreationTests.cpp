@@ -2,6 +2,7 @@
 
 #include "../util/LivingActivation.h"
 #include "../util/LivingBotCreation.h"
+#include "../util/LivingCreationLifecycle.h"
 
 using namespace living;
 
@@ -262,6 +263,80 @@ LIVING_TEST(bulk_fill_partial_progress_then_blocked_terminates)
     });
     LIVING_CHECK(fill.created == 2);
     LIVING_CHECK(fill.reservationBlocked);
+}
+
+// RunFixedCountRound is the exact sweep the production fixed-count fill runs
+// per reshuffle: zero quotas are disabled (the raw decrement used to wrap them
+// to UINT_MAX and mass-create the disabled combination), consumption is
+// checked, and a refused reservation still terminates the round.
+
+namespace
+{
+    using ClassRace = std::pair<uint8_t, uint8_t>;
+
+    std::vector<ClassRace> KeysOf(std::map<ClassRace, uint32_t> const& remaining)
+    {
+        std::vector<ClassRace> keys;
+        for (auto const& entry : remaining)
+            keys.push_back(entry.first);
+        return keys;
+    }
+}
+
+LIVING_TEST(fixed_count_round_zero_only_map_creates_nothing_and_terminates)
+{
+    // Every configured count is zero: nothing may be reserved or created, the
+    // zero entries are dropped, and the outer fill stops on the zero-progress
+    // round instead of respinning.
+    std::map<ClassRace, uint32_t> remaining{ {{1, 1}, 0}, {{4, 2}, 0} };
+    uint32_t attempts = 0;
+
+    AccountFillResult const fill = FillAccount(9, [&](uint32_t allowance) -> AccountFillRound
+    {
+        return RunFixedCountRound(remaining, KeysOf(remaining), allowance,
+            [&](ClassRace const&) { ++attempts; return FixedCountAttempt::Created; });
+    });
+
+    LIVING_CHECK(attempts == 0);        // zero = disabled: attempt never invoked
+    LIVING_CHECK(fill.created == 0);
+    LIVING_CHECK(remaining.empty());    // dropped, so no false shortfall report
+}
+
+LIVING_TEST(fixed_count_round_mixed_map_creates_only_positive_quotas)
+{
+    // Mixed map: the zero entry is skipped entirely while positive quotas are
+    // consumed exactly, with checked decrements (never past zero).
+    std::map<ClassRace, uint32_t> remaining{ {{1, 1}, 2}, {{4, 2}, 0}, {{8, 8}, 1} };
+    std::map<ClassRace, uint32_t> attempted;
+
+    AccountFillResult const fill = FillAccount(9, [&](uint32_t allowance) -> AccountFillRound
+    {
+        return RunFixedCountRound(remaining, KeysOf(remaining), allowance,
+            [&](ClassRace const& key) { ++attempted[key]; return FixedCountAttempt::Created; });
+    });
+
+    LIVING_CHECK(fill.created == 3);                   // 2 + 0 + 1
+    LIVING_CHECK((attempted[{1, 1}] == 2));
+    LIVING_CHECK((attempted.find({4, 2}) == attempted.end())); // disabled combo never attempted
+    LIVING_CHECK((attempted[{8, 8}] == 1));
+    LIVING_CHECK(remaining.empty());                   // all quotas exhausted and erased
+}
+
+LIVING_TEST(fixed_count_round_failed_create_keeps_quota_and_blocked_terminates)
+{
+    std::map<ClassRace, uint32_t> remaining{ {{1, 1}, 1} };
+
+    // A failed create keeps the quota for a later round.
+    AccountFillRound round = RunFixedCountRound(remaining, KeysOf(remaining), 5,
+        [&](ClassRace const&) { return FixedCountAttempt::CreateFailed; });
+    LIVING_CHECK(round.created == 0 && !round.reservationBlocked);
+    LIVING_CHECK((remaining[{1, 1}] == 1));
+
+    // A refused shared reservation terminates the round with the flag set.
+    round = RunFixedCountRound(remaining, KeysOf(remaining), 5,
+        [&](ClassRace const&) { return FixedCountAttempt::ReservationBlocked; });
+    LIVING_CHECK(round.reservationBlocked);
+    LIVING_CHECK((remaining[{1, 1}] == 1));
 }
 
 LIVING_TEST(group_join_plan_clears_only_on_success_or_terminal)
@@ -543,6 +618,38 @@ LIVING_TEST(always_toggle_applies_only_on_confirmed_write)
     LIVING_CHECK(!AlwaysToggleMayApply(false)); // unconfirmed -> leave runtime unchanged, report failure
 }
 
+LIVING_TEST(always_toggle_refuses_untrusted_or_invalid_prior_state)
+{
+    // `.bot always` decides its direction from the TYPED prior read. Trusted
+    // valid states toggle normally...
+    LIVING_CHECK(PlanAlwaysToggle(true, 0 /*DISABLED*/) == AlwaysToggleDecision::Enable);
+    LIVING_CHECK(PlanAlwaysToggle(true, 2 /*DISABLED_BY_COMMAND*/) == AlwaysToggleDecision::Enable);
+    LIVING_CHECK(PlanAlwaysToggle(true, 1 /*ACTIVE*/) == AlwaysToggleDecision::Disable);
+
+    // ...but a failed/dirty read (untrusted, raw collapses to zero) and an
+    // invalid stored value both refuse: no durable write, no runtime mutation.
+    LIVING_CHECK(PlanAlwaysToggle(false, 0) == AlwaysToggleDecision::RefuseUnknown);
+    LIVING_CHECK(PlanAlwaysToggle(false, 1) == AlwaysToggleDecision::RefuseUnknown); // dirty ACTIVE read
+    LIVING_CHECK(PlanAlwaysToggle(true, 3) == AlwaysToggleDecision::RefuseUnknown);  // invalid enum value
+}
+
+LIVING_TEST(always_online_loader_excludes_disabled_by_command_even_on_failed_reads)
+{
+    // Startup/reload scheduling from the durable `always` rows. Trusted states
+    // behave as configured...
+    LIVING_CHECK(ShouldScheduleAlwaysOnline(true, 1 /*ACTIVE*/, false));
+    LIVING_CHECK(ShouldScheduleAlwaysOnline(true, 0 /*DISABLED*/, true));   // config default online
+    LIVING_CHECK(!ShouldScheduleAlwaysOnline(true, 0, false));
+    LIVING_CHECK(!ShouldScheduleAlwaysOnline(true, 2 /*DISABLED_BY_COMMAND*/, true)); // command wins over config
+
+    // ...and a reload during a database failure schedules NOTHING: the failed
+    // read collapses to zero, which used to re-include DISABLED_BY_COMMAND
+    // characters and drop ACTIVE ones. Invalid stored values are never coerced.
+    LIVING_CHECK(!ShouldScheduleAlwaysOnline(false, 0, true));  // was DISABLED_BY_COMMAND, read failed
+    LIVING_CHECK(!ShouldScheduleAlwaysOnline(false, 1, true));  // was ACTIVE, read failed: retried next reload
+    LIVING_CHECK(!ShouldScheduleAlwaysOnline(true, 7, true));   // invalid enum value
+}
+
 LIVING_TEST(group_join_persist_advances_state_only_when_confirmed)
 {
     // Finding N2: the group-join backoff/consume bookkeeping advances ONLY on a
@@ -583,4 +690,81 @@ LIVING_TEST(group_join_attempt_count_advances_only_on_confirmed_persist)
     LIVING_CHECK(onePass(EventWriteResult::StateUnknown)         == 1 && durable == 1);
     LIVING_CHECK(onePass(EventWriteResult::DesiredStateConfirmed) == 1 && durable == 2); // advances only now
     LIVING_CHECK(onePass(EventWriteResult::DesiredStateConfirmed) == 2 && durable == 3);
+}
+
+// Scheduler-ownership across LoginFreeBots passes: the release decision
+// (MayReleasePostCreateOwner) composed with the group-join planner and the
+// one-shot marker ledgers, exactly as the production pass computes it. A
+// non-always bot must stay scheduled while any post-create obligation is
+// unsettled - unknown reads never count as settled.
+
+LIVING_TEST(post_create_owner_retained_across_group_join_retries)
+{
+    // Two manager passes per scenario: pass 1 hits a non-terminal join
+    // outcome (offline target / full group / database unavailable) and must
+    // retain the bot; a later pass reaches a confirmed terminal persist and
+    // releases it.
+    auto joinSettledAfterPass = [](TargetExistence existence, bool online, bool verified,
+        uint32_t attempts, EventWriteResult persistWrite) -> bool
+    {
+        GroupJoinPlan const plan = PlanGroupJoinAttempt(existence, online, verified, attempts, 10, 30);
+        if (plan.decision == GroupJoinDecision::RetryLater)
+            return false; // marker kept for a bounded retry
+        return PlanGroupJoinPersist(plan.decision, persistWrite).consumed;
+    };
+
+    bool const alwaysKnown = true, alwaysActive = false;
+
+    // Offline target, then the target comes online and membership verifies.
+    bool settled = joinSettledAfterPass(TargetExistence::Found, false, false, 0,
+        EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(!MayReleasePostCreateOwner(alwaysKnown, alwaysActive, !settled)); // pass 1: retained
+    settled = joinSettledAfterPass(TargetExistence::Found, true, true, 1,
+        EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(MayReleasePostCreateOwner(alwaysKnown, alwaysActive, !settled));  // pass 2: released
+
+    // Full group / failed invite (online but membership not verified).
+    settled = joinSettledAfterPass(TargetExistence::Found, true, false, 3,
+        EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(!MayReleasePostCreateOwner(alwaysKnown, alwaysActive, !settled));
+
+    // Database unavailable: existence unknown - retained without consuming
+    // the attempt budget.
+    GroupJoinPlan const unavailable = PlanGroupJoinAttempt(TargetExistence::Unavailable,
+        false, false, 4, 10, 30);
+    LIVING_CHECK(unavailable.decision == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(unavailable.attemptNumber == 4); // budget not consumed
+    LIVING_CHECK(!MayReleasePostCreateOwner(alwaysKnown, alwaysActive, true));
+
+    // Terminal decision whose durable CLEAR is unconfirmed: still retained;
+    // the confirmed clear on the next pass releases.
+    settled = joinSettledAfterPass(TargetExistence::ConfirmedMissing, false, false, 2,
+        EventWriteResult::StateUnknown);
+    LIVING_CHECK(!MayReleasePostCreateOwner(alwaysKnown, alwaysActive, !settled));
+    settled = joinSettledAfterPass(TargetExistence::ConfirmedMissing, false, false, 2,
+        EventWriteResult::DesiredStateConfirmed);
+    LIVING_CHECK(MayReleasePostCreateOwner(alwaysKnown, alwaysActive, !settled));
+}
+
+LIVING_TEST(post_create_owner_retained_on_unknown_reads_and_failed_clears)
+{
+    // Unknown marker reads are never interpreted as "no work": the bot stays
+    // scheduled with nothing mutated.
+    LIVING_CHECK(!MayReleasePostCreateOwner(/*alwaysKnown*/ true, /*active*/ false,
+        /*pending*/ true)); // an untrusted marker read reports pending work
+
+    // A failed marker clear keeps the obligation across passes; only the
+    // confirmed clear settles it.
+    OneShotMarker marker;
+    marker.OnEffectApplied();
+    LIVING_CHECK(!marker.OnClearResult(EventWriteResult::StateUnknown));
+    LIVING_CHECK(!MayReleasePostCreateOwner(true, false, true));
+    LIVING_CHECK(marker.OnClearResult(EventWriteResult::DesiredStateConfirmed));
+    LIVING_CHECK(MayReleasePostCreateOwner(true, false, false));
+
+    // The always-online membership itself releases only from a KNOWN state:
+    // an unreadable `always` row retains even a fully-settled bot, and a
+    // known ACTIVE bot is never released.
+    LIVING_CHECK(!MayReleasePostCreateOwner(/*alwaysKnown*/ false, false, false));
+    LIVING_CHECK(!MayReleasePostCreateOwner(true, /*active*/ true, false));
 }

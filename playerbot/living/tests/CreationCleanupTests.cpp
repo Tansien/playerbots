@@ -177,3 +177,177 @@ LIVING_TEST(cleanup_quarantined_single_is_dropped_without_delete)
     LIVING_CHECK(deleted.empty());
     LIVING_CHECK(cleanup.PendingSingles() == 0);
 }
+
+// DurableCharacterDeletions is the per-GUID deletion owner every DeleteBot
+// adoption flows through: absence must be execution-confirmed before any
+// metadata clear or account cleanup, still-present/failed readbacks retry
+// bounded, and exhaustion fails closed (rows kept for a restart to retry).
+
+namespace
+{
+    struct DeletionSpyOps
+    {
+        std::vector<uint32_t> deletes;
+        std::vector<uint32_t> verifyRequests;
+        std::vector<uint32_t> metadataClears;
+        std::vector<uint32_t> revokedLogins;
+        std::vector<std::pair<uint32_t, uint32_t>> confirmed;
+        std::vector<uint32_t> quarantined;
+
+        bool verifyEnqueueSucceeds = true;
+        bool clearSucceeds = true;
+
+        CharacterDeletionOps Make()
+        {
+            CharacterDeletionOps ops;
+            ops.deleteCharacter = [this](uint32_t guid, uint32_t) { deletes.push_back(guid); };
+            ops.requestAbsenceVerify = [this](uint32_t guid)
+            {
+                verifyRequests.push_back(guid);
+                return verifyEnqueueSucceeds;
+            };
+            ops.clearMetadata = [this](uint32_t guid) { metadataClears.push_back(guid); return clearSucceeds; };
+            ops.revokeLogin = [this](uint32_t guid) { revokedLogins.push_back(guid); };
+            ops.onConfirmedDeleted = [this](uint32_t guid, uint32_t accountId) { confirmed.push_back({ guid, accountId }); };
+            ops.onQuarantined = [this](uint32_t guid) { quarantined.push_back(guid); };
+            return ops;
+        }
+    };
+}
+
+LIVING_TEST(durable_deletion_confirmed_absence_clears_metadata_then_completes)
+{
+    // The happy path in execution order: adopt (login revoked at once, the
+    // auto-add cleanup), readback confirms absence, ONLY THEN metadata clears
+    // and the account-cleanup hook fires with the truthful durable count.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7001, 42, spy.Make());
+    LIVING_CHECK(spy.revokedLogins == std::vector<uint32_t>{ 7001 }); // immediately login-ineligible
+    LIVING_CHECK(deletions.Owns(7001));
+
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.verifyRequests.size() == 1);
+    LIVING_CHECK(spy.metadataClears.empty()); // nothing cleared before confirmation
+
+    deletions.OnAbsenceVerify(7001, RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make()); // consumes the outcome
+    deletions.Pump(spy.Make()); // clears + confirms
+    LIVING_CHECK(spy.metadataClears == std::vector<uint32_t>{ 7001 });
+    LIVING_CHECK(spy.confirmed.size() == 1 && spy.confirmed[0].first == 7001 && spy.confirmed[0].second == 42);
+    LIVING_CHECK(!deletions.Owns(7001));
+    LIVING_CHECK(spy.quarantined.empty());
+
+    // Duplicate adoption merges: re-adopting an owned guid re-revokes login
+    // but never duplicates the record.
+    deletions.Adopt(7002, 42, spy.Make());
+    deletions.Adopt(7002, 42, spy.Make());
+    LIVING_CHECK(deletions.RecordCount() == 1);
+}
+
+LIVING_TEST(durable_deletion_still_present_reissues_then_fails_closed)
+{
+    // Deletion failure: every readback finds the row STILL PRESENT. The
+    // idempotent deletion is re-issued per attempt; exhaustion quarantines
+    // WITHOUT clearing metadata - the marker survives for a restart to retry.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7010, 42, spy.Make());
+    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxVerifyAttempts + 2; ++i)
+    {
+        deletions.Pump(spy.Make());
+        deletions.OnAbsenceVerify(7010, RowVerifyOutcome::Verified);
+    }
+    deletions.Pump(spy.Make());
+
+    LIVING_CHECK(spy.quarantined == std::vector<uint32_t>{ 7010 });
+    LIVING_CHECK(deletions.IsQuarantined(7010));
+    LIVING_CHECK(spy.metadataClears.empty());          // fail closed: rows kept
+    LIVING_CHECK(spy.confirmed.empty());
+    LIVING_CHECK(!spy.deletes.empty());                // the deletion WAS re-issued
+    LIVING_CHECK(spy.deletes.size() < DurableCharacterDeletions::kMaxVerifyAttempts); // bounded
+
+    // Quarantined records do no further work.
+    size_t const requestsAtQuarantine = spy.verifyRequests.size();
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.verifyRequests.size() == requestsAtQuarantine);
+}
+
+LIVING_TEST(durable_deletion_query_failures_are_bounded_and_fail_closed)
+{
+    // Absence readbacks keep FAILING (outage): bounded retries, then
+    // quarantine with nothing cleared. A failed ENQUEUE consumes the same
+    // bounded budget through the mailbox.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7020, 42, spy.Make());
+    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxVerifyAttempts + 2; ++i)
+    {
+        deletions.Pump(spy.Make());
+        deletions.OnAbsenceVerify(7020, RowVerifyOutcome::QueryFailed);
+    }
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(deletions.IsQuarantined(7020));
+    LIVING_CHECK(spy.metadataClears.empty() && spy.confirmed.empty());
+    LIVING_CHECK(spy.deletes.empty()); // a failed QUERY never re-issues the deletion
+
+    DurableCharacterDeletions enqueueFailures;
+    DeletionSpyOps enqueueSpy;
+    enqueueSpy.verifyEnqueueSucceeds = false;
+    enqueueFailures.Adopt(7021, 42, enqueueSpy.Make());
+    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxVerifyAttempts + 2; ++i)
+        enqueueFailures.Pump(enqueueSpy.Make());
+    LIVING_CHECK(enqueueFailures.IsQuarantined(7021));
+    LIVING_CHECK(enqueueSpy.metadataClears.empty());
+}
+
+LIVING_TEST(durable_deletion_failed_metadata_clear_retries_then_fails_closed)
+{
+    // Absence confirmed but the metadata clear keeps failing: only the clear
+    // retries (no new readbacks, no re-deletes), bounded, then quarantine.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+    spy.clearSucceeds = false;
+
+    deletions.Adopt(7030, 42, spy.Make());
+    deletions.Pump(spy.Make());
+    deletions.OnAbsenceVerify(7030, RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make());
+
+    size_t const verifyRequestsAfterConfirm = spy.verifyRequests.size();
+    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxClearAttempts + 2; ++i)
+        deletions.Pump(spy.Make());
+
+    LIVING_CHECK(deletions.IsQuarantined(7030));
+    LIVING_CHECK(spy.confirmed.empty());
+    LIVING_CHECK(spy.verifyRequests.size() == verifyRequestsAfterConfirm); // clear-only retries
+    LIVING_CHECK(spy.metadataClears.size() == DurableCharacterDeletions::kMaxClearAttempts);
+}
+
+LIVING_TEST(durable_deletion_restart_readopts_and_completes)
+{
+    // Restart/retry: the first process quarantined (or crashed) without
+    // clearing metadata, so the startup sweep re-adopts the same guid in a
+    // FRESH owner - which then completes normally once the deletion lands.
+    DurableCharacterDeletions firstProcess;
+    DeletionSpyOps firstSpy;
+    firstProcess.Adopt(7040, 42, firstSpy.Make());
+    firstProcess.Pump(firstSpy.Make());
+    firstProcess.OnAbsenceVerify(7040, RowVerifyOutcome::Verified); // deletion had not landed
+    // ... crash: nothing was cleared, the marker row survives.
+    LIVING_CHECK(firstSpy.metadataClears.empty());
+
+    DurableCharacterDeletions restarted;
+    DeletionSpyOps restartSpy;
+    restarted.Adopt(7040, 42, restartSpy.Make());
+    LIVING_CHECK(restartSpy.revokedLogins == std::vector<uint32_t>{ 7040 });
+    restarted.Pump(restartSpy.Make());
+    restarted.OnAbsenceVerify(7040, RowVerifyOutcome::Absent);
+    restarted.Pump(restartSpy.Make());
+    restarted.Pump(restartSpy.Make());
+    LIVING_CHECK(restartSpy.confirmed.size() == 1);
+    LIVING_CHECK(!restarted.Owns(7040));
+}

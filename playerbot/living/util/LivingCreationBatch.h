@@ -175,16 +175,33 @@ namespace living
         // guard makes the delta positive, so replacementBudget keeps pace with
         // desiredSize (one replacement per requested slot) instead of leaving
         // the added slots to share the original run's budget.
-        bool ExtendDesiredSize(uint64_t batchToken, uint32_t desiredSize)
+        //
+        // The live-membership baseline is refreshed from the extension's OWN
+        // observation: unrelated members who joined since Begin used to stay
+        // uncounted (the stale baseline made completion report a false
+        // undersize). The batch's own already-joined finalized members are
+        // subtracted so they are never counted both as preexisting AND as
+        // finalized in the completion invariant.
+        template <typename JoinedFn>
+        bool ExtendDesiredSize(uint64_t batchToken, uint32_t desiredSize, uint32_t liveMembers,
+            JoinedFn&& isJoined)
         {
             auto it = batches.find(batchToken);
             if (it == batches.end())
                 return false;
 
-            if (desiredSize > it->second.desiredSize)
+            Batch& batch = it->second;
+
+            uint32_t ownJoined = 0;
+            for (CreationBatchMember const& member : batch.members)
+                if (member.state == BatchMemberState::Finalized && isJoined(member.finalizedGuid))
+                    ++ownJoined;
+            batch.preexistingMembers = liveMembers > ownJoined ? liveMembers - ownJoined : 0;
+
+            if (desiredSize > batch.desiredSize)
             {
-                it->second.replacementBudget += desiredSize - it->second.desiredSize;
-                it->second.desiredSize = desiredSize;
+                batch.replacementBudget += desiredSize - batch.desiredSize;
+                batch.desiredSize = desiredSize;
             }
             return true;
         }
@@ -426,6 +443,40 @@ namespace living
             }
         }
 
+        // Visits every batch of the initiator that still OWNS at least one
+        // outstanding dependency (a planned/pending creation, or a finalized
+        // member that has not joined the group). COMPLETED retained batches
+        // count: their finalized-unjoined members are credited as effective
+        // membership by new requests, so those requests must also honor the
+        // options those members were created with.
+        template <typename JoinedFn, typename BatchFn>
+        void ForEachBatchWithOutstanding(uint32_t initiatorGuid, JoinedFn&& isJoined, BatchFn&& fn) const
+        {
+            if (initiatorGuid == 0)
+                return;
+
+            for (auto const& [token, batch] : batches)
+            {
+                if (batch.initiatorGuid != initiatorGuid)
+                    continue;
+
+                bool outstanding = false;
+                for (CreationBatchMember const& member : batch.members)
+                {
+                    if (member.state == BatchMemberState::AwaitingAttempt
+                        || member.state == BatchMemberState::PendingPersistence
+                        || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid)))
+                    {
+                        outstanding = true;
+                        break;
+                    }
+                }
+
+                if (outstanding)
+                    fn(batch);
+            }
+        }
+
         // The initiator's most recent ACTIVE batch (0 when none): the single
         // owner of that group's deficit; a repeated command extends it instead
         // of enqueueing a second one. Only a genuinely active batch (some member
@@ -530,4 +581,89 @@ namespace living
         std::map<uint64_t, uint64_t> completedAtPump;
         uint64_t nextToken = 1;
     };
+
+    // Creation options a repeated group request must match while ANY of the
+    // initiator's batches still owns outstanding dependencies.
+    struct GroupBatchOptions
+    {
+        std::string gear;
+        bool autoAdd = false;
+        bool temporary = false;
+        bool useRandomAccounts = false;
+    };
+
+    enum class GroupBatchRequestAction
+    {
+        // Outstanding dependencies (possibly from a completed retained batch)
+        // were created with DIFFERENT options: refuse with an explicit message
+        // instead of silently crediting members the new options never applied
+        // to - or silently queueing nothing at all.
+        RejectIncompatible,
+        // An active batch exists: extend it (same token, shared ledger).
+        ExtendExisting,
+        // No active batch, and live membership plus credited outstanding
+        // dependencies already reach the requested size.
+        AlreadyCovered,
+        // No active batch: begin a fresh batch whose baseline explicitly
+        // credits the outstanding dependencies (creditedPreexisting), so its
+        // completion invariant cannot report a false undersize for slots an
+        // older batch still owns.
+        BeginNew,
+    };
+
+    struct GroupBatchRequestPlan
+    {
+        GroupBatchRequestAction action = GroupBatchRequestAction::BeginNew;
+        uint64_t existingToken = 0;      // nonzero only for ExtendExisting
+        uint32_t outstandingSlots = 0;   // credited dependencies across ALL batches
+        uint32_t effectiveMembers = 0;   // live + outstanding
+        uint32_t creditedPreexisting = 0;// BeginNew's preexisting baseline
+    };
+
+    // The ONE ownership/accounting rule for a repeated group request. The
+    // handler used to check option compatibility only against the ACTIVE
+    // batch, while OutstandingSlotsForInitiator still credited a completed
+    // retained batch's finalized-unjoined members - so a request with changed
+    // options could silently create no batch, ignore the new options, and the
+    // fresh batch (when one was made) later reported a false undersize because
+    // the credited members belonged to another batch's ledger.
+    template <typename JoinedFn>
+    GroupBatchRequestPlan PlanGroupBatchRequest(CreationBatchRegistry const& registry,
+        uint32_t initiatorGuid, JoinedFn&& isJoined, uint32_t liveMembers,
+        uint32_t requestedSize, GroupBatchOptions const& options)
+    {
+        GroupBatchRequestPlan plan;
+        plan.outstandingSlots = registry.OutstandingSlotsForInitiator(initiatorGuid, isJoined);
+        plan.effectiveMembers = liveMembers + plan.outstandingSlots;
+        plan.creditedPreexisting = plan.effectiveMembers;
+
+        bool incompatible = false;
+        registry.ForEachBatchWithOutstanding(initiatorGuid, isJoined,
+            [&](CreationBatchRegistry::Batch const& batch)
+            {
+                if (batch.memberGear != options.gear
+                    || batch.memberAutoAdd != options.autoAdd
+                    || batch.memberTemporary != options.temporary
+                    || batch.useRandomAccounts != options.useRandomAccounts)
+                    incompatible = true;
+            });
+
+        if (incompatible)
+        {
+            plan.action = GroupBatchRequestAction::RejectIncompatible;
+            return plan;
+        }
+
+        plan.existingToken = registry.FindBatchTokenForInitiator(initiatorGuid);
+        if (plan.existingToken)
+        {
+            plan.action = GroupBatchRequestAction::ExtendExisting;
+            return plan;
+        }
+
+        plan.action = plan.effectiveMembers >= requestedSize
+            ? GroupBatchRequestAction::AlreadyCovered
+            : GroupBatchRequestAction::BeginNew;
+        return plan;
+    }
 }

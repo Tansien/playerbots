@@ -678,9 +678,10 @@ LIVING_TEST(creation_batch_extension_shares_one_ledger_and_cannot_pass_after_mem
     batch.members = { PendingMember(31, /*cls*/ 1, /*role*/ 1) }; // the tank slot
     uint64_t const token = registry.Begin(std::move(batch));
 
-    // Second request (size 3): same owner - extend, never a second batch.
+    // Second request (size 3): same owner - extend, never a second batch. The
+    // extension observes the same one live member the batch began with.
     LIVING_CHECK(registry.FindBatchTokenForInitiator(88) == token);
-    LIVING_CHECK(registry.ExtendDesiredSize(token, 3));
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 3, /*liveMembers*/ 1, [](uint32_t) { return false; }));
     LIVING_CHECK(registry.AddPendingMember(token, PendingMember(32, 2, 4)));
 
     // The pending tank slot constrains the extension's quotas: the caller
@@ -777,14 +778,17 @@ LIVING_TEST(creation_batch_completed_batch_never_blocks_a_new_run)
     auto joined7001 = [](uint32_t g) { return g == 7001; };
 
     // Finalized-but-unjoined: retained + pollable + still counted for the
-    // deficit, but NOT the active owner -> the different-options gate is bypassed.
+    // deficit, but NOT the active owner. (While that unjoined dependency
+    // exists, the request PLANNER refuses different options - see the
+    // group_batch_request_plan tests; the registry itself never blocks.)
     LIVING_CHECK(registry.Poll(tokenA, false).status == BatchPollStatus::Complete);
     LIVING_CHECK(registry.Find(tokenA) != nullptr);
     LIVING_CHECK(registry.FindBatchTokenForInitiator(77) == 0);
     LIVING_CHECK(registry.OutstandingSlotsForInitiator(77, nobodyJoined) == 1); // anti-dup retained
     LIVING_CHECK(registry.OutstandingSlotsForInitiator(77, joined7001) == 0);   // joined -> no deficit
 
-    // A differently-configured request opens a FRESH batch instead of being refused.
+    // Once the dependency is JOINED, a differently-configured request opens a
+    // FRESH batch instead of being refused.
     CreationBatchRegistry::Batch b;
     b.initiatorGuid = 77;
     b.desiredSize = 3;
@@ -817,13 +821,14 @@ LIVING_TEST(creation_batch_extension_grows_replacement_budget_by_positive_delta)
     registry.OnCreationTerminal(MakeCompletion(71, CreationPollStatus::FailedRetryable, 0), 1); // 5 -> 4
     LIVING_CHECK(registry.Find(token)->replacementBudget == 4);
 
-    LIVING_CHECK(registry.ExtendDesiredSize(token, 40));         // +35 delta
+    auto nobodyJoined = [](uint32_t) { return false; };
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 40, 0, nobodyJoined)); // +35 delta
     LIVING_CHECK(registry.Find(token)->desiredSize == 40);
     LIVING_CHECK(registry.Find(token)->replacementBudget == 39); // 4 + 35 (pre-fix: stuck at 4)
 
-    LIVING_CHECK(registry.ExtendDesiredSize(token, 40));         // equal: no-op
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 40, 0, nobodyJoined)); // equal: no-op
     LIVING_CHECK(registry.Find(token)->replacementBudget == 39);
-    LIVING_CHECK(registry.ExtendDesiredSize(token, 10));         // smaller: never shrinks
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 10, 0, nobodyJoined)); // smaller: never shrinks
     LIVING_CHECK(registry.Find(token)->desiredSize == 40);
     LIVING_CHECK(registry.Find(token)->replacementBudget == 39);
 }
@@ -935,4 +940,150 @@ LIVING_TEST(creation_batch_registry_is_bounded_and_prunes_expired)
     LIVING_CHECK(registry.BatchCount() == CreationBatchRegistry::kMaxBatches);
     registry.PruneExpired(1 + CreationBatchRegistry::kRetentionPumps);
     LIVING_CHECK(registry.BatchCount() == CreationBatchRegistry::kMaxBatches - 1);
+}
+
+// PlanGroupBatchRequest is the exact ownership/accounting decision HandleGroup
+// runs for every repeated group request; these tests drive the same decision
+// flow the handler follows (plan -> reject / extend / credit / begin) instead
+// of manually assembling a second batch around the registry.
+
+namespace
+{
+    GroupBatchOptions Options(std::string gear, bool autoAdd = false, bool temporary = false,
+        bool randomAccounts = false)
+    {
+        GroupBatchOptions options;
+        options.gear = std::move(gear);
+        options.autoAdd = autoAdd;
+        options.temporary = temporary;
+        options.useRandomAccounts = randomAccounts;
+        return options;
+    }
+}
+
+LIVING_TEST(group_batch_request_plan_rejects_changed_options_over_retained_unjoined_members)
+{
+    // Completed retained batch with a finalized-but-unjoined member, then the
+    // SAME size requested with different options. The old flow skipped the
+    // compatibility gate (no ACTIVE batch), credited the unjoined member, and
+    // silently queued nothing under the new options.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 77;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.members.push_back(PendingMember(51, 1, 1));
+    registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(51, CreationPollStatus::Created, 7001), 1);
+
+    auto nobodyJoined = [](uint32_t) { return false; };
+
+    GroupBatchRequestPlan plan = PlanGroupBatchRequest(registry, 77, nobodyJoined,
+        /*live*/ 1, /*requested*/ 2, Options("default"));
+    LIVING_CHECK(plan.action == GroupBatchRequestAction::RejectIncompatible);
+    LIVING_CHECK(plan.outstandingSlots == 1); // reported in the explicit refusal
+
+    // The SAME options are compatible: the dependency is explicitly credited
+    // and the request is already covered - a deliberate message, not silence.
+    plan = PlanGroupBatchRequest(registry, 77, nobodyJoined, 1, 2, Options("epic"));
+    LIVING_CHECK(plan.action == GroupBatchRequestAction::AlreadyCovered);
+    LIVING_CHECK(plan.outstandingSlots == 1 && plan.effectiveMembers == 2);
+
+    // Once the member joins, no dependency remains: different options may
+    // begin a fresh batch.
+    auto joined7001 = [](uint32_t guid) { return guid == 7001; };
+    plan = PlanGroupBatchRequest(registry, 77, joined7001, 2, 2, Options("default"));
+    LIVING_CHECK(plan.action == GroupBatchRequestAction::AlreadyCovered);
+    LIVING_CHECK(plan.outstandingSlots == 0);
+    plan = PlanGroupBatchRequest(registry, 77, joined7001, 2, 5, Options("default"));
+    LIVING_CHECK(plan.action == GroupBatchRequestAction::BeginNew);
+}
+
+LIVING_TEST(group_batch_request_plan_credits_dependencies_without_false_undersize)
+{
+    // Completed-unjoined batch followed by a compatible LARGER request: the
+    // fresh batch credits the dependency in its baseline, queues only the
+    // residual, and its completion must NOT report a false undersize for the
+    // slot the older batch's ledger still owns.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 88;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.members.push_back(PendingMember(61, 1, 1));
+    registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(61, CreationPollStatus::Created, 8001), 1);
+
+    auto nobodyJoined = [](uint32_t) { return false; };
+
+    GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 88, nobodyJoined,
+        /*live*/ 1, /*requested*/ 4, Options("epic"));
+    LIVING_CHECK(plan.action == GroupBatchRequestAction::BeginNew);
+    LIVING_CHECK(plan.outstandingSlots == 1);
+    LIVING_CHECK(plan.creditedPreexisting == 2); // live + credited dependency
+
+    // The handler's follow-through: residual deficit is 4 - 2 = 2 members.
+    CreationBatchRegistry::Batch b;
+    b.initiatorGuid = 88;
+    b.desiredSize = 4;
+    b.preexistingMembers = plan.creditedPreexisting;
+    b.members = { PendingMember(62, 2, 2), PendingMember(63, 3, 4) };
+    uint64_t const tokenB = registry.Begin(std::move(b));
+
+    registry.OnCreationTerminal(MakeCompletion(62, CreationPollStatus::Created, 8002), 2);
+    registry.OnCreationTerminal(MakeCompletion(63, CreationPollStatus::Created, 8003), 3);
+
+    BatchPollResult const result = registry.Poll(tokenB, false);
+    LIVING_CHECK(result.status == BatchPollStatus::Complete);
+    LIVING_CHECK(!result.undersized); // pre-fix: 1 + 2 < 4 -> false undersize
+    LIVING_CHECK(result.failures.empty());
+}
+
+LIVING_TEST(group_batch_extension_refreshes_live_membership_baseline)
+{
+    // Live membership grows (unrelated players join) while a batch is active;
+    // a compatible extension must adopt the fresh baseline. The batch's own
+    // already-joined finalized member is subtracted so it is never counted
+    // both as preexisting and as finalized.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch batch;
+    batch.initiatorGuid = 99;
+    batch.desiredSize = 3;
+    batch.preexistingMembers = 1; // master alone at Begin
+    batch.memberGear = "epic";
+    batch.members = { PendingMember(71, 1, 1), PendingMember(72, 2, 2) };
+    uint64_t const token = registry.Begin(std::move(batch));
+
+    // One member finalizes and JOINS; additionally two unrelated players
+    // joined the live group: live membership is now 1 + 1 (own) + 2 = 4.
+    registry.OnCreationTerminal(MakeCompletion(71, CreationPollStatus::Created, 9001), 1);
+    auto joined9001 = [](uint32_t guid) { return guid == 9001; };
+
+    GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 99, joined9001,
+        /*live*/ 4, /*requested*/ 6, Options("epic"));
+    LIVING_CHECK(plan.action == GroupBatchRequestAction::ExtendExisting);
+    LIVING_CHECK(plan.existingToken == token);
+    LIVING_CHECK(plan.outstandingSlots == 1); // only the still-pending member
+
+    LIVING_CHECK(registry.ExtendDesiredSize(token, 6, /*live*/ 4, joined9001));
+    // Baseline: 4 live minus the batch's own joined member = 3.
+    LIVING_CHECK(registry.Find(token)->preexistingMembers == 3);
+    LIVING_CHECK(registry.Find(token)->desiredSize == 6);
+
+    // Residual deficit the extension queues: 6 - (4 live + 1 outstanding) = 1.
+    registry.AddPendingMember(token, PendingMember(73, 3, 4));
+
+    registry.OnCreationTerminal(MakeCompletion(72, CreationPollStatus::Created, 9002), 2);
+    registry.OnCreationTerminal(MakeCompletion(73, CreationPollStatus::Created, 9003), 3);
+
+    BatchPollResult const result = registry.Poll(token, false);
+    LIVING_CHECK(result.status == BatchPollStatus::Complete);
+    // 3 preexisting + 3 finalized >= 6: the stale baseline (1) would have
+    // reported this complete group as undersized.
+    LIVING_CHECK(!result.undersized);
 }
