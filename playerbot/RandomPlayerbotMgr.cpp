@@ -898,17 +898,65 @@ void RandomPlayerbotMgr::ScaleBotActivity()
     }
 }
 
+void RandomPlayerbotMgr::ReconstructPostCreateOwners()
+{
+    // COUNT-first over the JOINed scan so "no unsettled markers" is
+    // distinguishable from "could not ask": the pinned cores return a null
+    // result for BOTH an empty row set and a failed query.
+    static char const* kScanCondition =
+        "ai_playerbot_random_bots.owner = 0 AND ai_playerbot_random_bots.event IN "
+        "('create levelup', 'create gear', 'create group', 'test')";
+
+    std::map<uint32, uint32> scanned;
+    bool scanSucceeded = false;
+    if (auto countResult = CharacterDatabase.PQuery(
+            "SELECT COUNT(DISTINCT ai_playerbot_random_bots.bot) FROM ai_playerbot_random_bots "
+            "JOIN characters ON characters.guid = ai_playerbot_random_bots.bot WHERE %s", kScanCondition))
+    {
+        if (countResult->Fetch()[0].GetUInt32() == 0)
+            scanSucceeded = true; // confirmed: nothing unsettled
+        else if (auto rows = CharacterDatabase.PQuery(
+            "SELECT DISTINCT ai_playerbot_random_bots.bot, characters.account FROM ai_playerbot_random_bots "
+            "JOIN characters ON characters.guid = ai_playerbot_random_bots.bot WHERE %s", kScanCondition))
+        {
+            do
+            {
+                Field* fields = rows->Fetch();
+                scanned[fields[0].GetUInt32()] = fields[1].GetUInt32();
+            } while (rows->NextRow());
+            scanSucceeded = true;
+        }
+    }
+
+    if (!scanSucceeded)
+        sLog.outError("ReconstructPostCreateOwners: durable marker scan failed; existing owners are kept");
+    else if (!scanned.empty())
+        sLog.outString("Reconstructed %zu post-create scheduler owner(s) from durable markers", scanned.size());
+
+    postCreateOwners = living::ReconcilePostCreateOwners(postCreateOwners, scanSucceeded, scanned);
+}
+
 void RandomPlayerbotMgr::LoginFreeBots()
 {
-    // Barrier results queued by SQL callbacks are applied before the sweep so
-    // a marker whose save provably executed can clear in this same pass.
-    DrainPostCreateSaveBarriers();
+    // Verification results queued by SQL callbacks are applied before the
+    // sweep so a marker whose postcondition was proven can clear this pass.
+    DrainPostCreateSaveVerifies();
 
-    if (!sPlayerbotAIConfig.freeAltBots.empty() && sPlayerbotAIConfig.botAutologin != BotAutoLogin::LOGIN_ONLY_ALWAYS_ACTIVE)
+    if ((!sPlayerbotAIConfig.freeAltBots.empty() || !postCreateOwners.empty())
+        && sPlayerbotAIConfig.botAutologin != BotAutoLogin::LOGIN_ONLY_ALWAYS_ACTIVE)
     {
         std::vector<std::pair<uint32, uint32>> botsToRemove;
 
-        for (auto [accountId, botGuid] : sPlayerbotAIConfig.freeAltBots)
+        // The sweep services the always-online membership AND the transient
+        // post-create owners: a bot whose durable markers are unsettled keeps
+        // its scheduler even when it is not (or no longer) always-online.
+        std::vector<std::pair<uint32, uint32>> sweep(sPlayerbotAIConfig.freeAltBots.begin(),
+            sPlayerbotAIConfig.freeAltBots.end());
+        for (auto const& [ownerGuid, ownerAccount] : postCreateOwners)
+            if (!sPlayerbotAIConfig.IsFreeAltBot(ownerGuid))
+                sweep.push_back({ ownerAccount, ownerGuid });
+
+        for (auto [accountId, botGuid] : sweep)
         {
             ObjectGuid guid(ObjectGuid(HIGHGUID_PLAYER, botGuid));
             Player* bot = sObjectMgr.GetPlayer(guid, false);
@@ -965,14 +1013,26 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 };
 
                 // Destructive one-shot marker (create levelup / create gear):
-                // the durable two-phase consume. Phase 1->2 is execution-
-                // confirmed BEFORE the effect; the effect's character save is
-                // queued explicitly (Randomize may skip its own SaveToDB under
-                // DB delay) and proven executed by an async barrier query on
-                // the same FIFO thread; only then is the durable intent
-                // cleared. A fresh process finding phase 2 never replays the
-                // effect - ambiguous destructive work is disclosed and
-                // cleared, not blindly re-run on possibly-post-effect state.
+                // the fingerprint-verified durable consume. The effect runs
+                // FIRST (phase 1 durably implies the character state is still
+                // pre-effect, so a restart's re-apply is a safe first
+                // application), the phase-2 record with PRE/POST equipment
+                // fingerprints is execution-confirmed after it, the save is
+                // queued explicitly (Randomize may skip its own SaveToDB
+                // under DB delay), and the intent is cleared only once the
+                // execution-ordered readback PROVES the recorded postcondition
+                // landed. Recovery reconciles fingerprints: proven-durable
+                // clears, provably-lost rewinds to phase 1 and re-applies,
+                // ambiguity quarantines with an actionable error.
+                auto equipmentHash = [&]() -> uint64
+                {
+                    std::vector<std::pair<uint8, uint32>> slotItems;
+                    for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
+                        if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                            slotItems.push_back({ slot, item->GetGUIDLow() });
+                    return living::HashEquipmentState(slotItems);
+                };
+
                 auto consumeDurableOneShot = [&](char const* marker, auto&& applyEffect) -> bool
                 {
                     uint32 phase = 0;
@@ -980,48 +1040,113 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         return false; // unknown state: no effect, keep ownership
 
                     living::DurableOneShotMarker& ledger = durableOneShotMarkers[botGuid][marker];
+
+                    // Confirmed clear of a proven marker; retried alone.
+                    auto clearProven = [&]() -> bool
+                    {
+                        bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
+                        if (ledger.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
+                                                         : living::EventWriteResult::StateUnknown))
+                        {
+                            durableOneShotMarkers[botGuid].erase(marker);
+                            return true;
+                        }
+                        return false;
+                    };
+
+                    // Durably record phase 2 with the fingerprints, then queue
+                    // the save and request the postcondition verification.
+                    auto recordThenSaveAndVerify = [&]() -> bool
+                    {
+                        if (!ledger.phaseRecorded)
+                        {
+                            if (!sRandomPlayerbotMgr.SetValue(botGuid, marker, living::kMarkerPhaseApplied,
+                                    living::EncodeDurableMarkerData(ledger.originalData, ledger.preHash, ledger.postHash)))
+                                return false; // retry the record alone next pass
+                            ledger.OnPhaseRecorded();
+                        }
+
+                        bot->SaveToDB();
+                        ledger.OnVerifyRequested(RequestPostCreateSaveVerify(botGuid, marker,
+                            ledger.postHash, ledger.BeginVerify()));
+                        return false;
+                    };
+
                     switch (ledger.Plan(phase))
                     {
                         case living::DurableMarkerStep::Idle:
                             durableOneShotMarkers[botGuid].erase(marker);
                             return true;
-                        case living::DurableMarkerStep::AdvanceThenApply:
+                        case living::DurableMarkerStep::ApplyThenRecord:
                         {
-                            // The phase write must preserve the marker's data
-                            // payload (gear quality etc.).
                             std::string const data = sRandomPlayerbotMgr.GetData(botGuid, marker);
-                            if (!sRandomPlayerbotMgr.SetValue(botGuid, marker, living::kMarkerPhaseApplied, data))
-                                return false; // unconfirmed advance: retry later, effect NOT run
-
-                            if (!ledger.effectApplied)
-                            {
-                                applyEffect();
-                                ledger.OnEffectApplied();
-                            }
-                            bot->SaveToDB();
-                            ledger.OnBarrierRequested(RequestPostCreateSaveBarrier(botGuid, marker));
-                            return false;
+                            uint64 const pre = equipmentHash();
+                            applyEffect();
+                            ledger.OnEffectApplied(pre, equipmentHash(), data);
+                            return recordThenSaveAndVerify();
                         }
-                        case living::DurableMarkerStep::AwaitBarrier:
-                            if (!ledger.barrierRequested)
-                                ledger.OnBarrierRequested(RequestPostCreateSaveBarrier(botGuid, marker));
-                            return false;
-                        case living::DurableMarkerStep::RecoverNoReplay:
-                            sLog.outError("Bot %u: post-create marker '%s' was in applied phase from a previous run; "
-                                "the effect is NOT replayed (its durability is ambiguous) and the marker is cleared",
-                                botGuid, marker);
-                            [[fallthrough]]; // to the confirmed clear
-                        case living::DurableMarkerStep::ClearConfirmed:
-                        {
-                            bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
-                            if (ledger.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
-                                                             : living::EventWriteResult::StateUnknown))
+                        case living::DurableMarkerStep::RecordApplied:
+                        case living::DurableMarkerStep::SaveAndVerify:
+                            return recordThenSaveAndVerify();
+                        case living::DurableMarkerStep::AwaitVerify:
+                            // Lost-callback watchdog: a timed-out wait abandons
+                            // the stale generation (its late result will be
+                            // ignored) and re-requests, bounded.
+                            if (ledger.TickAwaitingVerify())
                             {
-                                durableOneShotMarkers[botGuid].erase(marker);
+                                if (ledger.quarantined)
+                                    sLog.outError("Bot %u: post-create marker '%s' could not be verified durable "
+                                        "(lost callbacks exhausted the bounded attempts); it is retained quarantined - "
+                                        "inspect the character and clear the marker manually", botGuid, marker);
+                                else
+                                    ledger.OnVerifyRequested(RequestPostCreateSaveVerify(botGuid, marker,
+                                        ledger.postHash, ledger.BeginVerify()));
+                            }
+                            return false;
+                        case living::DurableMarkerStep::ClearConfirmed:
+                            return clearProven();
+                        case living::DurableMarkerStep::RecoverProbe:
+                        {
+                            std::string originalData;
+                            uint64 recordedPre = 0, recordedPost = 0;
+                            if (!living::TryDecodeDurableMarkerData(sRandomPlayerbotMgr.GetData(botGuid, marker),
+                                    originalData, recordedPre, recordedPost))
+                            {
+                                // Phase 2 without decodable fingerprints:
+                                // nothing can be proven - quarantine, never
+                                // silently clear or replay.
+                                ledger.MarkQuarantined();
+                                sLog.outError("Bot %u: post-create marker '%s' is in applied phase with an undecodable "
+                                    "record; it is retained quarantined - inspect the character and clear it manually",
+                                    botGuid, marker);
                                 return true;
                             }
-                            return false;
+
+                            switch (living::DurableOneShotMarker::Reconcile(equipmentHash(), recordedPre, recordedPost))
+                            {
+                                case living::DurableOneShotMarker::RecoverDecision::ProvenDurable:
+                                    ledger.MarkProven();
+                                    return clearProven();
+                                case living::DurableOneShotMarker::RecoverDecision::ReapplySafe:
+                                    // The effect provably never persisted:
+                                    // rewind the record to phase 1 with the
+                                    // original payload (confirmed write); the
+                                    // next pass re-applies as a fresh, safe
+                                    // first application.
+                                    sRandomPlayerbotMgr.SetValue(botGuid, marker, living::kMarkerPhasePending, originalData);
+                                    return false;
+                                case living::DurableOneShotMarker::RecoverDecision::Ambiguous:
+                                default:
+                                    ledger.MarkQuarantined();
+                                    sLog.outError("Bot %u: post-create marker '%s' recorded an applied effect whose "
+                                        "durable outcome matches neither its pre nor post state; it is retained "
+                                        "quarantined - inspect the character and clear the marker manually",
+                                        botGuid, marker);
+                                    return true;
+                            }
                         }
+                        case living::DurableMarkerStep::Quarantined:
+                            return true; // retained durable row; explicitly quarantined
                     }
                     return false;
                 };
@@ -1086,11 +1211,16 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     bool membershipVerified = false;
                     if (target)
                     {
-                        master = target;
                         bot->GetPlayerbotAI()->DoSpecificAction("join", Event("create group", "", target));
                         // Verify the RESULTING membership; the action's return
-                        // value alone cannot prove the invite stuck.
+                        // value alone cannot prove the invite stuck. Only a
+                        // VERIFIED membership promotes the candidate target to
+                        // the post-create master - a failed/full-group attempt
+                        // must not teleport the bot to the target or leak the
+                        // target's level into gear processing on every retry.
                         membershipVerified = bot->GetGroup() && bot->GetGroup() == target->GetGroup();
+                        if (membershipVerified)
+                            master = target;
                     }
 
                     living::GroupJoinPlan const plan = living::PlanGroupJoinAttempt(
@@ -1136,6 +1266,27 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 }
                 postCreateSettled &= groupJoinSettled;
 
+                // gear=sync/upgrade is DEFINED against the verified master's
+                // level. While the join is still retryable the un-applied gear
+                // marker is retained (deferred, not consumed); a terminal join
+                // outcome settles it with the bot's own level as the fallback.
+                // Already-applied phases (2+) proceed regardless - only their
+                // durability confirmation remains.
+                uint32 gearPhase = 0;
+                bool const gearKnown = sRandomPlayerbotMgr.TryGetEventValue(botGuid, "create gear", gearPhase);
+                bool const gearNeedsMaster = gearKnown && gearPhase == living::kMarkerPhasePending
+                    && [&]() {
+                        std::string const gearData = sRandomPlayerbotMgr.GetData(botGuid, "create gear");
+                        return gearData == "sync" || gearData == "upgrade";
+                    }();
+                if (!gearKnown
+                    || (gearPhase == living::kMarkerPhasePending
+                        && !living::MayApplyMasterDerivedGear(gearNeedsMaster, groupJoinSettled, master != nullptr)))
+                {
+                    postCreateSettled = false; // unknown read, or deferred until the join settles
+                }
+                else
+                {
                 postCreateSettled &= consumeDurableOneShot("create gear", [&]()
                 {
                     std::string gear = sRandomPlayerbotMgr.GetData(botGuid, "create gear");
@@ -1188,6 +1339,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         factory.EquipGear();
                     }
                 });
+                }
 
                 postCreateSettled &= consumeOneShot("test", [&]()
                 {
@@ -1234,6 +1386,12 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 {
                     botsToRemove.push_back({accountId, botGuid});
                 }
+
+                // The transient owner releases on its own condition: all
+                // post-create work settled or explicitly quarantined,
+                // regardless of always-online membership.
+                if (postCreateSettled)
+                    postCreateOwners.erase(botGuid);
             }
         }
 
@@ -1243,50 +1401,87 @@ void RandomPlayerbotMgr::LoginFreeBots()
     }
 }
 
-bool RandomPlayerbotMgr::RequestPostCreateSaveBarrier(uint32 botGuid, std::string const& marker)
+bool RandomPlayerbotMgr::RequestPostCreateSaveVerify(uint32 botGuid, std::string const& marker,
+    uint64 expectedHash, uint32 generation)
 {
-    // Execution-ordered barrier: this async query is queued on the same FIFO
-    // delay thread AFTER the effect's SaveToDB transaction, so its callback
-    // observing ANY materialized result proves that save executed. AsyncPQuery
-    // reports enqueue failure via a false return in all three pinned cores;
-    // the caller re-requests on a later pass.
-    uint64 const barrierToken = nextSaveBarrierToken++;
-    if (!CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandlePostCreateSaveBarrier, barrierToken,
-            "SELECT COUNT(*) FROM characters WHERE guid = '%u'", botGuid))
+    // Execution-ordered postcondition readback: queued on the same FIFO delay
+    // thread AFTER the effect's SaveToDB transaction, it observes the STORED
+    // equipment rows once that save executed (committed or rolled back) and
+    // proves whether the intended state landed - not merely that something
+    // ran. The UNION ALL sentinel row guarantees at least one row on success,
+    // so a null result is a FAILED query, never an empty equipment set.
+    // AsyncPQuery reports enqueue failure via a false return in all three
+    // pinned cores; the caller consumes a bounded attempt and re-requests.
+    uint64 const verifyToken = nextSaveVerifyToken++;
+    if (!CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandlePostCreateSaveVerify, verifyToken,
+            "(SELECT slot, item FROM character_inventory WHERE guid = '%u' AND bag = '0' AND slot < '%u') "
+            "UNION ALL (SELECT 255, 0) ORDER BY slot", botGuid, uint32(EQUIPMENT_SLOT_END)))
         return false;
 
-    saveBarrierTokens[barrierToken] = PostCreateSaveBarrier{ botGuid, marker };
+    saveVerifyTokens[verifyToken] = PostCreateSaveVerify{ botGuid, marker, expectedHash, generation };
     return true;
 }
 
-void RandomPlayerbotMgr::HandlePostCreateSaveBarrier(QueryResult* result, uint64 barrierToken)
+void RandomPlayerbotMgr::HandlePostCreateSaveVerify(QueryResult* result, uint64 verifyToken)
 {
     // SQL result callback: parse + enqueue only (the same deadlock contract as
-    // the creation finalizer - no database work, no ledger decisions here). A
-    // null result is a FAILED query, not proof of execution.
-    saveBarrierResults.push_back({ barrierToken, result != nullptr });
+    // the creation finalizer - no database work, no ledger decisions here).
+    PostCreateSaveVerifyResult verify;
+    verify.token = verifyToken;
+    if (result)
+    {
+        std::vector<std::pair<uint8, uint32>> slotItems;
+        do
+        {
+            Field* fields = result->Fetch();
+            uint32 const slot = fields[0].GetUInt32();
+            if (slot >= EQUIPMENT_SLOT_END)
+                continue; // the always-present sentinel row
+
+            slotItems.push_back({ static_cast<uint8>(slot), fields[1].GetUInt32() });
+        } while (result->NextRow());
+
+        verify.queryOk = true;
+        verify.actualHash = living::HashEquipmentState(slotItems);
+    }
     delete result;
+
+    saveVerifyResults.push_back(verify);
 }
 
-void RandomPlayerbotMgr::DrainPostCreateSaveBarriers()
+void RandomPlayerbotMgr::DrainPostCreateSaveVerifies()
 {
-    for (auto const& [barrierToken, executed] : saveBarrierResults)
+    for (auto const& result : saveVerifyResults)
     {
-        auto tokenIt = saveBarrierTokens.find(barrierToken);
-        if (tokenIt == saveBarrierTokens.end())
+        auto tokenIt = saveVerifyTokens.find(result.token);
+        if (tokenIt == saveVerifyTokens.end())
             continue; // stale token (ledger forgotten on guid reuse): ignored
 
-        if (auto botMarkers = durableOneShotMarkers.find(tokenIt->second.botGuid);
+        PostCreateSaveVerify const& request = tokenIt->second;
+        if (auto botMarkers = durableOneShotMarkers.find(request.botGuid);
             botMarkers != durableOneShotMarkers.end())
         {
-            if (auto marker = botMarkers->second.find(tokenIt->second.marker);
+            if (auto marker = botMarkers->second.find(request.marker);
                 marker != botMarkers->second.end())
-                marker->second.OnBarrierResult(executed);
+            {
+                // The ledger itself drops results from superseded generations
+                // (a late callback after a watchdog re-arm).
+                living::DurableOneShotMarker::VerifyOutcome const outcome = !result.queryOk
+                    ? living::DurableOneShotMarker::VerifyOutcome::QueryFailed
+                    : (result.actualHash == request.expectedHash
+                        ? living::DurableOneShotMarker::VerifyOutcome::Match
+                        : living::DurableOneShotMarker::VerifyOutcome::Mismatch);
+                if (marker->second.OnVerifyResult(request.generation, outcome)
+                    == living::MarkerVerifyAction::Quarantined)
+                    sLog.outError("Bot %u: post-create marker '%s' could not be verified durable after bounded attempts; "
+                        "it is retained quarantined - inspect the character and clear the marker manually",
+                        request.botGuid, request.marker.c_str());
+            }
         }
 
-        saveBarrierTokens.erase(tokenIt);
+        saveVerifyTokens.erase(tokenIt);
     }
-    saveBarrierResults.clear();
+    saveVerifyResults.clear();
 }
 
 void RandomPlayerbotMgr::DelayedFacingFix()

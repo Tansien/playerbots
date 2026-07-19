@@ -674,6 +674,15 @@ void RandomPlayerbotFactory::CreateRandomBots()
                             }
 
                             sRandomPlayerbotMgr.OnPlayerLoginError(guidlo);
+                            // Deliberately NOT routed through DeleteBot/the durable
+                            // deletion confirmer: this is the config-driven wholesale
+                            // reset (DeleteRandomBots), which re-selects and re-deletes
+                            // EVERY character on the bot accounts on each startup until
+                            // none remain - the config flag itself is the durable,
+                            // restart-surviving intent, and per-guid intents/adoptions
+                            // for thousands of characters would only flood the bounded
+                            // confirmer. Event-row cleanup for these characters is the
+                            // absence-predicated statement below.
                             Player::DeleteFromDB(guid, accId, false, true);       // no need to update realm characters
                             //dels.push_back(std::async([guid, accId] {Player::DeleteFromDB(guid, accId, false, true); }));
 

@@ -156,9 +156,16 @@ public:
     // Adopts durable ownership of an ALREADY-QUEUED character deletion: login
     // eligibility (freeAltBots) is revoked immediately, and the character's
     // event rows/markers are cleared only after an execution-ordered readback
-    // confirms the row absent (DeleteFromDB returning is never success).
-    // DeleteBot calls this for every deletion path, live or offline.
-    static void AdoptCharacterDeletion(uint32 guid, uint32 accountId);
+    // confirms the row absent (DeleteFromDB returning is never success) or the
+    // guid proven reused by a different identity (`expectedName` records the
+    // identity for that comparison). DeleteBot calls this for every deletion
+    // path, live or offline.
+    static void AdoptCharacterDeletion(uint32 guid, uint32 accountId, std::string const& expectedName);
+    // Re-adopts every durable deletion intent ('delete' event rows) at
+    // startup/config reload: a lost queued deletion is re-run, an absent or
+    // guid-reused character is adopted for confirmation/cleanup only. A
+    // failed scan leaves the intent rows untouched.
+    static void ReadoptPendingDeletions();
     // Internal surface for the deletion confirmer: fires the OnBotDeleted
     // account-cleanup hook once absence is CONFIRMED (only then is the
     // durable character count truthful about the deletion).

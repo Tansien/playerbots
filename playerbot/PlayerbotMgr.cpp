@@ -2348,16 +2348,34 @@ namespace ai
     public:
         living::DurableCharacterDeletions core;
 
-        void HandleAbsenceVerify(QueryResult* result, uint32 guid)
+        // The AsyncPQuery parameter packs (generation << 32 | guid) so a late
+        // callback from a superseded request generation is distinguishable.
+        void HandleAbsenceVerify(QueryResult* result, uint64 packed)
         {
+            uint32 const guid = static_cast<uint32>(packed & 0xFFFFFFFFull);
+            uint32 const generation = static_cast<uint32>(packed >> 32);
+
             living::RowVerifyOutcome outcome = living::RowVerifyOutcome::QueryFailed;
             if (result)
-                outcome = result->Fetch()[0].GetUInt32() == 0
-                    ? living::RowVerifyOutcome::Absent
-                    : living::RowVerifyOutcome::Verified; // still present
+            {
+                Field* fields = result->Fetch();
+                if (fields[0].GetUInt32() == 0)
+                    outcome = living::RowVerifyOutcome::Absent;
+                else
+                {
+                    // Identity check against the recorded name: a row under a
+                    // DIFFERENT name proves the guid was reused by a new
+                    // character (the original deletion succeeded). An empty
+                    // recorded name degrades to presence-only (Verified).
+                    std::string const expected = core.ExpectedNameFor(guid);
+                    outcome = !expected.empty() && fields[1].GetCppString() != expected
+                        ? living::RowVerifyOutcome::IdentityMismatch
+                        : living::RowVerifyOutcome::Verified; // still present
+                }
+            }
             delete result;
 
-            core.OnAbsenceVerify(guid, outcome);
+            core.OnAbsenceVerify(guid, generation, outcome);
         }
 
         living::CharacterDeletionOps Ops()
@@ -2367,14 +2385,22 @@ namespace ai
             {
                 Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, guid), accountId, true, true);
             };
-            ops.requestAbsenceVerify = [this](uint32 guid) -> bool
+            ops.requestAbsenceVerify = [this](uint32 guid, uint32 generation) -> bool
             {
-                // COUNT always yields one row on success, so a null callback
-                // result is a FAILED query, never absence. The query is queued
-                // on the same FIFO thread as the deletion transaction, so its
-                // execution is ordered behind it.
-                return CharacterDatabase.AsyncPQuery(this, &BotDeletionConfirmer::HandleAbsenceVerify, guid,
-                    "SELECT COUNT(*) FROM characters WHERE guid = '%u'", guid);
+                // COUNT + MIN(name) always yields one row on success, so a
+                // null callback result is a FAILED query, never absence. The
+                // query is queued on the same FIFO thread as the deletion
+                // transaction, so its execution is ordered behind it.
+                uint64 const packed = (static_cast<uint64>(generation) << 32) | guid;
+                return CharacterDatabase.AsyncPQuery(this, &BotDeletionConfirmer::HandleAbsenceVerify, packed,
+                    "SELECT COUNT(*), MIN(name) FROM characters WHERE guid = '%u'", guid);
+            };
+            ops.clearIntent = [](uint32 guid) -> bool
+            {
+                // Execution-confirmed removal of ONLY the deletion-intent row:
+                // the guid is occupied by a new identity whose own event rows
+                // must not be touched.
+                return sRandomPlayerbotMgr.SetValue(guid, "delete", 0);
             };
             ops.clearMetadata = [](uint32 guid) -> bool
             {
@@ -2388,6 +2414,7 @@ namespace ai
                 auto it = std::remove_if(sPlayerbotAIConfig.freeAltBots.begin(), sPlayerbotAIConfig.freeAltBots.end(),
                     [guid](std::pair<uint32, uint32> entry) { return entry.second == guid; });
                 sPlayerbotAIConfig.freeAltBots.erase(it, sPlayerbotAIConfig.freeAltBots.end());
+                sRandomPlayerbotMgr.ForgetPostCreateOwner(guid);
             };
             ops.onConfirmedDeleted = [](uint32 guid, uint32 accountId)
             {
@@ -2441,9 +2468,50 @@ void PlayerbotHolder::AbandonBatchToken(uint64 batchToken)
     ai::botCreationCleanup.AdoptBatch(batchToken);
 }
 
-void PlayerbotHolder::AdoptCharacterDeletion(uint32 guid, uint32 accountId)
+void PlayerbotHolder::AdoptCharacterDeletion(uint32 guid, uint32 accountId, std::string const& expectedName)
 {
-    ai::botDeletionConfirmer.core.Adopt(guid, accountId, ai::botDeletionConfirmer.Ops());
+    ai::botDeletionConfirmer.core.Adopt(guid, accountId, expectedName, ai::botDeletionConfirmer.Ops());
+}
+
+void PlayerbotHolder::ReadoptPendingDeletions()
+{
+    // Durable deletion intents ('delete' event rows, written by DeleteBot
+    // BEFORE the deletion is queued) are re-adopted at startup/reload, so a
+    // crash between queueing DeleteFromDB and its confirmed absence can never
+    // silently lose an ordinary deletion. A character still present under the
+    // RECORDED name re-runs the full deletion path; an absent or renamed
+    // (guid-reused) character is adopted for confirmation only - the verify
+    // readback then clears metadata or just the intent. A failed scan leaves
+    // the intent rows untouched: nothing is forgotten either way.
+    auto result = CharacterDatabase.Query(
+        "SELECT r.bot, r.data, c.name, c.account FROM ai_playerbot_random_bots r "
+        "LEFT JOIN characters c ON c.guid = r.bot WHERE r.owner = 0 AND r.event = 'delete'");
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const guid = fields[0].GetUInt32();
+        std::string const recordedName = fields[1].GetCppString();
+        bool const present = !fields[2].IsNULL();
+        std::string const currentName = present ? fields[2].GetCppString() : std::string();
+        uint32 const accountId = present ? fields[3].GetUInt32() : 0;
+
+        // Re-adoption is idempotent: Adopt deduplicates and DeleteBot's
+        // re-queued DeleteFromDB is idempotent, so a GM config reload while a
+        // deletion is mid-confirmation is harmless.
+        switch (living::PlanDeletionIntentRecovery(present, currentName, recordedName))
+        {
+            case living::DeletionIntentRecovery::RequeueDeletion:
+                sLog.outDetail("Re-adopting lost character deletion for guid %u ('%s')", guid, recordedName.c_str());
+                sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
+                break;
+            case living::DeletionIntentRecovery::AdoptForConfirmation:
+                AdoptCharacterDeletion(guid, accountId, recordedName);
+                break;
+        }
+    } while (result->NextRow());
 }
 
 void PlayerbotHolder::OnCharacterDeletionConfirmed(uint32 guid, uint32 accountId)
@@ -2676,6 +2744,19 @@ namespace ai
                 result.status, result.creationToken, result.createdClass, pumpCount, result.createdRole);
         }
 
+        // Re-evaluate credited predecessor dependencies BEFORE surfacing
+        // completion: a credit whose member joined confirms into the
+        // baseline; one whose predecessor expired is replaced within the
+        // bounded budget or recorded - a fresh batch can never report a
+        // full-size success on vanished credit.
+        botCreationBatches.ReevaluateCredits(pumpCount,
+            [](uint32 initiatorGuid, uint32 memberGuid) -> bool
+            {
+                Player* initiator = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, initiatorGuid));
+                return initiator && initiator->GetGroup()
+                    && initiator->GetGroup()->IsMember(ObjectGuid(HIGHGUID_PLAYER, memberGuid));
+            });
+
         // Surface completed batches exactly once - the requested group is
         // never left silently undersized.
         for (living::CreationBatchRegistry::Batch const* batch : botCreationBatches.TakeNewlyCompleted())
@@ -2687,8 +2768,9 @@ namespace ai
 
             std::ostringstream summary;
             summary << "batch complete: " << finalized << " member(s) finalized";
-            uint32 const wanted = batch->desiredSize > batch->preexistingMembers
-                ? batch->desiredSize - batch->preexistingMembers : 0;
+            uint32 const effectivePreexisting = batch->EffectivePreexisting();
+            uint32 const wanted = batch->desiredSize > effectivePreexisting
+                ? batch->desiredSize - effectivePreexisting : 0;
             if (finalized < wanted)
                 summary << " of " << wanted << " requested";
             if (!batch->failures.empty())
@@ -3292,10 +3374,12 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     living::GroupCreationLedger ledger;
     std::vector<living::CreationBatchMember> batchMembers;
     // A fresh batch's baseline EXPLICITLY credits the outstanding dependencies
-    // it coalesced over (live members plus older batches' unjoined slots):
-    // its completion invariant then measures only the slots THIS batch owns,
-    // instead of reporting a false undersize for members another batch's
-    // ledger already tracks.
+    // it coalesced over (live members plus older batches' unjoined slots).
+    // The credited slots are tracked BY REFERENCE (predecessor token+index)
+    // in the batch, so a predecessor that expires before its member joins is
+    // replaced within the bounded budget or reported as undersize - never
+    // silently counted forever; the message baseline below still uses the
+    // combined number.
     uint32 const preexistingMembers = requestPlan.creditedPreexisting;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     bool stoppedOnTerminalFailure = false;
@@ -3432,7 +3516,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         batch.initiatorName = master->GetName();
         batch.initiatorGuid = master->GetGUIDLow();
         batch.desiredSize = groupSize;
-        batch.preexistingMembers = preexistingMembers;
+        // Live members only; the credited dependencies are carried by
+        // reference and either confirm (join) into this baseline or are
+        // replaced/reported when their predecessor vanishes.
+        batch.preexistingMembers = liveMembers;
+        batch.creditedDependencies = requestPlan.creditedDependencies;
         batch.members = batchMembers;
         // Bounded replacement: at most one replacement per requested slot.
         batch.replacementBudget = groupSize;
@@ -3851,15 +3939,27 @@ bool PlayerbotHolder::DeleteBot(ObjectGuid guid, bool allowInstant)
         LogoutPlayerBot(guid, allowInstant, true);
     }
 
+    // Persist the deletion INTENT (with the identity name for GUID-reuse
+    // detection) BEFORE queueing the deletion: a crash after this point is
+    // recovered by ReadoptPendingDeletions at the next startup/reload. A
+    // failed intent write is disclosed - the deletion still proceeds with
+    // in-process ownership, but a crash would not rediscover it.
+    std::string expectedName;
+    sObjectMgr.GetPlayerNameByGUID(guid, expectedName);
+    if (!sRandomPlayerbotMgr.SetValue(guid.GetCounter(), "delete", 1, expectedName))
+        sLog.outError("DeleteBot: could not persist the deletion intent for guid %u; "
+            "the deletion proceeds but will not be rediscovered after a crash", guid.GetCounter());
+
     Player::DeleteFromDB(guid, botAccount, true, true);
 
     // DeleteFromDB only QUEUED the transaction. Adopt the deletion into the
     // durable confirmer: login eligibility (freeAltBots) is revoked NOW, and
     // event rows/markers are cleared - and account cleanup runs - only after
-    // the execution-ordered readback confirms the character row absent.
-    // Still-present and failed readbacks retry bounded; exhaustion fails
+    // the execution-ordered readback confirms the character row absent (or the
+    // guid is proven reused by a new identity). Still-present and failed
+    // readbacks retry bounded with a lost-callback watchdog; exhaustion fails
     // closed (rows kept, a restart retries).
-    AdoptCharacterDeletion(guid.GetCounter(), botAccount);
+    AdoptCharacterDeletion(guid.GetCounter(), botAccount, expectedName);
 
     OnBotDeleted(guid, botAccount);
 

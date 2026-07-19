@@ -768,3 +768,152 @@ LIVING_TEST(post_create_owner_retained_on_unknown_reads_and_failed_clears)
     LIVING_CHECK(!MayReleasePostCreateOwner(/*alwaysKnown*/ false, false, false));
     LIVING_CHECK(!MayReleasePostCreateOwner(true, /*active*/ true, false));
 }
+
+LIVING_TEST(fixed_count_config_rebuild_never_retains_stale_entries)
+{
+    // The reload sequence uses ONE mutable "config" and "availability" state,
+    // exactly like a GM/console reload of the real config object: the loader
+    // clears and reassigns from BuildFixedClassRaceCounts every Initialize,
+    // so no earlier positive entry can survive.
+    std::map<std::pair<uint32_t, uint32_t>, int> configured;
+    std::map<std::pair<uint32_t, uint32_t>, bool> available;
+    bool fixedMode = true;
+
+    std::map<std::pair<uint8_t, uint8_t>, uint32_t> quotas;
+    auto reload = [&]()
+    {
+        // Mirrors PlayerbotAIConfig::Initialize: unconditional clear, rebuild
+        // only while fixed mode is on.
+        quotas.clear();
+        if (!fixedMode)
+            return;
+        quotas = BuildFixedClassRaceCounts(12, 12,
+            [&](uint32_t cls, uint32_t race) -> int
+            {
+                auto it = configured.find({ cls, race });
+                return it == configured.end() ? -1 : it->second; // absent key = missing
+            },
+            [&](uint32_t cls, uint32_t race)
+            {
+                auto it = available.find({ cls, race });
+                return it != available.end() && it->second;
+            });
+    };
+
+    configured[{1, 1}] = 5;
+    configured[{4, 2}] = 3;
+    available[{1, 1}] = true;
+    available[{4, 2}] = true;
+    reload();
+    LIVING_CHECK(quotas.size() == 2);
+    LIVING_CHECK((quotas[{1, 1}] == 5 && quotas[{4, 2}] == 3));
+
+    // positive -> zero: the stale 5 must not survive the reload.
+    configured[{1, 1}] = 0;
+    reload();
+    LIVING_CHECK((quotas.find({1, 1}) == quotas.end()));
+    LIVING_CHECK((quotas[{4, 2}] == 3));
+
+    // positive -> missing (key removed from the config entirely).
+    configured.erase({4, 2});
+    configured[{1, 1}] = 5; // back to positive so the next steps have a subject
+    reload();
+    LIVING_CHECK((quotas.find({4, 2}) == quotas.end()));
+    LIVING_CHECK((quotas[{1, 1}] == 5));
+
+    // available -> unavailable: the entry disappears even though the count
+    // stays positive.
+    available[{1, 1}] = false;
+    reload();
+    LIVING_CHECK(quotas.empty());
+    available[{1, 1}] = true;
+
+    // fixed on -> off -> on: the off reload clears; the on reload rebuilds
+    // only from current configuration.
+    reload();
+    LIVING_CHECK((quotas[{1, 1}] == 5));
+    fixedMode = false;
+    reload();
+    LIVING_CHECK(quotas.empty());
+    fixedMode = true;
+    configured[{1, 1}] = 2; // changed while off
+    reload();
+    LIVING_CHECK(quotas.size() == 1);
+    LIVING_CHECK((quotas[{1, 1}] == 2));
+
+    // No disabled combination can reach bulk creation: the rebuilt map IS the
+    // sweep's quota source, and zero-count keys were never inserted.
+    configured[{4, 2}] = 0;
+    reload();
+    std::map<std::pair<uint8_t, uint8_t>, uint32_t> remaining = quotas;
+    uint32_t disabledAttempts = 0;
+    RunFixedCountRound(remaining, std::vector<std::pair<uint8_t, uint8_t>>{ {1, 1}, {4, 2} }, 9,
+        [&](std::pair<uint8_t, uint8_t> const& key)
+        {
+            if (key == std::pair<uint8_t, uint8_t>{4, 2})
+                ++disabledAttempts;
+            return FixedCountAttempt::Created;
+        });
+    LIVING_CHECK(disabledAttempts == 0);
+}
+
+LIVING_TEST(group_side_effects_gate_on_verified_membership)
+{
+    // The candidate join target is promoted to the post-create master ONLY on
+    // verified membership; teleport and master-derived gear consume that
+    // master. This drives the production pass's decision sequence across
+    // repeated failed/full-group attempts and the eventual success.
+    uint32_t teleports = 0;
+    uint32_t masterGearApplies = 0;
+    uint32_t attempts = 0;
+    bool joinSettled = false;
+
+    auto pass = [&](bool targetOnline, bool inviteSticks) -> GroupJoinDecision
+    {
+        bool const membershipVerified = targetOnline && inviteSticks;
+        bool const masterVerified = membershipVerified; // master = target only when verified
+
+        GroupJoinPlan const plan = PlanGroupJoinAttempt(TargetExistence::Found, targetOnline,
+            membershipVerified, attempts, 10, 30);
+        if (plan.decision != GroupJoinDecision::RetryLater)
+            joinSettled = true; // confirmed terminal persist assumed for the model
+        else
+            attempts = plan.attemptNumber;
+
+        // gear=sync processing: runs only per the gate.
+        if (MayApplyMasterDerivedGear(true, joinSettled, masterVerified))
+            ++masterGearApplies;
+
+        if (masterVerified)
+            ++teleports; // production: if (master) TeleportTo(master)
+
+        return plan.decision;
+    };
+
+    // Repeated failed/full-group attempts: no teleport, no master-derived
+    // gear, marker retained for retry.
+    LIVING_CHECK(pass(false, false) == GroupJoinDecision::RetryLater); // offline target
+    LIVING_CHECK(pass(true, false) == GroupJoinDecision::RetryLater);  // full group / declined invite
+    LIVING_CHECK(pass(true, false) == GroupJoinDecision::RetryLater);
+    LIVING_CHECK(teleports == 0 && masterGearApplies == 0);
+
+    // Success: verified membership applies the master effects exactly once
+    // (the cleared marker never re-enters this path).
+    LIVING_CHECK(pass(true, true) == GroupJoinDecision::ClearJoined);
+    LIVING_CHECK(teleports == 1 && masterGearApplies == 1);
+
+    // Terminal failure instead: gear falls back to the bot's own level (the
+    // gate opens with no verified master).
+    uint32_t fallbackApplies = 0;
+    bool terminalSettled = false;
+    GroupJoinPlan const terminal = PlanGroupJoinAttempt(TargetExistence::ConfirmedMissing,
+        false, false, 0, 10, 30);
+    LIVING_CHECK(terminal.decision == GroupJoinDecision::ClearTerminal);
+    terminalSettled = true;
+    if (MayApplyMasterDerivedGear(true, terminalSettled, false))
+        ++fallbackApplies;
+    LIVING_CHECK(fallbackApplies == 1);
+
+    // Non-master gear (e.g. "epic") is never deferred by the join.
+    LIVING_CHECK(MayApplyMasterDerivedGear(false, false, false));
+}

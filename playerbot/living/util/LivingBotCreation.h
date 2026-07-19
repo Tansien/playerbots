@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace living
@@ -258,6 +259,31 @@ namespace living
         return out;
     }
 
+    // Reconciliation rule for the transient post-create owner set after a
+    // durable marker scan: only a SUCCESSFUL scan is authoritative and
+    // replaces the set; a failed scan (database unavailable) keeps every
+    // existing owner - unknown state must never remove an owner that still
+    // has unsettled durable work.
+    inline std::map<uint32_t, uint32_t> ReconcilePostCreateOwners(
+        std::map<uint32_t, uint32_t> const& existing, bool scanSucceeded,
+        std::map<uint32_t, uint32_t> const& scanned)
+    {
+        return scanSucceeded ? scanned : existing;
+    }
+
+    // Master-derived gear gate for the post-create pass. gear=sync/upgrade is
+    // DEFINED relative to the requested group master's level, so it may run
+    // only once membership is VERIFIED (the verified master supplies the
+    // level) or once the join is terminally settled (no master will ever be
+    // confirmed: the effect falls back to the bot's own level). While the
+    // join is merely retryable the gear marker is retained un-applied - a
+    // failed/full-group attempt's candidate target must never leak its level
+    // into the gear effect.
+    inline bool MayApplyMasterDerivedGear(bool needsMaster, bool joinSettled, bool masterVerified)
+    {
+        return !needsMaster || masterVerified || joinSettled;
+    }
+
     // Scheduler-ownership rule for LoginFreeBots: a bot stays scheduled while
     // it still owns TRANSIENT post-create work (an unknown/typed-untrusted
     // marker read, an unconsumed one-shot marker, an unconfirmed clear, or a
@@ -280,6 +306,32 @@ namespace living
 
         --counter;
         return true;
+    }
+
+    // Builds the fixed class/race quota map from FRESH configuration state.
+    // The result is assigned wholesale by the config loader on EVERY
+    // Initialize, so a reload can never retain an earlier positive entry
+    // whose key meanwhile became zero, was removed, became unavailable, or
+    // whose fixed mode was toggled off and on. Zero and negative counts mean
+    // DISABLED and never enter the map; unavailable combinations are skipped.
+    // `getCount(cls, race)` returns the configured value (negative = absent),
+    // `isAvailable(cls, race)` the factory availability rule.
+    template <typename GetCountFn, typename AvailableFn>
+    std::map<std::pair<uint8_t, uint8_t>, uint32_t> BuildFixedClassRaceCounts(
+        uint32_t maxClasses, uint32_t maxRaces, GetCountFn&& getCount, AvailableFn&& isAvailable)
+    {
+        std::map<std::pair<uint8_t, uint8_t>, uint32_t> counts;
+        for (uint32_t cls = 1; cls < maxClasses; ++cls)
+        {
+            for (uint32_t race = 1; race < maxRaces; ++race)
+            {
+                int const count = getCount(cls, race);
+                if (count > 0 && isAvailable(cls, race))
+                    counts[{ static_cast<uint8_t>(cls), static_cast<uint8_t>(race) }] =
+                        static_cast<uint32_t>(count);
+            }
+        }
+        return counts;
     }
 
     // Outcome of one attempt inside a fixed-count sweep, reported by the
