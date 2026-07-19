@@ -153,6 +153,16 @@ public:
     // and deletes any finalized temporary character exactly once.
     static void AbandonCreationToken(uint64 creationToken);
     static void AbandonBatchToken(uint64 batchToken);
+    // Adopts durable ownership of an ALREADY-QUEUED character deletion: login
+    // eligibility (freeAltBots) is revoked immediately, and the character's
+    // event rows/markers are cleared only after an execution-ordered readback
+    // confirms the row absent (DeleteFromDB returning is never success).
+    // DeleteBot calls this for every deletion path, live or offline.
+    static void AdoptCharacterDeletion(uint32 guid, uint32 accountId);
+    // Internal surface for the deletion confirmer: fires the OnBotDeleted
+    // account-cleanup hook once absence is CONFIRMED (only then is the
+    // durable character count truthful about the deletion).
+    static void OnCharacterDeletionConfirmed(uint32 guid, uint32 accountId);
     // Typed durable character count. The cores' GetCharactersCount collapses
     // a FAILED query to zero, which fails admission OPEN (a full account
     // admitted as empty); this returns false on query failure so admission

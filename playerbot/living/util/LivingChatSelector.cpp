@@ -1,5 +1,6 @@
 #include "LivingChatSelector.h"
 
+#include "LivingLinkGrammar.h"
 #include "LivingNumericParse.h"
 
 namespace living
@@ -48,28 +49,24 @@ namespace living
 
         if (!body.empty() && body[0] == '|')
         {
-            // LINK form: the selector is the FIRST quest link only. It is
-            // delimited by its "|r" terminator (titles contain spaces), so
-            // trailing operands - including further quest links - survive intact.
-            std::string const tag = "|Hquest:";
-            size_t const tagPos = body.find(tag);
-            if (tagPos == std::string::npos)
-                return QuestChatSelectorParse::Malformed; // a link, but not a quest link
-
-            size_t const idPos = tagPos + tag.size();
-            size_t idEnd = idPos;
-            while (idEnd < body.size() && body[idEnd] >= '0' && body[idEnd] <= '9')
-                ++idEnd;
-
+            // LINK form: the selector is exactly ONE quest link, anchored at the
+            // start of the body and matched against the full supported grammar
+            // (optional color prefix, "|Hquest:" in place, id/level delimiters,
+            // paired "|h[...]|h|r"). The old scan found "|Hquest:" and "|r"
+            // anywhere, so junk before the tag or a mangled close was accepted
+            // and could swallow trailing operands. The remainder after the
+            // link's own terminator survives intact.
             uint32_t id = 0;
-            if (idEnd == idPos || !TryParseUInt32(body.substr(idPos, idEnd - idPos), id))
+            size_t linkEnd = 0;
+            if (!TryParseQuestLink(body, 0, id, linkEnd))
                 return QuestChatSelectorParse::Malformed;
 
-            size_t const linkEnd = body.find("|r", idEnd);
-            if (linkEnd == std::string::npos)
-                return QuestChatSelectorParse::Malformed;
+            std::string const rem = body.substr(linkEnd);
 
-            std::string const rem = body.substr(linkEnd + 2);
+            // Text glued straight onto the link terminator is junk, not an
+            // operand - the bare numeric form rejects "523x" the same way.
+            if (!rem.empty() && rem[0] != ' ' && rem[0] != '\t')
+                return QuestChatSelectorParse::Malformed;
             size_t const nonSpace = rem.find_first_not_of(" \t");
             out.questId = id;
             out.fromLink = true;

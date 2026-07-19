@@ -900,6 +900,10 @@ void RandomPlayerbotMgr::ScaleBotActivity()
 
 void RandomPlayerbotMgr::LoginFreeBots()
 {
+    // Barrier results queued by SQL callbacks are applied before the sweep so
+    // a marker whose save provably executed can clear in this same pass.
+    DrainPostCreateSaveBarriers();
+
     if (!sPlayerbotAIConfig.freeAltBots.empty() && sPlayerbotAIConfig.botAutologin != BotAutoLogin::LOGIN_ONLY_ALWAYS_ACTIVE)
     {
         std::vector<std::pair<uint32, uint32>> botsToRemove;
@@ -916,34 +920,113 @@ void RandomPlayerbotMgr::LoginFreeBots()
             }
             else if (!bot->IsBeingTeleported())
             {
-                // One-shot post-create markers: run the runtime effect EXACTLY
-                // ONCE, then retry only the durable clear. An always-online bot
-                // reprocessed every pass must never replay the mutation (e.g.
-                // gear=empty destroying newly equipped items) just because a
-                // clear failed or was ambiguous.
-                auto consumeOneShot = [&](char const* marker, auto&& applyEffect)
+                // Transient post-create ownership, tracked separately from the
+                // always-online membership: the bot may leave the schedule
+                // only when every marker below is authoritatively absent or
+                // confirmed-cleared and the group join reached a confirmed
+                // terminal persist. Unknown (typed-untrusted) reads keep the
+                // bot scheduled and mutate nothing.
+                bool postCreateSettled = true;
+
+                // Idempotent one-shot marker (test): run the runtime effect
+                // EXACTLY ONCE per process, then retry only the durable clear.
+                // Returns whether the marker is settled (absent or consumed).
+                auto consumeOneShot = [&](char const* marker, auto&& applyEffect) -> bool
                 {
+                    uint32 present = 0;
+                    if (!sRandomPlayerbotMgr.TryGetEventValue(botGuid, marker, present))
+                        return false; // unknown state: no effect, keep ownership
+
                     living::OneShotMarker& oneShot = oneShotMarkers[botGuid][marker];
-                    living::MarkerConsumeStep const step =
-                        oneShot.Plan(sRandomPlayerbotMgr.GetValue(botGuid, marker) != 0);
+                    living::MarkerConsumeStep const step = oneShot.Plan(present != 0);
+                    if (step == living::MarkerConsumeStep::Idle)
+                    {
+                        oneShotMarkers[botGuid].erase(marker);
+                        return true;
+                    }
+
                     if (step == living::MarkerConsumeStep::ApplyThenClear)
                     {
                         applyEffect();
                         oneShot.OnEffectApplied();
                     }
-                    if (step != living::MarkerConsumeStep::Idle)
+
+                    // SetValue preserves the marker's durability semantics;
+                    // its bool maps to the typed clear result, so an
+                    // unconfirmed clear retries ONLY the clear, never the effect.
+                    bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
+                    if (oneShot.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
+                                                      : living::EventWriteResult::StateUnknown))
                     {
-                        // SetValue preserves the marker's durability semantics;
-                        // its bool maps to the typed clear result, so an
-                        // unconfirmed clear retries ONLY the clear, never the effect.
-                        bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
-                        if (oneShot.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
-                                                          : living::EventWriteResult::StateUnknown))
-                            oneShotMarkers[botGuid].erase(marker);
+                        oneShotMarkers[botGuid].erase(marker);
+                        return true;
                     }
+                    return false;
                 };
 
-                consumeOneShot("create levelup", [&]()
+                // Destructive one-shot marker (create levelup / create gear):
+                // the durable two-phase consume. Phase 1->2 is execution-
+                // confirmed BEFORE the effect; the effect's character save is
+                // queued explicitly (Randomize may skip its own SaveToDB under
+                // DB delay) and proven executed by an async barrier query on
+                // the same FIFO thread; only then is the durable intent
+                // cleared. A fresh process finding phase 2 never replays the
+                // effect - ambiguous destructive work is disclosed and
+                // cleared, not blindly re-run on possibly-post-effect state.
+                auto consumeDurableOneShot = [&](char const* marker, auto&& applyEffect) -> bool
+                {
+                    uint32 phase = 0;
+                    if (!sRandomPlayerbotMgr.TryGetEventValue(botGuid, marker, phase))
+                        return false; // unknown state: no effect, keep ownership
+
+                    living::DurableOneShotMarker& ledger = durableOneShotMarkers[botGuid][marker];
+                    switch (ledger.Plan(phase))
+                    {
+                        case living::DurableMarkerStep::Idle:
+                            durableOneShotMarkers[botGuid].erase(marker);
+                            return true;
+                        case living::DurableMarkerStep::AdvanceThenApply:
+                        {
+                            // The phase write must preserve the marker's data
+                            // payload (gear quality etc.).
+                            std::string const data = sRandomPlayerbotMgr.GetData(botGuid, marker);
+                            if (!sRandomPlayerbotMgr.SetValue(botGuid, marker, living::kMarkerPhaseApplied, data))
+                                return false; // unconfirmed advance: retry later, effect NOT run
+
+                            if (!ledger.effectApplied)
+                            {
+                                applyEffect();
+                                ledger.OnEffectApplied();
+                            }
+                            bot->SaveToDB();
+                            ledger.OnBarrierRequested(RequestPostCreateSaveBarrier(botGuid, marker));
+                            return false;
+                        }
+                        case living::DurableMarkerStep::AwaitBarrier:
+                            if (!ledger.barrierRequested)
+                                ledger.OnBarrierRequested(RequestPostCreateSaveBarrier(botGuid, marker));
+                            return false;
+                        case living::DurableMarkerStep::RecoverNoReplay:
+                            sLog.outError("Bot %u: post-create marker '%s' was in applied phase from a previous run; "
+                                "the effect is NOT replayed (its durability is ambiguous) and the marker is cleared",
+                                botGuid, marker);
+                            [[fallthrough]]; // to the confirmed clear
+                        case living::DurableMarkerStep::ClearConfirmed:
+                        {
+                            bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
+                            if (ledger.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
+                                                             : living::EventWriteResult::StateUnknown))
+                            {
+                                durableOneShotMarkers[botGuid].erase(marker);
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                    return false;
+                };
+
+                postCreateSettled &= consumeDurableOneShot("create levelup", [&]()
                 {
                     PlayerbotFactory factory(bot, bot->GetLevel());
                     factory.Randomize(true, false);
@@ -951,7 +1034,15 @@ void RandomPlayerbotMgr::LoginFreeBots()
 
                 Player* master = nullptr;
 
-                uint32 const joinAttempts = sRandomPlayerbotMgr.GetValue(botGuid, "create group");
+                // TYPED join-intent read: an untrusted read must not be
+                // interpreted as "no join owed" - it keeps the bot scheduled
+                // and attempts nothing.
+                uint32 joinAttempts = 0;
+                bool const joinKnown = sRandomPlayerbotMgr.TryGetEventValue(botGuid, "create group", joinAttempts);
+                bool groupJoinSettled = joinKnown && joinAttempts == 0;
+                if (!joinKnown)
+                    joinAttempts = 0;
+
                 if (joinAttempts && time(0) >= groupJoinBackoffUntil[botGuid])
                 {
                     // The stored data is a stable target GUID (creation
@@ -1032,13 +1123,20 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
                         living::GroupJoinPersist const persist = living::PlanGroupJoinPersist(plan.decision, persistResult(cleared));
                         if (persist.consumed)
+                        {
                             groupJoinBackoffUntil.erase(botGuid);
+                            // Only a CONFIRMED terminal clear settles the join
+                            // ownership; RetryLater and unconfirmed clears keep
+                            // the bot scheduled for the next pass.
+                            groupJoinSettled = true;
+                        }
                         else
                             groupJoinBackoffUntil[botGuid] = time(0) + 30; // clear not confirmed: retry it, keep the marker
                     }
                 }
+                postCreateSettled &= groupJoinSettled;
 
-                consumeOneShot("create gear", [&]()
+                postCreateSettled &= consumeDurableOneShot("create gear", [&]()
                 {
                     std::string gear = sRandomPlayerbotMgr.GetData(botGuid, "create gear");
                     if (gear == "empty")
@@ -1091,7 +1189,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     }
                 });
 
-                consumeOneShot("test", [&]()
+                postCreateSettled &= consumeOneShot("test", [&]()
                 {
                     PlayerbotAI* ai = bot->GetPlayerbotAI();
                     AiObjectContext* context = ai->GetAiObjectContext();
@@ -1122,8 +1220,17 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 if (master)
                     bot->TeleportTo(WorldPosition(master));
 
-                BotAlwaysOnline always = BotAlwaysOnline(sRandomPlayerbotMgr.GetValue(botGuid, "always"));
-                if (always != BotAlwaysOnline::ACTIVE)
+                // Release from the schedule only from a KNOWN, valid always
+                // state AND with every transient post-create obligation
+                // settled: an unreadable `always` row must not unschedule a
+                // possibly-active bot, and unfinished markers/joins must keep
+                // their scheduler owner.
+                uint32 alwaysRaw = 0;
+                living::AlwaysOnlineState alwaysState = living::AlwaysOnlineState::Disabled;
+                bool const alwaysKnown = sRandomPlayerbotMgr.TryGetEventValue(botGuid, "always", alwaysRaw)
+                    && living::TryClassifyAlwaysOnline(alwaysRaw, alwaysState);
+                bool const alwaysActive = alwaysKnown && alwaysState == living::AlwaysOnlineState::Active;
+                if (living::MayReleasePostCreateOwner(alwaysKnown, alwaysActive, !postCreateSettled))
                 {
                     botsToRemove.push_back({accountId, botGuid});
                 }
@@ -1134,6 +1241,52 @@ void RandomPlayerbotMgr::LoginFreeBots()
             return std::find(botsToRemove.begin(), botsToRemove.end(), entry) != botsToRemove.end();
         });
     }
+}
+
+bool RandomPlayerbotMgr::RequestPostCreateSaveBarrier(uint32 botGuid, std::string const& marker)
+{
+    // Execution-ordered barrier: this async query is queued on the same FIFO
+    // delay thread AFTER the effect's SaveToDB transaction, so its callback
+    // observing ANY materialized result proves that save executed. AsyncPQuery
+    // reports enqueue failure via a false return in all three pinned cores;
+    // the caller re-requests on a later pass.
+    uint64 const barrierToken = nextSaveBarrierToken++;
+    if (!CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandlePostCreateSaveBarrier, barrierToken,
+            "SELECT COUNT(*) FROM characters WHERE guid = '%u'", botGuid))
+        return false;
+
+    saveBarrierTokens[barrierToken] = PostCreateSaveBarrier{ botGuid, marker };
+    return true;
+}
+
+void RandomPlayerbotMgr::HandlePostCreateSaveBarrier(QueryResult* result, uint64 barrierToken)
+{
+    // SQL result callback: parse + enqueue only (the same deadlock contract as
+    // the creation finalizer - no database work, no ledger decisions here). A
+    // null result is a FAILED query, not proof of execution.
+    saveBarrierResults.push_back({ barrierToken, result != nullptr });
+    delete result;
+}
+
+void RandomPlayerbotMgr::DrainPostCreateSaveBarriers()
+{
+    for (auto const& [barrierToken, executed] : saveBarrierResults)
+    {
+        auto tokenIt = saveBarrierTokens.find(barrierToken);
+        if (tokenIt == saveBarrierTokens.end())
+            continue; // stale token (ledger forgotten on guid reuse): ignored
+
+        if (auto botMarkers = durableOneShotMarkers.find(tokenIt->second.botGuid);
+            botMarkers != durableOneShotMarkers.end())
+        {
+            if (auto marker = botMarkers->second.find(tokenIt->second.marker);
+                marker != botMarkers->second.end())
+                marker->second.OnBarrierResult(executed);
+        }
+
+        saveBarrierTokens.erase(tokenIt);
+    }
+    saveBarrierResults.clear();
 }
 
 void RandomPlayerbotMgr::DelayedFacingFix()

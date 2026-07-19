@@ -105,4 +105,64 @@ namespace living
     {
         return alwaysWriteConfirmed;
     }
+
+    // Typed always-online state. The durable value space is exactly
+    // {0 disabled, 1 active, 2 disabled-by-command} (BotAlwaysOnline in the
+    // module); any other stored value is invalid, never coerced.
+    enum class AlwaysOnlineState : uint32_t
+    {
+        Disabled = 0,
+        Active = 1,
+        DisabledByCommand = 2,
+    };
+
+    inline bool TryClassifyAlwaysOnline(uint32_t raw, AlwaysOnlineState& out)
+    {
+        if (raw > static_cast<uint32_t>(AlwaysOnlineState::DisabledByCommand))
+            return false;
+
+        out = static_cast<AlwaysOnlineState>(raw);
+        return true;
+    }
+
+    // What the `.bot always` command may do given the TYPED read of the prior
+    // durable state. An untrusted read (failed bulk load, unreconciled dirty
+    // row) or an invalid stored value produces NO durable or runtime mutation:
+    // toggling against a fabricated zero could flip an active bot's durable
+    // row - and its login - based on state that was never confirmed.
+    enum class AlwaysToggleDecision
+    {
+        RefuseUnknown,
+        Enable,
+        Disable,
+    };
+
+    inline AlwaysToggleDecision PlanAlwaysToggle(bool readTrusted, uint32_t raw)
+    {
+        AlwaysOnlineState state;
+        if (!readTrusted || !TryClassifyAlwaysOnline(raw, state))
+            return AlwaysToggleDecision::RefuseUnknown;
+
+        return state == AlwaysOnlineState::Active
+            ? AlwaysToggleDecision::Disable
+            : AlwaysToggleDecision::Enable;
+    }
+
+    // Startup-loader decision for one character: schedule always-online ONLY
+    // from a trusted, valid read. Unknown state schedules nothing (fail
+    // closed) - in particular a config reload during a database blip can never
+    // re-include a DISABLED_BY_COMMAND character whose read collapsed to zero.
+    // `configuredOnline` is the config-side default after account/character
+    // toggles (selfBotLevel == ALWAYS_ACTIVE xor toggle lists).
+    inline bool ShouldScheduleAlwaysOnline(bool readTrusted, uint32_t raw, bool configuredOnline)
+    {
+        AlwaysOnlineState state;
+        if (!readTrusted || !TryClassifyAlwaysOnline(raw, state))
+            return false;
+
+        if (state == AlwaysOnlineState::DisabledByCommand)
+            return false;
+
+        return configuredOnline || state == AlwaysOnlineState::Active;
+    }
 }

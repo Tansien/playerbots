@@ -258,6 +258,18 @@ namespace living
         return out;
     }
 
+    // Scheduler-ownership rule for LoginFreeBots: a bot stays scheduled while
+    // it still owns TRANSIENT post-create work (an unknown/typed-untrusted
+    // marker read, an unconsumed one-shot marker, an unconfirmed clear, or a
+    // group join that has not reached a confirmed terminal persist), even when
+    // it is not always-online - removal used to orphan that work forever. The
+    // always-online membership itself releases only from a KNOWN, valid state:
+    // an unreadable `always` row must not unschedule a possibly-active bot.
+    inline bool MayReleasePostCreateOwner(bool alwaysKnown, bool alwaysActive, bool postCreateWorkPending)
+    {
+        return alwaysKnown && !alwaysActive && !postCreateWorkPending;
+    }
+
     // Consumes one unit of a role/class quota, refusing to wrap: decrementing a
     // zero quota corrupted the remaining allowance for the whole run. Returns
     // whether a unit was actually consumed.
@@ -268,6 +280,61 @@ namespace living
 
         --counter;
         return true;
+    }
+
+    // Outcome of one attempt inside a fixed-count sweep, reported by the
+    // production reserve+create callable.
+    enum class FixedCountAttempt
+    {
+        Created,            // reserved and queued: consume one unit of quota
+        CreateFailed,       // reservation released, nothing queued: quota kept
+        ReservationBlocked, // shared slot refused: terminate this round
+        Skipped,            // combination not attemptable (invalid class etc.)
+    };
+
+    // One reshuffled sweep of a fixed class/race fill: walks `keys` (the
+    // caller's shuffle order) against the shared `remaining` quota map,
+    // attempting up to `allowance` creations. Zero-count entries are DISABLED:
+    // they are dropped without reserving or creating anything - the raw
+    // `--remaining[key]` this replaces wrapped a zero to UINT_MAX and
+    // mass-created the disabled combination. Consumption is checked
+    // (TryConsumeQuota) and an exhausted entry is erased so the end-of-run
+    // shortfall report never lists it.
+    template <typename Key, typename AttemptFn>
+    AccountFillRound RunFixedCountRound(std::map<Key, uint32_t>& remaining,
+        std::vector<Key> const& keys, uint32_t allowance, AttemptFn&& attempt)
+    {
+        AccountFillRound round;
+        for (Key const& key : keys)
+        {
+            if (round.created >= allowance)
+                break;
+
+            auto quota = remaining.find(key);
+            if (quota == remaining.end())
+                continue;
+            if (quota->second == 0)
+            {
+                remaining.erase(quota); // zero = disabled: never reserve or create
+                continue;
+            }
+
+            switch (attempt(key))
+            {
+                case FixedCountAttempt::Created:
+                    ++round.created;
+                    if (TryConsumeQuota(quota->second) && quota->second == 0)
+                        remaining.erase(quota);
+                    break;
+                case FixedCountAttempt::ReservationBlocked:
+                    round.reservationBlocked = true;
+                    return round;
+                case FixedCountAttempt::CreateFailed:
+                case FixedCountAttempt::Skipped:
+                    break;
+            }
+        }
+        return round;
     }
 
     // Streamed minimum selection with an explicit "nothing selected yet" state.

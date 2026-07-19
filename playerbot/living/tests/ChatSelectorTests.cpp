@@ -101,3 +101,25 @@ LIVING_TEST(quest_selector_parses_only_leading_selector_and_preserves_operands)
     LIVING_CHECK(ParseQuestChatSelector("@quest=abc x", sel) == QuestChatSelectorParse::Malformed);
     LIVING_CHECK(ParseQuestChatSelector("@quest=9999999999 x", sel) == QuestChatSelectorParse::Malformed); // overflow, no throw
 }
+
+LIVING_TEST(quest_selector_link_form_is_anchored_to_the_exact_grammar)
+{
+    QuestChatSelector sel;
+    std::string const link = "|cFFFFFF00|Hquest:983:70|h[Wanted: Terokk]|h|r";
+
+    // Valid trailing operand survives untouched (space-separated).
+    LIVING_CHECK(ParseQuestChatSelector("@quest=" + link + " accept now", sel) == QuestChatSelectorParse::Parsed);
+    LIVING_CHECK(sel.questId == 983 && sel.fromLink && sel.remainder == "accept now");
+
+    // Malformed color prefix, and junk between a '|' opener and the quest tag:
+    // the old scan found "|Hquest:" anywhere and accepted both.
+    LIVING_CHECK(ParseQuestChatSelector("@quest=|cZZZZZZZZ|Hquest:983:70|h[T]|h|r", sel) == QuestChatSelectorParse::Malformed);
+    LIVING_CHECK(ParseQuestChatSelector("@quest=|junk|Hquest:983:70|h[T]|h|r", sel) == QuestChatSelectorParse::Malformed);
+
+    // Missing id/level delimiter and an unpaired close.
+    LIVING_CHECK(ParseQuestChatSelector("@quest=|Hquest:983|h[T]|h|r x", sel) == QuestChatSelectorParse::Malformed);
+    LIVING_CHECK(ParseQuestChatSelector("@quest=|Hquest:983:70|h[T]|r x", sel) == QuestChatSelectorParse::Malformed);
+
+    // Trailing junk glued to the terminator is not an operand.
+    LIVING_CHECK(ParseQuestChatSelector("@quest=" + link + "junk", sel) == QuestChatSelectorParse::Malformed);
+}
