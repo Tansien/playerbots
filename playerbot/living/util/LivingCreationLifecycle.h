@@ -3,6 +3,10 @@
 #include "LivingEventSchema.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace living
 {
@@ -177,76 +181,254 @@ namespace living
 
     // Durable phase values for a DESTRUCTIVE one-shot marker (create gear /
     // create levelup): the phase lives in the marker row's value, so a fresh
-    // process can tell "effect provably never ran" from "effect ran at least
-    // once" - the in-memory OneShotMarker ledger alone could not, and a crash
-    // either replayed the destructive mutation or silently lost it.
-    inline constexpr uint32_t kMarkerPhasePending = 1; // intent recorded, effect NOT applied
-    inline constexpr uint32_t kMarkerPhaseApplied = 2; // effect ran; save durability unconfirmed
+    // process can tell "effect provably never persisted" from "effect ran at
+    // least once" - the in-memory OneShotMarker ledger alone could not, and a
+    // crash either replayed the destructive mutation or silently lost it.
+    //
+    // The protocol proves outcomes instead of assuming them:
+    //   phase 1 (Pending): the effect was never durably recorded. Because the
+    //     character save is queued only AFTER the phase-2 record is
+    //     execution-confirmed, durable phase 1 implies the durable character
+    //     state is still pre-effect - re-applying is a safe first application.
+    //   phase 2 (Applied): the effect ran, and the record carries the PRE and
+    //     POST equipment-state fingerprints captured around it. Durability is
+    //     then PROVEN by comparing the fingerprint against the stored
+    //     equipment (an execution-ordered readback behind the queued save; on
+    //     restart, against the freshly loaded character). post-match = proven
+    //     durable (clear); pre-match = provably lost (safe to re-apply by
+    //     rewinding the record to phase 1); anything else = ambiguous, which
+    //     QUARANTINES the marker with an actionable error - never a silent
+    //     clear, never a blind replay.
+    // Known limitation, disclosed: an effect that leaves equipment unchanged
+    // (pre == post) cannot be distinguished by the fingerprint; its
+    // non-equipment changes ride the same save transaction and are treated as
+    // proven when the equipment matches.
+    inline constexpr uint32_t kMarkerPhasePending = 1; // effect not durably recorded
+    inline constexpr uint32_t kMarkerPhaseApplied = 2; // effect ran; fingerprints recorded
+
+    // FNV-1a 64 over a canonical (slot, item-guid) equipment serialization;
+    // the SAME function hashes the in-memory snapshot and the
+    // character_inventory readback so the two are directly comparable.
+    inline uint64_t HashEquipmentState(std::vector<std::pair<uint8_t, uint32_t>> const& slotItems)
+    {
+        uint64_t hash = 14695981039346656037ull;
+        auto mix = [&hash](uint64_t value)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                hash ^= (value >> (i * 8)) & 0xFF;
+                hash *= 1099511628211ull;
+            }
+        };
+        for (auto const& [slot, itemGuid] : slotItems)
+        {
+            mix(slot);
+            mix(itemGuid);
+        }
+        return hash;
+    }
+
+    // The phase-2 record's data payload: the ORIGINAL payload (gear quality
+    // etc., needed verbatim if the effect must be re-applied) plus both
+    // fingerprints. Fits EVENT_DATA_MAX_BYTES for every legal original.
+    inline std::string EncodeDurableMarkerData(std::string const& original, uint64_t preHash, uint64_t postHash)
+    {
+        char buffer[48];
+        std::snprintf(buffer, sizeof(buffer), "|pre:%016llx|post:%016llx",
+            static_cast<unsigned long long>(preHash), static_cast<unsigned long long>(postHash));
+        return original + buffer;
+    }
+
+    inline bool TryDecodeDurableMarkerData(std::string const& data, std::string& original,
+        uint64_t& preHash, uint64_t& postHash)
+    {
+        size_t const prePos = data.rfind("|pre:");
+        size_t const postPos = data.rfind("|post:");
+        if (prePos == std::string::npos || postPos == std::string::npos || postPos != prePos + 5 + 16)
+            return false;
+
+        auto parseHex16 = [&](size_t begin, uint64_t& out) -> bool
+        {
+            uint64_t value = 0;
+            for (size_t i = 0; i < 16; ++i)
+            {
+                char const c = begin + i < data.size() ? data[begin + i] : '\0';
+                uint64_t digit;
+                if (c >= '0' && c <= '9') digit = static_cast<uint64_t>(c - '0');
+                else if (c >= 'a' && c <= 'f') digit = static_cast<uint64_t>(c - 'a') + 10;
+                else return false;
+                value = (value << 4) | digit;
+            }
+            out = value;
+            return true;
+        };
+
+        if (data.size() != postPos + 6 + 16)
+            return false;
+        if (!parseHex16(prePos + 5, preHash) || !parseHex16(postPos + 6, postHash))
+            return false;
+
+        original = data.substr(0, prePos);
+        return true;
+    }
 
     // What a destructive marker owes this pass.
     enum class DurableMarkerStep
     {
         // Marker absent: nothing owed.
         Idle,
-        // Pending phase: durably confirm phase=Applied FIRST, then (only after
-        // that confirmed write, and only if the effect has not run in this
-        // process) apply the effect, queue the character save, and request the
-        // execution-ordered save barrier. An unconfirmed phase write retries
-        // the whole step on a later pass with the effect still un-run.
-        AdvanceThenApply,
-        // Effect applied this process: wait for the barrier (re-requesting it
-        // when the enqueue failed or the result was a failed query).
-        AwaitBarrier,
-        // Barrier passed: the effect is durable; retry ONLY the confirmed
-        // durable clear.
+        // Phase 1, effect not applied this process: capture the PRE
+        // fingerprint, apply the effect, capture POST, then durably record
+        // phase 2 with both fingerprints (execution-confirmed).
+        ApplyThenRecord,
+        // Effect applied this process but the phase-2 record is still owed
+        // (its confirmed write failed): retry ONLY the record - never the
+        // effect (the kept fingerprints travel with the ledger).
+        RecordApplied,
+        // Phase 2 recorded this process: queue/re-queue the character save
+        // and request the execution-ordered fingerprint verification.
+        SaveAndVerify,
+        // A verification request is in flight: tick the lost-callback
+        // watchdog; timeout invalidates the generation and re-arms.
+        AwaitVerify,
+        // Postcondition proven durable: retry only the confirmed clear.
         ClearConfirmed,
-        // A fresh process found phase=Applied with no in-memory ledger: the
-        // effect ran before a crash and its durability is ambiguous. NEVER
-        // blindly replay a destructive effect - clear the marker (confirmed)
-        // and disclose; the only loss window is a crash that also beat the
-        // queued save, and that loss is logged instead of silently replayed
-        // onto possibly-post-effect state.
-        RecoverNoReplay,
+        // Fresh process, phase 2: reconcile the recorded fingerprints against
+        // the freshly loaded character (post-match -> proven; pre-match ->
+        // rewind to phase 1 and re-apply; neither -> quarantine).
+        RecoverProbe,
+        // Ambiguous durable state: retained with an actionable error; no
+        // further automatic work, never silently cleared.
+        Quarantined,
     };
 
-    // Per-(bot, marker) ledger for the durable two-phase consume. The phase
-    // ordering gives recovery its guarantees: phase=Pending durably implies
-    // the effect never ran (the Applied write is execution-confirmed BEFORE
-    // the effect), and phase=Applied implies it ran at least once - so a
-    // restart replays only provably-unapplied intents. The clear is issued
-    // only after the save barrier (an async query behind the queued SaveToDB
-    // on the same FIFO thread) confirms the save transaction executed, so the
-    // durable intent outlives every crash that could lose the effect.
+    // What the caller owes after feeding one verification result.
+    enum class MarkerVerifyAction
+    {
+        None,        // stale generation / not awaiting: ignore
+        Proven,      // postcondition matched: proceed to the confirmed clear
+        RetrySave,   // mismatch or failed query: re-save + re-verify (bounded)
+        Quarantined, // bounded attempts exhausted: retained with error
+    };
+
+    // Per-(bot, marker) ledger for the durable fingerprint-verified consume.
     struct DurableOneShotMarker
     {
-        bool effectApplied = false;    // this process
-        bool barrierRequested = false; // a barrier query is in flight
-        bool barrierPassed = false;    // the save provably executed
+        static constexpr uint32_t kMaxVerifyAttempts = 5;
+        // Passes a verification may stay outstanding before its callback is
+        // considered lost and the request is re-armed under a new generation
+        // (the relocation watchdog pattern; one pass per manager tick).
+        static constexpr uint32_t kMaxAwaitVerifyPasses = 128;
+
+        bool effectApplied = false;      // this process
+        bool phaseRecorded = false;      // confirmed durable phase-2 record
+        bool verifyOutstanding = false;  // a verification query is in flight
+        bool postconditionProven = false;
+        bool quarantined = false;
+        uint32_t verifyAttempts = 0;     // mismatches/failures/timeouts consumed
+        uint32_t verifyGeneration = 0;   // stamps requests; stale results ignored
+        uint32_t awaitingPasses = 0;     // watchdog while a verify is outstanding
+        uint64_t preHash = 0;
+        uint64_t postHash = 0;
+        std::string originalData;        // payload preserved for a re-apply
 
         DurableMarkerStep Plan(uint32_t durablePhase) const
         {
+            if (quarantined)
+                return DurableMarkerStep::Quarantined;
             if (durablePhase == 0)
                 return DurableMarkerStep::Idle;
             if (durablePhase < kMarkerPhaseApplied)
-                return DurableMarkerStep::AdvanceThenApply;
+                return effectApplied ? DurableMarkerStep::RecordApplied
+                                     : DurableMarkerStep::ApplyThenRecord;
             if (!effectApplied)
-                return DurableMarkerStep::RecoverNoReplay;
-            return barrierPassed ? DurableMarkerStep::ClearConfirmed : DurableMarkerStep::AwaitBarrier;
+                return DurableMarkerStep::RecoverProbe;
+            if (postconditionProven)
+                return DurableMarkerStep::ClearConfirmed;
+            return verifyOutstanding ? DurableMarkerStep::AwaitVerify
+                                     : DurableMarkerStep::SaveAndVerify;
         }
 
-        void OnEffectApplied() { effectApplied = true; }
-
-        void OnBarrierRequested(bool enqueued) { barrierRequested = enqueued; }
-
-        // Feeds one barrier result: a null/failed query proves nothing (the
-        // request is re-armed); any real result proves the earlier queued
-        // save transaction executed.
-        void OnBarrierResult(bool executed)
+        void OnEffectApplied(uint64_t pre, uint64_t post, std::string original)
         {
-            barrierRequested = false;
-            if (executed)
-                barrierPassed = true;
+            effectApplied = true;
+            preHash = pre;
+            postHash = post;
+            originalData = std::move(original);
         }
+
+        void OnPhaseRecorded() { phaseRecorded = true; }
+
+        // Stamps a fresh request generation (invalidating any stale in-flight
+        // result) and returns it for the request binding.
+        uint32_t BeginVerify()
+        {
+            ++verifyGeneration;
+            awaitingPasses = 0;
+            return verifyGeneration;
+        }
+
+        void OnVerifyRequested(bool enqueued)
+        {
+            verifyOutstanding = enqueued;
+            if (!enqueued)
+                ConsumeVerifyAttempt(); // failed enqueue: bounded retry next pass
+        }
+
+        // Watchdog tick while AwaitVerify: returns true when the outstanding
+        // result is considered LOST - the wait is abandoned (consuming one
+        // bounded attempt) and the caller re-requests under a new generation.
+        bool TickAwaitingVerify()
+        {
+            if (!verifyOutstanding)
+                return false;
+
+            if (++awaitingPasses <= kMaxAwaitVerifyPasses)
+                return false;
+
+            verifyOutstanding = false;
+            ConsumeVerifyAttempt();
+            return true;
+        }
+
+        enum class VerifyOutcome { Match, Mismatch, QueryFailed };
+
+        // Feeds one verification result. Results whose generation does not
+        // match the CURRENT outstanding request are stale (a late callback
+        // after a watchdog re-arm) and are ignored.
+        MarkerVerifyAction OnVerifyResult(uint32_t generation, VerifyOutcome outcome)
+        {
+            if (!verifyOutstanding || generation != verifyGeneration)
+                return MarkerVerifyAction::None;
+
+            verifyOutstanding = false;
+            awaitingPasses = 0;
+
+            if (outcome == VerifyOutcome::Match)
+            {
+                postconditionProven = true;
+                return MarkerVerifyAction::Proven;
+            }
+
+            ConsumeVerifyAttempt();
+            return quarantined ? MarkerVerifyAction::Quarantined : MarkerVerifyAction::RetrySave;
+        }
+
+        // Recovery decision for a fresh process holding a phase-2 record.
+        enum class RecoverDecision { ProvenDurable, ReapplySafe, Ambiguous };
+
+        static RecoverDecision Reconcile(uint64_t currentHash, uint64_t recordedPre, uint64_t recordedPost)
+        {
+            if (currentHash == recordedPost)
+                return RecoverDecision::ProvenDurable; // ties (pre==post) favor proven
+            if (currentHash == recordedPre)
+                return RecoverDecision::ReapplySafe;
+            return RecoverDecision::Ambiguous;
+        }
+
+        void MarkProven() { effectApplied = true; postconditionProven = true; }
+
+        void MarkQuarantined() { quarantined = true; }
 
         // Feeds the typed clear result; returns whether the marker is now
         // fully consumed (only a confirmed clear ends it and resets the
@@ -257,6 +439,13 @@ namespace living
             if (consumed)
                 *this = DurableOneShotMarker{};
             return consumed;
+        }
+
+    private:
+        void ConsumeVerifyAttempt()
+        {
+            if (++verifyAttempts >= kMaxVerifyAttempts)
+                quarantined = true;
         }
     };
 }

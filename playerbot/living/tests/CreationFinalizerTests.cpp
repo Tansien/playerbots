@@ -1025,12 +1025,15 @@ LIVING_TEST(group_batch_request_plan_credits_dependencies_without_false_undersiz
     LIVING_CHECK(plan.action == GroupBatchRequestAction::BeginNew);
     LIVING_CHECK(plan.outstandingSlots == 1);
     LIVING_CHECK(plan.creditedPreexisting == 2); // live + credited dependency
+    LIVING_CHECK(plan.creditedDependencies.size() == 1); // tracked by reference
 
-    // The handler's follow-through: residual deficit is 4 - 2 = 2 members.
+    // The handler's follow-through: residual deficit is 4 - 2 = 2 members;
+    // the live baseline and the credited REFERENCE are stored separately.
     CreationBatchRegistry::Batch b;
     b.initiatorGuid = 88;
     b.desiredSize = 4;
-    b.preexistingMembers = plan.creditedPreexisting;
+    b.preexistingMembers = 1; // live members only
+    b.creditedDependencies = plan.creditedDependencies;
     b.members = { PendingMember(62, 2, 2), PendingMember(63, 3, 4) };
     uint64_t const tokenB = registry.Begin(std::move(b));
 
@@ -1041,6 +1044,142 @@ LIVING_TEST(group_batch_request_plan_credits_dependencies_without_false_undersiz
     LIVING_CHECK(result.status == BatchPollStatus::Complete);
     LIVING_CHECK(!result.undersized); // pre-fix: 1 + 2 < 4 -> false undersize
     LIVING_CHECK(result.failures.empty());
+}
+
+LIVING_TEST(group_batch_expired_predecessor_credit_is_replaced_or_reported)
+{
+    // Finding: a fresh batch's credit for a predecessor's finalized-unjoined
+    // member used to be a bare number, so the predecessor could expire (be
+    // pruned after retention) while the new batch was still active - and the
+    // new batch then reported a FULL-SIZE success on the vanished credit.
+    // Tracked credits re-evaluate every pump: a joined member confirms, a
+    // vanished one is replaced within the bounded budget or reported.
+    auto nobodyJoined = [](uint32_t) { return false; };
+    auto nobodyJoinedFor = [](uint32_t, uint32_t) { return false; };
+
+    // --- Lost credit WITH replacement budget: a replacement slot is added.
+    {
+        CreationBatchRegistry registry;
+        CreationBatchRegistry::Batch a;
+        a.initiatorGuid = 91;
+        a.desiredSize = 2;
+        a.preexistingMembers = 1;
+        a.memberGear = "epic";
+        a.members.push_back(PendingMember(71, 1, 1));
+        uint64_t const tokenA = registry.Begin(std::move(a));
+        registry.OnCreationTerminal(MakeCompletion(71, CreationPollStatus::Created, 9101), 1);
+        // A is now completed-retained with one finalized-UNJOINED member.
+
+        GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 91, nobodyJoined,
+            /*live*/ 1, /*requested*/ 3, Options("epic"));
+        LIVING_CHECK(plan.action == GroupBatchRequestAction::BeginNew);
+        LIVING_CHECK(plan.creditedDependencies.size() == 1);
+
+        CreationBatchRegistry::Batch b;
+        b.initiatorGuid = 91;
+        b.desiredSize = 3;
+        b.preexistingMembers = 1;
+        b.creditedDependencies = plan.creditedDependencies;
+        b.replacementBudget = 3;
+        // The residual deficit is still pending, so B stays ACTIVE far beyond
+        // the predecessor's retention - the finding's exact window.
+        b.members = { PendingMember(72, 2, 2) };
+        uint64_t const tokenB = registry.Begin(std::move(b));
+
+        // The predecessor expires (retention elapsed, member never joined)
+        // while B is still active.
+        registry.PruneExpired(10);
+        registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
+        LIVING_CHECK(registry.Find(tokenA) == nullptr);
+        LIVING_CHECK(registry.Find(tokenB) != nullptr);
+
+        // Re-evaluation replaces the vanished credit within the budget.
+        registry.ReevaluateCredits(20000, nobodyJoinedFor);
+        LIVING_CHECK(registry.Find(tokenB)->creditedDependencies.empty());
+        LIVING_CHECK(registry.Find(tokenB)->replacementBudget == 2);
+
+        // Both the residual member and the replacement finalize: completion
+        // is genuine (1 live + 2 own members = 3), not credit-inflated.
+        registry.OnCreationTerminal(MakeCompletion(72, CreationPollStatus::Created, 9102), 20000);
+        auto due = registry.TakeDueAttempts(20001);
+        LIVING_CHECK(due.size() == 1);
+        registry.OnAttemptResult(due[0].batchToken, due[0].memberIndex,
+            BotCreateStatus::PendingPersistence, 90, 3, 20001, 4);
+        registry.OnCreationTerminal(MakeCompletion(90, CreationPollStatus::Created, 9103), 20002);
+        BatchPollResult const result = registry.Poll(tokenB, false);
+        LIVING_CHECK(result.status == BatchPollStatus::Complete);
+        LIVING_CHECK(!result.undersized);
+    }
+
+    // --- Lost credit WITHOUT budget: reported, and completion is undersized.
+    {
+        CreationBatchRegistry registry;
+        CreationBatchRegistry::Batch a;
+        a.initiatorGuid = 92;
+        a.desiredSize = 2;
+        a.preexistingMembers = 1;
+        a.memberGear = "epic";
+        a.members.push_back(PendingMember(81, 1, 1));
+        registry.Begin(std::move(a));
+        registry.OnCreationTerminal(MakeCompletion(81, CreationPollStatus::Created, 9201), 1);
+
+        GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 92, nobodyJoined,
+            1, 3, Options("epic"));
+        CreationBatchRegistry::Batch b;
+        b.initiatorGuid = 92;
+        b.desiredSize = 3;
+        b.preexistingMembers = 1;
+        b.creditedDependencies = plan.creditedDependencies;
+        b.replacementBudget = 0; // exhausted
+        b.members = { PendingMember(82, 2, 2) }; // keeps B active through the prunes
+        uint64_t const tokenB = registry.Begin(std::move(b));
+
+        registry.PruneExpired(10);
+        registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
+        registry.ReevaluateCredits(20000, nobodyJoinedFor);
+        registry.OnCreationTerminal(MakeCompletion(82, CreationPollStatus::Created, 9202), 20001);
+
+        BatchPollResult const result = registry.Poll(tokenB, false);
+        LIVING_CHECK(result.status == BatchPollStatus::Complete);
+        LIVING_CHECK(result.undersized);          // pre-fix: full-size success
+        LIVING_CHECK(!result.failures.empty());   // the loss is reported
+    }
+
+    // --- The credited member JOINS before expiry: confirmed permanently,
+    // and survives the predecessor's later pruning.
+    {
+        CreationBatchRegistry registry;
+        CreationBatchRegistry::Batch a;
+        a.initiatorGuid = 93;
+        a.desiredSize = 2;
+        a.preexistingMembers = 1;
+        a.memberGear = "epic";
+        a.members.push_back(PendingMember(85, 1, 1));
+        registry.Begin(std::move(a));
+        registry.OnCreationTerminal(MakeCompletion(85, CreationPollStatus::Created, 9301), 1);
+
+        GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 93, nobodyJoined,
+            1, 3, Options("epic"));
+        CreationBatchRegistry::Batch b;
+        b.initiatorGuid = 93;
+        b.desiredSize = 3;
+        b.preexistingMembers = 1;
+        b.creditedDependencies = plan.creditedDependencies;
+        b.members = { PendingMember(86, 2, 2) }; // keeps B active through the prunes
+        uint64_t const tokenB = registry.Begin(std::move(b));
+
+        auto joined9301For = [](uint32_t, uint32_t guid) { return guid == 9301; };
+        registry.ReevaluateCredits(100, joined9301For);
+        LIVING_CHECK(registry.Find(tokenB)->preexistingMembers == 2); // confirmed
+        LIVING_CHECK(registry.Find(tokenB)->creditedDependencies.empty());
+
+        registry.PruneExpired(10);
+        registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
+        registry.OnCreationTerminal(MakeCompletion(86, CreationPollStatus::Created, 9302), 20001);
+        BatchPollResult const result = registry.Poll(tokenB, false);
+        LIVING_CHECK(result.status == BatchPollStatus::Complete);
+        LIVING_CHECK(!result.undersized); // 2 + 1 own >= 3
+    }
 }
 
 LIVING_TEST(group_batch_extension_refreshes_live_membership_baseline)

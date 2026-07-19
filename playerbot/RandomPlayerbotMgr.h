@@ -78,6 +78,16 @@ private:
         void DelayedFacingFix();
         void LoginFreeBots();
 public:
+        // Rebuilds the TRANSIENT post-create scheduler owners (guid ->
+        // account) from the durable unsettled markers (create levelup/gear/
+        // group, test) at startup/config reload: creation persists those
+        // markers durably, but the always-online list they used to ride on is
+        // rebuilt from always-state only, which orphaned unfinished work. A
+        // failed scan keeps the existing owners - unknown state never removes
+        // an owner.
+        void ReconstructPostCreateOwners();
+        // Drops a guid from the transient owner set (its deletion was adopted).
+        void ForgetPostCreateOwner(uint32 botGuid) { postCreateOwners.erase(botGuid); }
         static void DatabasePing(QueryResult* result, uint32 pingStart, std::string db);
         void SetDatabaseDelay(std::string db, uint32 delay) {databaseDelay[db] = delay;}
         uint32 GetDatabaseDelay(std::string db) {if(databaseDelay.find(db) == databaseDelay.end()) return 0; return databaseDelay[db];}
@@ -355,32 +365,48 @@ public:
         // durable marker, and ForgetEventCache drops the ledger on guid reuse.
         std::map<uint32, std::map<std::string, living::OneShotMarker> > oneShotMarkers;
         // Per-(bot, marker) ledger for the DESTRUCTIVE post-create markers
-        // (create gear / create levelup): a durable phase (marker value 1->2,
-        // confirmed before the effect) plus an execution-ordered save barrier
-        // make the consume crash-safe - the durable intent is cleared only
-        // after the character save provably executed, and a fresh process
-        // never replays a phase-2 (ambiguous) effect. ForgetEventCache drops
-        // the ledger on guid reuse.
+        // (create gear / create levelup): the effect runs first, the phase-2
+        // record (with PRE/POST equipment fingerprints) is execution-confirmed
+        // after it, and the durable intent is cleared only once an
+        // execution-ordered fingerprint readback PROVES the intended
+        // postcondition landed. Ambiguity quarantines with an error instead of
+        // clearing. ForgetEventCache drops the ledger on guid reuse.
         std::map<uint32, std::map<std::string, living::DurableOneShotMarker> > durableOneShotMarkers;
-        // Save-barrier bookkeeping: token -> (bot, marker) for the async
-        // barrier query queued BEHIND the effect's SaveToDB on the same FIFO
-        // thread; results are only enqueued by the SQL callback and drained
-        // from LoginFreeBots on the world thread.
-        struct PostCreateSaveBarrier
+        // Transient post-create scheduler owners (guid -> account), SEPARATE
+        // from the always-online freeAltBots membership: reconstructed from
+        // durable markers by ReconstructPostCreateOwners and released only
+        // when a bot's post-create work is settled or quarantined.
+        std::map<uint32, uint32> postCreateOwners;
+        // Save-verification bookkeeping: token -> (bot, marker, expected
+        // fingerprint, request generation) for the async equipment readback
+        // queued BEHIND the effect's SaveToDB on the same FIFO thread. Results
+        // are only enqueued by the SQL callback and drained from LoginFreeBots
+        // on the world thread; stale generations (a late callback after a
+        // watchdog re-arm) are dropped there.
+        struct PostCreateSaveVerify
         {
             uint32 botGuid = 0;
             std::string marker;
+            uint64 expectedHash = 0;
+            uint32 generation = 0;
         };
-        std::map<uint64, PostCreateSaveBarrier> saveBarrierTokens;
-        uint64 nextSaveBarrierToken = 1;
-        std::vector<std::pair<uint64, bool>> saveBarrierResults;
-        // Enqueues the execution-ordered save barrier query for (bot, marker);
+        std::map<uint64, PostCreateSaveVerify> saveVerifyTokens;
+        uint64 nextSaveVerifyToken = 1;
+        struct PostCreateSaveVerifyResult
+        {
+            uint64 token = 0;
+            bool queryOk = false;
+            uint64 actualHash = 0;
+        };
+        std::vector<PostCreateSaveVerifyResult> saveVerifyResults;
+        // Enqueues the execution-ordered equipment readback for (bot, marker);
         // returns whether it was actually enqueued.
-        bool RequestPostCreateSaveBarrier(uint32 botGuid, std::string const& marker);
+        bool RequestPostCreateSaveVerify(uint32 botGuid, std::string const& marker,
+            uint64 expectedHash, uint32 generation);
         // SQL result callback: parse + enqueue only (deadlock contract).
-        void HandlePostCreateSaveBarrier(QueryResult* result, uint64 barrierToken);
-        // Applies drained barrier results to the durable marker ledgers.
-        void DrainPostCreateSaveBarriers();
+        void HandlePostCreateSaveVerify(QueryResult* result, uint64 verifyToken);
+        // Applies drained verification results to the durable marker ledgers.
+        void DrainPostCreateSaveVerifies();
         // True after an activation pair (add/logout) whose durable state could
         // not be established: GetBots must reconcile from durable truth before
         // trusting the in-memory vector again.

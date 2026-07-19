@@ -2,6 +2,7 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/living/config/EffectiveConfigReport.h"
 #include "playerbot/living/util/LivingActivation.h"
+#include "playerbot/living/util/LivingBotCreation.h"
 #include "playerbot/playerbot.h"
 #include "RandomPlayerbotFactory.h"
 #include "Accounts/AccountMgr.h"
@@ -375,6 +376,12 @@ bool PlayerbotAIConfig::Initialize()
     useFixedClassRaceCounts = config.GetBoolDefault("AiPlayerbot.ClassRace.UseFixedClassRaceCounts", false);
     RandomPlayerbotFactory factory(0);
 
+    // Rebuilt FRESH on every Initialize (GM/console reload included): stale
+    // positive entries used to survive a reload when a combination was
+    // changed to zero, removed, made unavailable, or fixed mode was toggled
+    // off - bulk creation then consumed the phantom quota.
+    fixedClassRaceCounts.clear();
+
     for (uint32 race = 1; race < MAX_RACES; ++race)
     {
         //Set race defaults
@@ -439,26 +446,20 @@ bool PlayerbotAIConfig::Initialize()
                 sLog.outError("Fixed class/race counts does not yet support '%s' (class-only). This config entry will be ignored.", classKey.c_str());
         }
 
-        //Parse and build fixedClassRacesCounts
-        {
-            for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
-	    {
-	        for (uint32 race = 1; race < MAX_RACES; ++race)
-	        {
-		    std::string key = "AiPlayerbot.ClassRaceProb." + std::to_string(cls) + "." + std::to_string(race);
-		    int count = config.GetIntDefault(key, -1);
-
-            // A configured zero means DISABLED and never enters the quota
-            // map: the bulk fill decrements per created bot, so a zero
-            // entry used to wrap to UINT_MAX and mass-create the disabled
-            // combination.
-            if (count > 0 && factory.isAvailableRace(cls, race))
-		    {
-		        fixedClassRaceCounts[{cls, race}] = count;
-		    }
-	        }
-	    }
-        }
+        // Parse into a fresh map through the shared builder (zero/negative =
+        // DISABLED, unavailable combinations skipped); the wholesale
+        // assignment together with the unconditional clear above means no
+        // prior reload's entry can ever leak into this one.
+        fixedClassRaceCounts = living::BuildFixedClassRaceCounts(MAX_CLASSES, MAX_RACES,
+            [&](uint32 cls, uint32 race)
+            {
+                return config.GetIntDefault(
+                    "AiPlayerbot.ClassRaceProb." + std::to_string(cls) + "." + std::to_string(race), -1);
+            },
+            [&](uint32 cls, uint32 race)
+            {
+                return factory.isAvailableRace(static_cast<uint8>(cls), static_cast<uint8>(race));
+            });
     }
 
     botCheatMask = uint32(CheatAction::GetCheatMask(config.GetStringDefault("AiPlayerbot.BotCheats", "taxi,item,breath")));
@@ -796,6 +797,13 @@ bool PlayerbotAIConfig::Initialize()
     }
 
     loadFreeAltBotAccounts();
+
+    // Durable ownership reconstruction on every startup AND config reload:
+    // deletion intents are re-adopted, and unsettled post-create markers get
+    // their scheduler owner back (loadFreeAltBotAccounts above rebuilds only
+    // the always-online membership, which is a different concern).
+    PlayerbotHolder::ReadoptPendingDeletions();
+    sRandomPlayerbotMgr.ReconstructPostCreateOwners();
 
     targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f);
 
