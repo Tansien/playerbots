@@ -336,6 +336,76 @@ namespace living
         return !needsMaster || masterVerified || joinSettled;
     }
 
+    // Durable creation-intent lifecycle. The intent row ('create pending') is
+    // execution-confirmed BEFORE the character transaction is queued, so a
+    // committed character can never exist without a restart-reconstructable
+    // creation owner: value 1 = pre-persistence (the finalizer owns it; a
+    // present character resumes finalization, an absent one is residue),
+    // value 2 = finalized with outstanding post-create obligations (the row
+    // carries the lifecycle LOGIN AUTHORIZATION until settlement clears it).
+    inline constexpr uint32_t kCreationIntentPrePersistence = 1;
+    inline constexpr uint32_t kCreationIntentFinalized = 2;
+
+    // Small fixed-size payload: {level, login authorization, has-obligations}.
+    // The heavyweight creation metadata (markers, spec events) is persisted as
+    // its own rows pre-save, so this always fits the durable envelope.
+    inline std::string EncodeCreationIntent(uint32_t level, bool autoAdd, bool hasObligations)
+    {
+        return "level:" + std::to_string(level) + "|login:" + (autoAdd ? "1" : "0")
+            + "|obligations:" + (hasObligations ? "1" : "0");
+    }
+
+    inline void DecodeCreationIntent(std::string const& data, uint32_t& level, bool& autoAdd,
+        bool& hasObligations)
+    {
+        level = 0;
+        autoAdd = false;
+        hasObligations = false;
+
+        size_t const levelPos = data.find("level:");
+        if (levelPos != std::string::npos)
+        {
+            uint64_t parsed = 0;
+            for (size_t i = levelPos + 6; i < data.size() && data[i] >= '0' && data[i] <= '9'; ++i)
+            {
+                if (parsed > 0xFFFFFFull)
+                    break;
+                parsed = parsed * 10 + static_cast<uint64_t>(data[i] - '0');
+            }
+            level = static_cast<uint32_t>(parsed);
+        }
+        size_t const loginPos = data.find("|login:");
+        autoAdd = loginPos != std::string::npos && loginPos + 7 < data.size() && data[loginPos + 7] == '1';
+        size_t const obligationsPos = data.find("|obligations:");
+        hasObligations = obligationsPos != std::string::npos && obligationsPos + 13 < data.size()
+            && data[obligationsPos + 13] == '1';
+    }
+
+    // Startup recovery decision for one intent row.
+    enum class CreationIntentRecovery
+    {
+        DiscardResidue,     // character absent: nothing committed (or rolled back)
+        ResumeFinalization, // pre-persistence intent, character committed: re-own it
+        ReconstructOwner,   // finalized intent: rebuild the post-create owner + login auth
+    };
+
+    inline CreationIntentRecovery PlanCreationIntentRecovery(bool characterPresent, uint32_t value)
+    {
+        if (!characterPresent)
+            return CreationIntentRecovery::DiscardResidue;
+        return value >= kCreationIntentFinalized ? CreationIntentRecovery::ReconstructOwner
+                                                 : CreationIntentRecovery::ResumeFinalization;
+    }
+
+    // Direction-aware one-copper commit token: the delta must ALWAYS change
+    // the purse, and every pinned core silently clamps a positive change at
+    // the money cap - so a saturated purse toggles down instead. Gameplay
+    // money is never permanently altered beyond one copper either way.
+    inline int32_t CommitTokenDelta(uint32_t money, uint32_t maxMoney)
+    {
+        return money < maxMoney ? 1 : -1;
+    }
+
     // Login decision for one offline sweep entry: an automatic login needs
     // the MODE to allow it (LOGIN_ONLY_ALWAYS_ACTIVE suppresses sweep logins
     // entirely), the entry's OWN authorization (lifecycle ownership never

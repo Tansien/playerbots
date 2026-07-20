@@ -1235,3 +1235,100 @@ LIVING_TEST(group_batch_extension_refreshes_live_membership_baseline)
     // reported this complete group as undersized.
     LIVING_CHECK(!result.undersized);
 }
+
+LIVING_TEST(group_batch_credits_have_exactly_one_owner)
+{
+    // Three identical covered requests over one predecessor slot: the FIRST
+    // creates the tracking owner; the second and third find that owner ACTIVE
+    // (unresolved credits make a batch active) and never spawn independent
+    // trackers - so predecessor expiry produces exactly ONE replacement.
+    CreationBatchRegistry registry;
+    auto nobodyJoined = [](uint32_t) { return false; };
+    auto nobodyJoinedFor = [](uint32_t, uint32_t) { return false; };
+
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 95;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.members.push_back(PendingMember(41, 1, 1));
+    uint64_t const tokenA = registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(41, CreationPollStatus::Created, 9401), 1);
+    // A is completed-retained with one finalized-UNJOINED member.
+
+    // Request 1: covered - creates the tracking owner with the credit.
+    GroupBatchRequestPlan plan1 = PlanGroupBatchRequest(registry, 95, nobodyJoined, 1, 2, Options("epic"));
+    LIVING_CHECK(plan1.action == GroupBatchRequestAction::AlreadyCovered);
+    LIVING_CHECK(plan1.creditedDependencies.size() == 1);
+    CreationBatchRegistry::Batch tracker;
+    tracker.initiatorGuid = 95;
+    tracker.desiredSize = 2;
+    tracker.preexistingMembers = 1;
+    tracker.creditedDependencies = plan1.creditedDependencies;
+    tracker.replacementBudget = 2;
+    tracker.memberGear = "epic";
+    uint64_t const trackerToken = registry.Begin(std::move(tracker));
+
+    // Requests 2 and 3: the tracker is now the ACTIVE owner (unresolved
+    // credits count), so the handler extends it instead of creating another -
+    // and even if a plan were computed, the credit is no longer collectable.
+    LIVING_CHECK(registry.FindBatchTokenForInitiator(95) == trackerToken);
+    GroupBatchRequestPlan plan2 = PlanGroupBatchRequest(registry, 95, nobodyJoined, 1, 2, Options("epic"));
+    LIVING_CHECK(plan2.action == GroupBatchRequestAction::ExtendExisting);
+    LIVING_CHECK(plan2.existingToken == trackerToken);
+    LIVING_CHECK(registry.CollectOutstandingMemberRefs(95, nobodyJoined).empty()); // credit already owned
+    LIVING_CHECK(registry.IsCreditOwned(tokenA, 0));
+
+    // Changed options while the credit is unresolved: REJECTED - the credit
+    // holder participates in option-compatibility accounting.
+    GroupBatchRequestPlan incompatible = PlanGroupBatchRequest(registry, 95, nobodyJoined, 1, 2, Options("default"));
+    LIVING_CHECK(incompatible.action == GroupBatchRequestAction::RejectIncompatible);
+
+    // Predecessor expires: exactly ONE replacement appears, in the tracker.
+    registry.PruneExpired(10);
+    registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
+    LIVING_CHECK(registry.Find(tokenA) == nullptr);
+    registry.ReevaluateCredits(20000, nobodyJoinedFor);
+
+    uint32_t replacements = 0;
+    for (living::CreationBatchMember const& member : registry.Find(trackerToken)->members)
+        if (member.state == BatchMemberState::AwaitingAttempt)
+            ++replacements;
+    LIVING_CHECK(replacements == 1);
+    LIVING_CHECK(registry.Find(trackerToken)->creditedDependencies.empty());
+
+    // The replacement finalizes: an observable, genuine completion.
+    auto due = registry.TakeDueAttempts(20001);
+    LIVING_CHECK(due.size() == 1);
+    registry.OnAttemptResult(due[0].batchToken, due[0].memberIndex,
+        BotCreateStatus::PendingPersistence, 99, 3, 20001, 4);
+    registry.OnCreationTerminal(MakeCompletion(99, CreationPollStatus::Created, 9402), 20002);
+    LIVING_CHECK(registry.Poll(trackerToken, false).status == BatchPollStatus::Complete);
+    LIVING_CHECK(!registry.Poll(trackerToken, false).undersized);
+    LIVING_CHECK(registry.TakeNewlyCompleted().size() == 1); // notified exactly once
+
+    // Predecessor JOINS variant: the credit confirms into the baseline and no
+    // replacement is created.
+    CreationBatchRegistry joins;
+    CreationBatchRegistry::Batch b;
+    b.initiatorGuid = 96;
+    b.desiredSize = 2;
+    b.preexistingMembers = 1;
+    b.memberGear = "epic";
+    b.members.push_back(PendingMember(51, 1, 1));
+    joins.Begin(std::move(b));
+    joins.OnCreationTerminal(MakeCompletion(51, CreationPollStatus::Created, 9501), 1);
+    GroupBatchRequestPlan planJ = PlanGroupBatchRequest(joins, 96, nobodyJoined, 1, 2, Options("epic"));
+    CreationBatchRegistry::Batch trackerJ;
+    trackerJ.initiatorGuid = 96;
+    trackerJ.desiredSize = 2;
+    trackerJ.preexistingMembers = 1;
+    trackerJ.creditedDependencies = planJ.creditedDependencies;
+    trackerJ.replacementBudget = 2;
+    trackerJ.memberGear = "epic";
+    uint64_t const tokenJ = joins.Begin(std::move(trackerJ));
+    joins.ReevaluateCredits(5, [](uint32_t, uint32_t guid) { return guid == 9501; });
+    LIVING_CHECK(joins.Find(tokenJ)->preexistingMembers == 2); // confirmed
+    LIVING_CHECK(joins.Find(tokenJ)->members.empty());          // no replacement
+    LIVING_CHECK(joins.Poll(tokenJ, false).status == BatchPollStatus::Complete);
+}

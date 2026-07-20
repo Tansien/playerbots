@@ -475,6 +475,16 @@ namespace living
         // unjoined) of ALL of the initiator's batches, by reference - the
         // trackable form of OutstandingSlotsForInitiator for a fresh batch's
         // credited dependencies.
+        // Whether some batch already OWNS this slot as a credited dependency.
+        bool IsCreditOwned(uint64_t batchToken, size_t memberIndex) const
+        {
+            for (auto const& [token, batch] : batches)
+                for (CreditedDependency const& credit : batch.creditedDependencies)
+                    if (credit.batchToken == batchToken && credit.memberIndex == memberIndex)
+                        return true;
+            return false;
+        }
+
         template <typename JoinedFn>
         std::vector<CreditedDependency> CollectOutstandingMemberRefs(uint32_t initiatorGuid,
             JoinedFn&& isJoined) const
@@ -491,9 +501,13 @@ namespace living
                 for (size_t i = 0; i < batch.members.size(); ++i)
                 {
                     CreationBatchMember const& member = batch.members[i];
-                    if (member.state == BatchMemberState::AwaitingAttempt
+                    bool const outstanding = member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence
-                        || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid)))
+                        || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid));
+                    // Exactly ONE replacement owner per credited slot: a slot
+                    // already credited elsewhere is not collectable again, so
+                    // predecessor expiry produces at most one replacement.
+                    if (outstanding && !IsCreditOwned(token, i))
                         refs.push_back(CreditedDependency{ token, i });
                 }
             }
@@ -569,16 +583,17 @@ namespace living
                 if (batch.initiatorGuid != initiatorGuid)
                     continue;
 
-                bool outstanding = false;
+                // Unresolved credits count as outstanding dependencies for
+                // option compatibility, exactly like unjoined members.
+                bool outstanding = !batch.creditedDependencies.empty();
                 for (CreationBatchMember const& member : batch.members)
                 {
+                    if (outstanding)
+                        break;
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence
                         || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid)))
-                    {
                         outstanding = true;
-                        break;
-                    }
                 }
 
                 if (outstanding)
@@ -608,7 +623,12 @@ namespace living
                 if (batch.initiatorGuid != initiatorGuid || token <= newest)
                     continue;
 
-                bool active = false;
+                // Unresolved credited dependencies make a batch ACTIVE: it is
+                // the single owner of that coverage, and a repeated request
+                // must extend it - never spawn an independent tracker whose
+                // duplicate credit would fan one lost slot into many
+                // replacements.
+                bool active = !batch.creditedDependencies.empty();
                 for (CreationBatchMember const& member : batch.members)
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence)

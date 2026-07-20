@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -39,8 +41,12 @@ namespace living
         std::function<CreationPollResult(uint64_t /*token*/, bool /*acknowledge*/)> pollSingle;
         // Poll a group-batch token; `acknowledge` matches PollBotCreationBatch.
         std::function<BatchPollResult(uint64_t /*token*/, bool /*acknowledge*/)> pollBatch;
-        // Delete one finalized temporary character by GUID (DeleteBot).
-        std::function<void(uint32_t /*guid*/)> deleteCharacter;
+        // Deletes one finalized temporary character by GUID (DeleteBot) and
+        // returns whether DURABLE DELETION OWNERSHIP was secured (the
+        // fail-closed deletion path refuses when its intent cannot be
+        // persisted). On false the caller must NOT acknowledge or drop its
+        // cleanup token - the character would be orphaned with no owner.
+        std::function<bool(uint32_t /*guid*/)> deleteCharacter;
     };
 
     class AbandonedCreationCleanup
@@ -60,7 +66,7 @@ namespace living
         void AdoptBatch(uint64_t token)
         {
             if (token && batches.size() < kMaxAdopted)
-                batches.push_back(token);
+                batches.push_back(BatchCleanup{ token, {} });
         }
 
         void Pump(CreationCleanupOps const& ops)
@@ -69,7 +75,7 @@ namespace living
             {
                 // Peek WITHOUT acknowledging: ownership is retained until the
                 // record reaches a terminal state and any finalized character
-                // has been deleted.
+                // has SECURED durable deletion ownership.
                 CreationPollResult const poll = ops.pollSingle ? ops.pollSingle(*it, false) : CreationPollResult{};
                 if (poll.status == CreationPollStatus::Pending)
                 {
@@ -77,11 +83,16 @@ namespace living
                     continue;
                 }
 
-                // Only a confirmed-created record exposes a GUID; delete that
-                // temporary character exactly once. Other terminals (rolled
-                // back, quarantined, unknown) expose no GUID and delete nothing.
-                if (poll.status == CreationPollStatus::Created && poll.guid && ops.deleteCharacter)
-                    ops.deleteCharacter(poll.guid);
+                // Only a confirmed-created record exposes a GUID. If durable
+                // deletion ownership could not be secured (fail-closed intent
+                // write refused), KEEP this token and retry next pump -
+                // acknowledging now would orphan the character forever.
+                if (poll.status == CreationPollStatus::Created && poll.guid && ops.deleteCharacter
+                    && !ops.deleteCharacter(poll.guid))
+                {
+                    ++it;
+                    continue;
+                }
 
                 // Acknowledge only now that cleanup is secured, then drop it.
                 if (ops.pollSingle)
@@ -91,24 +102,41 @@ namespace living
 
             for (auto it = batches.begin(); it != batches.end();)
             {
-                BatchPollResult const poll = ops.pollBatch ? ops.pollBatch(*it, false) : BatchPollResult{};
+                BatchPollResult const poll = ops.pollBatch ? ops.pollBatch(it->token, false) : BatchPollResult{};
                 if (poll.status == BatchPollStatus::Pending)
                 {
                     ++it; // a live batch may still finalize/act on members: never touch its GUIDs
                     continue;
                 }
 
-                // A COMPLETE batch is done acting on its finalized members, so
-                // their temporary characters are now safe to delete (each once).
-                // Acknowledge (which erases the batch) only after cleanup.
+                // A COMPLETE batch is done acting on its finalized members.
+                // Each member must SECURE deletion ownership exactly once;
+                // members that already secured are never re-processed while a
+                // refused member keeps the whole token alive for a retry.
                 // Unknown = already acknowledged/expired: just drop it.
                 if (poll.status == BatchPollStatus::Complete)
                 {
-                    if (ops.deleteCharacter)
-                        for (uint32_t guid : poll.finalizedGuids)
-                            ops.deleteCharacter(guid);
+                    bool allSecured = true;
+                    for (uint32_t guid : poll.finalizedGuids)
+                    {
+                        if (it->securedGuids.count(guid))
+                            continue;
+                        if (ops.deleteCharacter && !ops.deleteCharacter(guid))
+                        {
+                            allSecured = false;
+                            continue;
+                        }
+                        it->securedGuids.insert(guid);
+                    }
+
+                    if (!allSecured)
+                    {
+                        ++it; // retry ONLY the unsecured members next pump
+                        continue;
+                    }
+
                     if (ops.pollBatch)
-                        ops.pollBatch(*it, true);
+                        ops.pollBatch(it->token, true);
                 }
                 it = batches.erase(it);
             }
@@ -119,8 +147,16 @@ namespace living
         bool Empty() const { return singles.empty() && batches.empty(); }
 
     private:
+        struct BatchCleanup
+        {
+            uint64_t token = 0;
+            // Finalized members whose durable deletion ownership is secured:
+            // never re-processed while failed members retry.
+            std::set<uint32_t> securedGuids;
+        };
+
         std::vector<uint64_t> singles;
-        std::vector<uint64_t> batches;
+        std::vector<BatchCleanup> batches;
     };
 
     // World/database boundary for the durable character-deletion owner. Every
@@ -181,28 +217,51 @@ namespace living
         accountId = static_cast<uint32_t>(parsed);
     }
 
-    // Startup/reload recovery decision for one durable deletion-intent row.
-    // Only a character present under BOTH its recorded name and recorded
-    // account is provably the intended one: re-run the full deletion path.
-    // Anything else - absent, renamed, account-moved, or reused - is adopted
-    // for confirmation only; the identity-aware verify readback then confirms
-    // absence (cleanup with the RECORDED account) or fails closed
-    // (quarantine). A deletion is never re-issued at an unproven identity.
-    enum class DeletionIntentRecovery
+    // Typed deletion preflight over ONE identity query
+    // (COUNT + MIN(name) + MIN(account) by guid). Distinguishes a verified
+    // present identity from confirmed absence from an unanswerable lookup -
+    // the legacy GetPlayerNameByGUID/GetPlayerAccountIdByGUID pair conflated
+    // missing rows with query failure and accepted account 0, losing correct
+    // realm/account bookkeeping and leaving recovery unable to prove the
+    // identity it recorded. Unknown or incomplete identity (failed query,
+    // empty name, account 0) must write no intent and queue no deletion.
+    enum class DeletionPreflight
     {
-        RequeueDeletion,
-        AdoptForConfirmation,
+        Unknown,         // query failed or identity incomplete: fail closed
+        ConfirmedAbsent, // no characters row: nothing destructive to queue
+        VerifiedPresent, // full (name, account) identity verified
     };
 
-    inline DeletionIntentRecovery PlanDeletionIntentRecovery(bool characterPresent,
-        std::string const& currentName, uint32_t currentAccount,
-        std::string const& recordedName, uint32_t recordedAccount)
+    inline DeletionPreflight ClassifyDeletionPreflight(std::optional<uint64_t> count,
+        std::string const& name, uint32_t accountId)
     {
-        bool const identityProven = characterPresent
-            && !recordedName.empty() && currentName == recordedName
-            && recordedAccount != 0 && currentAccount == recordedAccount;
-        return identityProven ? DeletionIntentRecovery::RequeueDeletion
-                              : DeletionIntentRecovery::AdoptForConfirmation;
+        if (!count)
+            return DeletionPreflight::Unknown;
+        if (*count == 0)
+            return DeletionPreflight::ConfirmedAbsent;
+        if (name.empty() || accountId == 0)
+            return DeletionPreflight::Unknown; // present but incomplete: fail closed
+        return DeletionPreflight::VerifiedPresent;
+    }
+
+    // Startup/reload recovery decision for one durable deletion-intent row.
+    // (guid, name, account) is NOT an immutable identity across a restart:
+    // the guid may have been reused by a NEW character with the same name on
+    // the same account, and no immutable creation nonce exists in the schema.
+    // A PRESENT row is therefore NEVER automatically re-deleted after a
+    // restart - it is adopted pre-quarantined (fail closed, login blocked,
+    // manual resolution). Only a confirmed-ABSENT row proceeds to
+    // metadata/account cleanup using the RECORDED account.
+    enum class DeletionIntentRecovery
+    {
+        AdoptForCleanup,   // character absent: confirm + clean up
+        QuarantinePresent, // character present: identity unprovable, fail closed
+    };
+
+    inline DeletionIntentRecovery PlanDeletionIntentRecovery(bool characterPresent)
+    {
+        return characterPresent ? DeletionIntentRecovery::QuarantinePresent
+                                : DeletionIntentRecovery::AdoptForCleanup;
     }
 
     // Durable per-GUID ownership of queued character deletions. In every
@@ -243,8 +302,14 @@ namespace living
         // character must never race a login. Over-capacity adoptions are
         // otherwise dropped (fail closed: rows stay, the next restart
         // retries).
+        // `identityProvenInProcess`: true only when the caller verified the
+        // present identity in THIS process (the typed deletion preflight) -
+        // a Verified readback may then re-issue the idempotent deletion.
+        // Recovery adoptions (restart boundary) pass false: any PRESENT
+        // readback fails closed, because the recorded identity cannot prove
+        // the row was not reused since the original process died.
         void Adopt(uint32_t guid, uint32_t accountId, std::string expectedName,
-            CharacterDeletionOps const& ops)
+            bool identityProvenInProcess, CharacterDeletionOps const& ops)
         {
             if (ops.revokeLogin)
                 ops.revokeLogin(guid);
@@ -262,6 +327,18 @@ namespace living
             Record& record = records[guid];
             record.accountId = accountId;
             record.expectedName = std::move(expectedName);
+            record.identityProvenInProcess = identityProvenInProcess;
+        }
+
+        // Adopts a recovery-time PRESENT row directly into quarantine: login
+        // stays blocked and everything is retained for manual resolution.
+        void AdoptQuarantined(uint32_t guid, uint32_t accountId, std::string expectedName,
+            CharacterDeletionOps const& ops)
+        {
+            Adopt(guid, accountId, std::move(expectedName), false, ops);
+            auto it = records.find(guid);
+            if (it != records.end() && !it->second.quarantined)
+                Quarantine(guid, it->second, ops);
         }
 
         // SQL-callback entry: copies the outcome into the record's mailbox and
@@ -348,10 +425,19 @@ namespace living
                     }
 
                     // Still present under the recorded identity: re-issue the
-                    // idempotent deletion before the next readback. A failed
-                    // query re-verifies only.
-                    if (record.pendingOutcome == RowVerifyOutcome::Verified && ops.deleteCharacter)
-                        ops.deleteCharacter(guid, record.accountId);
+                    // idempotent deletion ONLY when this process itself proved
+                    // the identity (in-process adoption). A recovery adoption
+                    // can never prove the row was not reused: fail closed.
+                    if (record.pendingOutcome == RowVerifyOutcome::Verified)
+                    {
+                        if (!record.identityProvenInProcess)
+                        {
+                            Quarantine(guid, record, ops);
+                            continue;
+                        }
+                        if (ops.deleteCharacter)
+                            ops.deleteCharacter(guid, record.accountId);
+                    }
                 }
                 else if (record.verifyRequested)
                 {
@@ -414,6 +500,7 @@ namespace living
         {
             uint32_t accountId = 0;
             std::string expectedName;
+            bool identityProvenInProcess = false;
             uint32_t attempts = 0;      // verify outcomes consumed (present/failed/lost)
             uint32_t clearAttempts = 0; // metadata/intent-clear failures
             uint32_t generation = 0;    // stamps requests; stale results ignored

@@ -160,13 +160,20 @@ public:
     // guid proven reused by a different identity (`expectedName` records the
     // identity for that comparison). DeleteBot calls this for every deletion
     // path, live or offline.
-    static void AdoptCharacterDeletion(uint32 guid, uint32 accountId, std::string const& expectedName);
+    static void AdoptCharacterDeletion(uint32 guid, uint32 accountId, std::string const& expectedName,
+        bool identityProvenInProcess);
     // Re-adopts every durable deletion intent ('delete' event rows) at
     // startup/config reload: a lost queued deletion is re-run, an absent or
     // identity-unproven character is adopted for confirmation/cleanup only.
     // A failed scan leaves the intent rows untouched, reports false, and is
     // retried with bounded backoff from the creation pump.
     static bool ReadoptPendingDeletions();
+    // Re-adopts every durable creation intent ('create pending') at
+    // startup/config reload: absent characters are residue (discarded),
+    // committed-but-unfinalized ones resume finalization, finalized ones
+    // reconstruct their post-create owner with the persisted login
+    // authorization. A failed scan retries with bounded backoff.
+    static bool ReadoptPendingCreations();
     // Whether a character deletion is currently owned (adopted, quarantined,
     // or freshly re-adopted from a durable intent). Every login/add-bot path
     // and the post-create owner reconstruction must exclude such guids: a

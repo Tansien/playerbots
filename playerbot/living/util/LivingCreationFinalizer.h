@@ -487,10 +487,21 @@ namespace living
                         StoreRecordOutcome(record.guid, RowVerifyOutcome::QueryFailed, CreationCallbackKind::Verify);
                     break;
                 case CreationStage::FailedRetryable:
-                    // The character transaction executed and rolled back; no
-                    // dependent state was ever written.
-                    PublishTerminal(record, CreationPollStatus::FailedRetryable,
-                        "character transaction rolled back; nothing persisted", onTerminal);
+                    // The character transaction executed and rolled back. The
+                    // creation intent and metadata rows were execution-
+                    // confirmed BEFORE the save, so they must be verifiably
+                    // removed before this attempt may be reported retryable;
+                    // an unconfirmed removal quarantines (fail closed - the
+                    // startup intent scan would otherwise resurrect residue).
+                    if (ops.deleteEventRows && ops.deleteEventRows(record.guid))
+                        PublishTerminal(record, CreationPollStatus::FailedRetryable,
+                            "character transaction rolled back; pre-persisted metadata removed", onTerminal);
+                    else
+                    {
+                        record.lifecycle.stage = CreationStage::Quarantined;
+                        PublishTerminal(record, CreationPollStatus::Quarantined,
+                            "character transaction rolled back but the pre-persisted metadata could not be confirmed removed", onTerminal);
+                    }
                     break;
                 case CreationStage::Quarantined:
                     PublishTerminal(record, CreationPollStatus::Quarantined,

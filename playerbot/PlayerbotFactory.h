@@ -51,12 +51,22 @@ public:
     static void Init();
     void Refresh();
     void Randomize(bool incremental, bool syncWithMaster);
-    // Suppresses every internal SaveToDB inside Randomize/Refresh. The
-    // durable post-create marker protocol REQUIRES a no-save application
-    // path: durable marker phase 1 must imply "no effect state persisted",
-    // so the effect application itself may not queue any character save -
-    // the owning consume queues exactly one save AFTER the phase-2 record
-    // is execution-confirmed.
+    // No-save application mode for the durable post-create marker consume.
+    // Durable marker phase 1 must imply "no effect state persisted", so the
+    // effect application may not perform independent durable writes; the
+    // owning consume queues exactly ONE character save AFTER the phase-2
+    // record is execution-confirmed. Audited persistence families inside
+    // Randomize(true, false):
+    //  - trailing Player::SaveToDB          -> gated by this flag;
+    //  - guild / arena membership           -> gated (own tables, NOT
+    //    idempotent to replay);
+    //  - spec/skill event rows (auto
+    //    talents -> PersistTalentSpec etc.) -> deliberately NOT gated: they
+    //    are the module's own execution-confirmed event writes, idempotent
+    //    (last-writer-wins per event), and re-applied verbatim when recovery
+    //    re-runs the effect - each is its own verified durable obligation;
+    //  - hunter pet SavePetToDB             -> deliberately NOT gated: keyed
+    //    per pet slot, overwritten idempotently on re-application.
     bool deferSave = false;
     static std::list<uint32> classQuestIds;
     static std::list<uint32> specialQuestIds;

@@ -1,6 +1,7 @@
 #include "LivingTest.h"
 
 #include "../util/LivingCreationLifecycle.h"
+#include "../util/LivingBotCreation.h"
 
 using namespace living;
 
@@ -463,6 +464,7 @@ namespace
 {
     struct TupleMarkerHarness
     {
+        static constexpr uint64_t kMaxMoney = 0x7FFFFFFE; // MAX_MONEY_AMOUNT in every pinned core
         DurableOneShotMarker ledger;
         uint32_t durablePhase = kMarkerPhasePending;
         std::string durableData = "sync@70";
@@ -522,8 +524,21 @@ namespace
                     if (equipChangesOnApply)
                         liveEquip += 11;   // the effect's own equipment delta
                     ++effects;             // (non-equipment changes are implicit)
-                    liveMoney += 1;        // the one-copper COMMIT TOKEN
+                    // The DIRECTION-AWARE one-copper commit token, exactly as
+                    // production applies it: a positive grant would clamp
+                    // silently at the money cap, so a saturated purse toggles
+                    // down - the token must move state at both boundaries.
+                    int32_t const delta = CommitTokenDelta(static_cast<uint32_t>(liveMoney),
+                        static_cast<uint32_t>(kMaxMoney));
+                    liveMoney = delta > 0
+                        ? (liveMoney >= kMaxMoney ? kMaxMoney : liveMoney + 1) // core clamp modeled
+                        : liveMoney - 1;
                     ledger.OnEffectApplied(pre, LiveHash(), durableData);
+                    if (ledger.preHash == ledger.postHash)
+                    {
+                        ledger.MarkQuarantined(); // production's asserted invariant
+                        return true;
+                    }
                     return recordThenSaveAndVerify();
                 }
                 case DurableMarkerStep::RecordApplied:
@@ -679,4 +694,52 @@ LIVING_TEST(durable_markers_serialize_levelup_before_gear)
     LIVING_CHECK(levelup.DeliverVerify() == MarkerVerifyAction::Proven);
     LIVING_CHECK(pass()); // levelup cleared -> gear may proceed
     LIVING_CHECK(gearApplied);
+}
+
+LIVING_TEST(durable_marker_commit_token_changes_state_at_both_money_boundaries)
+{
+    // Zero money: the token grants one copper upward.
+    TupleMarkerHarness zero;
+    zero.equipChangesOnApply = false; // isolate the token as the only delta
+    zero.liveMoney = zero.durableMoney = 0;
+    LIVING_CHECK(!zero.Pass());
+    LIVING_CHECK(!zero.ledger.quarantined);
+    LIVING_CHECK(zero.ledger.preHash != zero.ledger.postHash);
+    LIVING_CHECK(zero.liveMoney == 1);
+    LIVING_CHECK(zero.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(zero.Pass());
+
+    // SATURATED money: a positive grant would be a silent core no-op (the
+    // exact production bug), so the token toggles DOWN - pre/post still
+    // provably differ and a rolled-back save is still detectable.
+    TupleMarkerHarness saturated;
+    saturated.equipChangesOnApply = false;
+    saturated.liveMoney = saturated.durableMoney = TupleMarkerHarness::kMaxMoney;
+    saturated.savesCommit = false; // rollback at the boundary
+    LIVING_CHECK(!saturated.Pass());
+    LIVING_CHECK(!saturated.ledger.quarantined); // token DID move state
+    LIVING_CHECK(saturated.ledger.preHash != saturated.ledger.postHash);
+    LIVING_CHECK(saturated.liveMoney == TupleMarkerHarness::kMaxMoney - 1);
+    LIVING_CHECK(saturated.DeliverVerify() == MarkerVerifyAction::RetrySave); // rollback detected
+
+    saturated.savesCommit = true;
+    LIVING_CHECK(!saturated.Pass());
+    LIVING_CHECK(saturated.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(saturated.Pass());
+    LIVING_CHECK(saturated.effects == 1);
+
+    // Restart at the saturated boundary with the save lost: recovery still
+    // proves the loss (pre-match) and re-applies - never silently clears.
+    TupleMarkerHarness crashed;
+    crashed.equipChangesOnApply = false;
+    crashed.liveMoney = crashed.durableMoney = TupleMarkerHarness::kMaxMoney;
+    crashed.savesCommit = false;
+    LIVING_CHECK(!crashed.Pass());
+    crashed.Restart();
+    crashed.savesCommit = true;
+    LIVING_CHECK(!crashed.Pass()); // pre-match -> rewind to phase 1
+    LIVING_CHECK(crashed.durablePhase == kMarkerPhasePending);
+    LIVING_CHECK(!crashed.Pass()); // fresh application
+    LIVING_CHECK(crashed.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(crashed.Pass());
 }

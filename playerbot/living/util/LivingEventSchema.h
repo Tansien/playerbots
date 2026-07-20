@@ -23,6 +23,7 @@ namespace living
     inline bool IsLifecycleControlEvent(std::string const& event)
     {
         return event == "temporary" || event == "delete" || event == "test"
+            || event == "create pending"
             || event == "create levelup" || event == "create gear" || event == "create group";
     }
 
