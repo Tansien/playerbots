@@ -2104,8 +2104,9 @@ bool CreateBotOptions::Parse(Player* master, std::string const& param, std::stri
     if (std::string const* value = get("gear"))
     {
         // Finite whitelist BEFORE any mutation: an arbitrary payload used to
-        // act as "default" but could exceed the durable event envelope once
-        // phase-2 record metadata was appended.
+        // be accepted and silently act as "default", and an oversized one
+        // cannot fit the durable event envelope once a captured target level
+        // is stamped onto it.
         if (!living::IsSupportedGearValue(*value))
         {
             error = "Unsupported gear value '" + *value
@@ -2240,22 +2241,6 @@ namespace ai
             core.OnCallbackResult(guid, outcome, living::CreationCallbackKind::CleanupVerify);
         }
 
-        void HandleBulkCountVerify(QueryResult* result, uint64 generation)
-        {
-            // Any successful readback releases exactly THIS GENERATION's bulk
-            // reservations in the pump: the query executed AFTER that
-            // generation's saves on the same FIFO thread, so its completion
-            // is their durability barrier - the count value itself is not
-            // consulted, and reservations added after this query was queued
-            // are untouched (they carry their own generation and barrier).
-            living::RowVerifyOutcome const outcome = result
-                ? living::RowVerifyOutcome::Verified
-                : living::RowVerifyOutcome::QueryFailed;
-            delete result;
-
-            core.OnBulkCallbackResult(generation, outcome);
-        }
-
         living::CreationFinalizerOps Ops()
         {
             living::CreationFinalizerOps ops;
@@ -2331,20 +2316,6 @@ namespace ai
                         "the next startup replays the exposure and clears it", guid);
 
                 sLog.outDetail("Bot creation finalized: '%s' (guid %u)", name.c_str(), guid);
-            };
-            ops.requestBulkCountVerify = [this](uint32 accountId, uint64 generation) -> bool
-            {
-                // The callback parameter is the GENERATION token; the account
-                // is interpolated into the query text here. The enqueue result
-                // is propagated so the core's bounded retry/give-up path owns
-                // failures instead of the generation waiting forever.
-                return CharacterDatabase.AsyncPQuery(this, &BotCreationFinalizer::HandleBulkCountVerify, generation,
-                    "SELECT COUNT(guid) FROM characters WHERE account = '%u'", accountId);
-            };
-            ops.onBulkVerifyGaveUp = [](uint32 accountId, uint32 keptReservations)
-            {
-                sLog.outError("Bulk creation for account %u could not be verified; %u reserved slot(s) kept - capacity stays conservatively blocked",
-                    accountId, keptReservations);
             };
             return ops;
         }
@@ -2577,8 +2548,7 @@ bool PlayerbotHolder::ReadoptPendingDeletions()
                 sLog.outError("Deletion intent for guid %u ('%s') found a PRESENT character after restart; "
                     "identity cannot be proven immutable - quarantined for manual resolution, login blocked",
                     guid, recordedName.c_str());
-                ai::botDeletionConfirmer.core.AdoptQuarantined(guid, recordedAccount, recordedName,
-                    ai::botDeletionConfirmer.Ops());
+                ai::botDeletionConfirmer.core.AdoptQuarantined(guid, ai::botDeletionConfirmer.Ops());
                 break;
             case living::DeletionIntentRecovery::AdoptForCleanup:
                 AdoptCharacterDeletion(guid, recordedAccount, recordedName, false);
@@ -2808,11 +2778,6 @@ void PlayerbotHolder::ReleaseCharacterSlot(uint32 accountId)
     ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId);
 }
 
-void PlayerbotHolder::BeginBulkReservationVerify(uint32 accountId, uint32 reservedSlots)
-{
-    ai::botCreationFinalizer.core.BeginBulkVerify(accountId, reservedSlots, ai::botCreationFinalizer.Ops());
-}
-
 AccountLookupOutcome PlayerbotHolder::TryLookupAccountId(std::string const& accountName, uint32& accountId)
 {
     // COUNT + MIN aggregate: it always yields one row on success, so a null
@@ -2976,19 +2941,6 @@ namespace ai
                 result.status, result.creationToken, result.createdClass, pumpCount, result.createdRole);
         }
 
-        // Re-evaluate credited predecessor dependencies BEFORE surfacing
-        // completion: a credit whose member joined confirms into the
-        // baseline; one whose predecessor expired is replaced within the
-        // bounded budget or recorded - a fresh batch can never report a
-        // full-size success on vanished credit.
-        botCreationBatches.ReevaluateCredits(pumpCount,
-            [](uint32 initiatorGuid, uint32 memberGuid) -> bool
-            {
-                Player* initiator = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, initiatorGuid));
-                return initiator && initiator->GetGroup()
-                    && initiator->GetGroup()->IsMember(ObjectGuid(HIGHGUID_PLAYER, memberGuid));
-            });
-
         // Surface completed batches exactly once - the requested group is
         // never left silently undersized.
         for (living::CreationBatchRegistry::Batch const* batch : botCreationBatches.TakeNewlyCompleted())
@@ -3000,9 +2952,9 @@ namespace ai
 
             std::ostringstream summary;
             summary << "batch complete: " << finalized << " member(s) finalized";
-            uint32 const effectivePreexisting = batch->EffectivePreexisting();
-            uint32 const wanted = batch->desiredSize > effectivePreexisting
-                ? batch->desiredSize - effectivePreexisting : 0;
+            uint32 const baseline = batch->EffectivePreexisting();
+            uint32 const wanted = batch->desiredSize > baseline
+                ? batch->desiredSize - baseline : 0;
             if (finalized < wanted)
                 summary << " of " << wanted << " requested";
             if (!batch->failures.empty())
@@ -3663,24 +3615,35 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     if (requestPlan.action == living::GroupBatchRequestAction::AlreadyCovered
         && requestPlan.outstandingSlots > 0)
     {
-        // The reported coverage rests on referenced credits: a TRACKING batch
-        // retains those dependencies, so a predecessor expiring unjoined is
-        // replaced within the budget or reported as an observable undersized
-        // completion - never a silent, untracked "covered".
+        // Queueing nothing here is SUCCESS, not an admission failure, so the
+        // caller still gets a token IT OWNS - a fresh, empty tracking batch
+        // recording the covered request under its own ledger. NEVER a
+        // predecessor's token: the caller acknowledges its token when done,
+        // and acknowledging a batch this request did not create would erase
+        // it out from under its real owner (and judge this request against
+        // the other request's size and failures).
+        //
+        // The tracking batch has no members, so it polls Complete immediately
+        // and (effective baseline >= requested size) not undersized; it is
+        // never returned as extendable, and its credited count feeds no
+        // outstanding accounting. If a credited member ultimately never
+        // joins, the group is simply short and the user re-runs the command.
         living::CreationBatchRegistry::Batch tracking;
         tracking.initiatorName = master->GetName();
         tracking.initiatorGuid = master->GetGUIDLow();
         tracking.desiredSize = groupSize;
         tracking.preexistingMembers = liveMembers;
-        tracking.creditedDependencies = requestPlan.creditedDependencies;
-        tracking.replacementBudget = groupSize;
+        tracking.creditedMembers = requestPlan.outstandingSlots;
         tracking.memberGear = gear;
         tracking.memberAutoAdd = autoAdd;
         tracking.memberTemporary = temporary;
         tracking.useRandomAccounts = wantRandomAccounts;
+        // The user is told synchronously below; the pump must not surface a
+        // second, empty completion summary for this batch.
+        tracking.completionReported = true;
         batchToken = ai::botCreationBatches.Begin(std::move(tracking));
         if (!batchToken)
-            messages.push_back("Warning: creation batch registry is full; the credited coverage cannot be tracked to completion");
+            messages.push_back("Warning: creation batch registry is full; the covered request cannot be tracked");
 
         messages.push_back(std::to_string(requestPlan.outstandingSlots)
             + " outstanding member slot(s) from a previous group creation already cover the requested size; "
@@ -3734,14 +3697,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
 
     living::GroupCreationLedger ledger;
     std::vector<living::CreationBatchMember> batchMembers;
-    // A fresh batch's baseline EXPLICITLY credits the outstanding dependencies
-    // it coalesced over (live members plus older batches' unjoined slots).
-    // The credited slots are tracked BY REFERENCE (predecessor token+index)
-    // in the batch, so a predecessor that expires before its member joins is
-    // replaced within the bounded budget or reported as undersize - never
-    // silently counted forever; the message baseline below still uses the
-    // combined number.
-    uint32 const preexistingMembers = requestPlan.creditedPreexisting;
+    // A fresh batch's baseline credits the outstanding dependencies it
+    // coalesced over: live members plus older batches' unjoined slots. The
+    // credit is a plain count, so if a credited member ultimately never joins
+    // the group simply completes undersized and the user re-runs the command.
+    uint32 const preexistingMembers = requestPlan.effectiveMembers;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     bool stoppedOnTerminalFailure = false;
     bool stoppedOnTransientFailure = false;
@@ -3877,11 +3837,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         batch.initiatorName = master->GetName();
         batch.initiatorGuid = master->GetGUIDLow();
         batch.desiredSize = groupSize;
-        // Live members only; the credited dependencies are carried by
-        // reference and either confirm (join) into this baseline or are
-        // replaced/reported when their predecessor vanishes.
+        // The two halves of the baseline are stored SEPARATELY: a later
+        // extension refreshes the live count from its own observation, and
+        // must not discard the credited slots while doing so.
         batch.preexistingMembers = liveMembers;
-        batch.creditedDependencies = requestPlan.creditedDependencies;
+        batch.creditedMembers = requestPlan.outstandingSlots;
         batch.members = batchMembers;
         // Bounded replacement: at most one replacement per requested slot.
         batch.replacementBudget = groupSize;
@@ -4356,8 +4316,9 @@ bool PlayerbotHolder::DeleteBot(ObjectGuid guid, bool allowInstant)
     // event rows/markers are cleared - and account cleanup runs - only after
     // the execution-ordered readback confirms the character row absent (or the
     // guid is proven reused by a new identity). Still-present and failed
-    // readbacks retry bounded with a lost-callback watchdog; exhaustion fails
-    // closed (rows kept, a restart retries).
+    // readbacks retry bounded; a readback whose callback never arrives is
+    // bounded by a pump watchdog. Every exhaustion path fails closed - rows
+    // kept, login still blocked, a restart's scan retries.
     AdoptCharacterDeletion(guid.GetCounter(), botAccount, expectedName, true);
 
     OnBotDeleted(guid, botAccount);

@@ -261,10 +261,10 @@ namespace living
 
     // The FINITE set of supported gear values. Creation input is validated
     // against exactly this list BEFORE any account/character mutation: an
-    // arbitrary payload used to be accepted (acting as "default"), applied
-    // as an effect, and could then exceed the durable event envelope once
-    // the phase-2 record metadata was appended - an accepted input must
-    // never become impossible to persist.
+    // arbitrary payload used to be accepted (acting as "default") and applied
+    // as an effect, and an oversized one could then become impossible to
+    // persist once a captured target level was stamped onto it - an accepted
+    // input must never become unpersistable.
     inline bool IsSupportedGearValue(std::string const& value)
     {
         static char const* const kSupported[] = {
@@ -426,14 +426,6 @@ namespace living
                                                  : CreationIntentRecovery::ResumeFinalization;
     }
 
-    // Direction-aware one-copper commit token: the delta must ALWAYS change
-    // the purse, and every pinned core silently clamps a positive change at
-    // the money cap - so a saturated purse toggles down instead. Gameplay
-    // money is never permanently altered beyond one copper either way.
-    inline int32_t CommitTokenDelta(uint32_t money, uint32_t maxMoney)
-    {
-        return money < maxMoney ? 1 : -1;
-    }
 
     // Login decision for one offline sweep entry: an automatic login needs
     // the MODE to allow it (LOGIN_ONLY_ALWAYS_ACTIVE suppresses sweep logins

@@ -3,10 +3,8 @@
 #include "LivingEventSchema.h"
 
 #include <cstdint>
-#include <cstdio>
+#include <map>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace living
 {
@@ -147,17 +145,39 @@ namespace living
     };
 
     // Per-(bot, marker) one-shot ledger. The runtime effect (destroy/generate
-    // gear, level up, install a test strategy) must run EXACTLY ONCE, then the
-    // durable marker row is cleared. A marker that is `create X = 1` and never
-    // cleared - or whose clear is unconfirmed - would otherwise replay the
-    // mutation every manager pass for an always-online bot. This separates
-    // "effect applied" from "marker consumed": the effect runs once and, until
-    // the clear is execution-confirmed, only the CLEAR is retried; a confirmed
-    // clear ends the obligation. A transient read blip (marker briefly absent)
-    // does NOT reset the applied flag, so it can never license a replay.
+    // gear, level up, install a test strategy) must run EXACTLY ONCE per
+    // process, then the durable marker row is cleared. A marker that is
+    // `create X = 1` and never cleared - or whose clear is unconfirmed - would
+    // otherwise replay the mutation every manager pass for an always-online
+    // bot. This separates "effect applied" from "marker consumed": the effect
+    // runs once and, until the clear is execution-confirmed, only the CLEAR is
+    // retried; a confirmed clear ends the obligation. A transient read blip
+    // (marker briefly absent) does NOT reset the applied flag, so it can never
+    // license a replay.
+    //
+    // ponytail: crash-window disclosure. Every marker effect (re-randomize
+    // gear, level up, install a test strategy) is a bot-facing randomization,
+    // so BOTH failure directions are tolerable and no durable
+    // applied-phase/fingerprint protocol is warranted here:
+    //   - crash before the clear -> the effect replays once next login pass;
+    //   - crash after the clear  -> that one application is lost.
+    // The caller is still required to queue the effect's persistence BEFORE
+    // asking for the clear. The clear is durable the instant it returns, so
+    // clearing first would widen the second window from "a queued save that
+    // had not drained yet" to "no save was ever queued at all".
     struct OneShotMarker
     {
+        // Failed clear attempts after which the stuck clear is DISCLOSED
+        // (once). The retry itself is deliberately unbounded and self-healing:
+        // the ledger is retained, so only the CLEAR is ever retried and the
+        // first confirmed clear ends the obligation the moment the database
+        // recovers. A give-up that erased the ledger would re-license the
+        // effect against the still-present durable row - a replay loop, which
+        // is strictly worse than an idle retry.
+        static constexpr uint32_t kStuckClearWarnAttempts = 5;
+
         bool effectApplied = false;
+        uint32_t clearAttempts = 0;
 
         MarkerConsumeStep Plan(bool present) const
         {
@@ -168,284 +188,95 @@ namespace living
 
         void OnEffectApplied() { effectApplied = true; }
 
-        // Feeds the typed clear result; returns whether the marker is now fully
-        // consumed (only a confirmed clear ends it and resets the ledger).
-        bool OnClearResult(EventWriteResult clearResult)
-        {
-            bool const consumed = clearResult == EventWriteResult::DesiredStateConfirmed;
-            if (consumed)
-                effectApplied = false;
-            return consumed;
-        }
-    };
-
-    // Durable phase values for a DESTRUCTIVE one-shot marker (create gear /
-    // create levelup): the phase lives in the marker row's value, so a fresh
-    // process can tell "effect provably never persisted" from "effect ran at
-    // least once" - the in-memory OneShotMarker ledger alone could not, and a
-    // crash either replayed the destructive mutation or silently lost it.
-    //
-    // The protocol proves outcomes instead of assuming them:
-    //   phase 1 (Pending): the effect was never durably recorded. Because the
-    //     character save is queued only AFTER the phase-2 record is
-    //     execution-confirmed, durable phase 1 implies the durable character
-    //     state is still pre-effect - re-applying is a safe first application.
-    //   phase 2 (Applied): the effect ran, and the record carries the PRE and
-    //     POST equipment-state fingerprints captured around it. Durability is
-    //     then PROVEN by comparing the fingerprint against the stored
-    //     equipment (an execution-ordered readback behind the queued save; on
-    //     restart, against the freshly loaded character). post-match = proven
-    //     durable (clear); pre-match = provably lost (safe to re-apply by
-    //     rewinding the record to phase 1); anything else = ambiguous, which
-    //     QUARANTINES the marker with an actionable error - never a silent
-    //     clear, never a blind replay.
-    // Known limitation, disclosed: an effect that leaves equipment unchanged
-    // (pre == post) cannot be distinguished by the fingerprint; its
-    // non-equipment changes ride the same save transaction and are treated as
-    // proven when the equipment matches.
-    inline constexpr uint32_t kMarkerPhasePending = 1; // effect not durably recorded
-    inline constexpr uint32_t kMarkerPhaseApplied = 2; // effect ran; fingerprints recorded
-
-    // FNV-1a 64 over a canonical (slot, item-guid) equipment serialization;
-    // the SAME function hashes the in-memory snapshot and the
-    // character_inventory readback so the two are directly comparable.
-    inline uint64_t HashEquipmentState(std::vector<std::pair<uint8_t, uint32_t>> const& slotItems)
-    {
-        uint64_t hash = 14695981039346656037ull;
-        auto mix = [&hash](uint64_t value)
-        {
-            for (int i = 0; i < 8; ++i)
-            {
-                hash ^= (value >> (i * 8)) & 0xFF;
-                hash *= 1099511628211ull;
-            }
-        };
-        for (auto const& [slot, itemGuid] : slotItems)
-        {
-            mix(slot);
-            mix(itemGuid);
-        }
-        return hash;
-    }
-
-    // The phase-2 record's data payload: the ORIGINAL payload (gear quality
-    // etc., needed verbatim if the effect must be re-applied) plus both
-    // fingerprints. Fits EVENT_DATA_MAX_BYTES for every legal original.
-    inline std::string EncodeDurableMarkerData(std::string const& original, uint64_t preHash, uint64_t postHash)
-    {
-        char buffer[48];
-        std::snprintf(buffer, sizeof(buffer), "|pre:%016llx|post:%016llx",
-            static_cast<unsigned long long>(preHash), static_cast<unsigned long long>(postHash));
-        return original + buffer;
-    }
-
-    inline bool TryDecodeDurableMarkerData(std::string const& data, std::string& original,
-        uint64_t& preHash, uint64_t& postHash)
-    {
-        size_t const prePos = data.rfind("|pre:");
-        size_t const postPos = data.rfind("|post:");
-        if (prePos == std::string::npos || postPos == std::string::npos || postPos != prePos + 5 + 16)
-            return false;
-
-        auto parseHex16 = [&](size_t begin, uint64_t& out) -> bool
-        {
-            uint64_t value = 0;
-            for (size_t i = 0; i < 16; ++i)
-            {
-                char const c = begin + i < data.size() ? data[begin + i] : '\0';
-                uint64_t digit;
-                if (c >= '0' && c <= '9') digit = static_cast<uint64_t>(c - '0');
-                else if (c >= 'a' && c <= 'f') digit = static_cast<uint64_t>(c - 'a') + 10;
-                else return false;
-                value = (value << 4) | digit;
-            }
-            out = value;
-            return true;
-        };
-
-        if (data.size() != postPos + 6 + 16)
-            return false;
-        if (!parseHex16(prePos + 5, preHash) || !parseHex16(postPos + 6, postHash))
-            return false;
-
-        original = data.substr(0, prePos);
-        return true;
-    }
-
-    // What a destructive marker owes this pass.
-    enum class DurableMarkerStep
-    {
-        // Marker absent: nothing owed.
-        Idle,
-        // Phase 1, effect not applied this process: capture the PRE
-        // fingerprint, apply the effect, capture POST, then durably record
-        // phase 2 with both fingerprints (execution-confirmed).
-        ApplyThenRecord,
-        // Effect applied this process but the phase-2 record is still owed
-        // (its confirmed write failed): retry ONLY the record - never the
-        // effect (the kept fingerprints travel with the ledger).
-        RecordApplied,
-        // Phase 2 recorded this process: queue/re-queue the character save
-        // and request the execution-ordered fingerprint verification.
-        SaveAndVerify,
-        // A verification request is in flight: tick the lost-callback
-        // watchdog; timeout invalidates the generation and re-arms.
-        AwaitVerify,
-        // Postcondition proven durable: retry only the confirmed clear.
-        ClearConfirmed,
-        // Fresh process, phase 2: reconcile the recorded fingerprints against
-        // the freshly loaded character (post-match -> proven; pre-match ->
-        // rewind to phase 1 and re-apply; neither -> quarantine).
-        RecoverProbe,
-        // Ambiguous durable state: retained with an actionable error; no
-        // further automatic work, never silently cleared.
-        Quarantined,
-    };
-
-    // What the caller owes after feeding one verification result.
-    enum class MarkerVerifyAction
-    {
-        None,        // stale generation / not awaiting: ignore
-        Proven,      // postcondition matched: proceed to the confirmed clear
-        RetrySave,   // mismatch or failed query: re-save + re-verify (bounded)
-        Quarantined, // bounded attempts exhausted: retained with error
-    };
-
-    // Per-(bot, marker) ledger for the durable fingerprint-verified consume.
-    struct DurableOneShotMarker
-    {
-        static constexpr uint32_t kMaxVerifyAttempts = 5;
-        // Passes a verification may stay outstanding before its callback is
-        // considered lost and the request is re-armed under a new generation
-        // (the relocation watchdog pattern; one pass per manager tick).
-        static constexpr uint32_t kMaxAwaitVerifyPasses = 128;
-
-        bool effectApplied = false;      // this process
-        bool phaseRecorded = false;      // confirmed durable phase-2 record
-        bool verifyOutstanding = false;  // a verification query is in flight
-        bool postconditionProven = false;
-        bool quarantined = false;
-        uint32_t verifyAttempts = 0;     // mismatches/failures/timeouts consumed
-        uint32_t verifyGeneration = 0;   // stamps requests; stale results ignored
-        uint32_t awaitingPasses = 0;     // watchdog while a verify is outstanding
-        uint64_t preHash = 0;
-        uint64_t postHash = 0;
-        std::string originalData;        // payload preserved for a re-apply
-
-        DurableMarkerStep Plan(uint32_t durablePhase) const
-        {
-            if (quarantined)
-                return DurableMarkerStep::Quarantined;
-            if (durablePhase == 0)
-                return DurableMarkerStep::Idle;
-            if (durablePhase < kMarkerPhaseApplied)
-                return effectApplied ? DurableMarkerStep::RecordApplied
-                                     : DurableMarkerStep::ApplyThenRecord;
-            if (!effectApplied)
-                return DurableMarkerStep::RecoverProbe;
-            if (postconditionProven)
-                return DurableMarkerStep::ClearConfirmed;
-            return verifyOutstanding ? DurableMarkerStep::AwaitVerify
-                                     : DurableMarkerStep::SaveAndVerify;
-        }
-
-        void OnEffectApplied(uint64_t pre, uint64_t post, std::string original)
-        {
-            effectApplied = true;
-            preHash = pre;
-            postHash = post;
-            originalData = std::move(original);
-        }
-
-        void OnPhaseRecorded() { phaseRecorded = true; }
-
-        // Stamps a fresh request generation (invalidating any stale in-flight
-        // result) and returns it for the request binding.
-        uint32_t BeginVerify()
-        {
-            ++verifyGeneration;
-            awaitingPasses = 0;
-            return verifyGeneration;
-        }
-
-        void OnVerifyRequested(bool enqueued)
-        {
-            verifyOutstanding = enqueued;
-            if (!enqueued)
-                ConsumeVerifyAttempt(); // failed enqueue: bounded retry next pass
-        }
-
-        // Watchdog tick while AwaitVerify: returns true when the outstanding
-        // result is considered LOST - the wait is abandoned (consuming one
-        // bounded attempt) and the caller re-requests under a new generation.
-        bool TickAwaitingVerify()
-        {
-            if (!verifyOutstanding)
-                return false;
-
-            if (++awaitingPasses <= kMaxAwaitVerifyPasses)
-                return false;
-
-            verifyOutstanding = false;
-            ConsumeVerifyAttempt();
-            return true;
-        }
-
-        enum class VerifyOutcome { Match, Mismatch, QueryFailed };
-
-        // Feeds one verification result. Results whose generation does not
-        // match the CURRENT outstanding request are stale (a late callback
-        // after a watchdog re-arm) and are ignored.
-        MarkerVerifyAction OnVerifyResult(uint32_t generation, VerifyOutcome outcome)
-        {
-            if (!verifyOutstanding || generation != verifyGeneration)
-                return MarkerVerifyAction::None;
-
-            verifyOutstanding = false;
-            awaitingPasses = 0;
-
-            if (outcome == VerifyOutcome::Match)
-            {
-                postconditionProven = true;
-                return MarkerVerifyAction::Proven;
-            }
-
-            ConsumeVerifyAttempt();
-            return quarantined ? MarkerVerifyAction::Quarantined : MarkerVerifyAction::RetrySave;
-        }
-
-        // Recovery decision for a fresh process holding a phase-2 record.
-        enum class RecoverDecision { ProvenDurable, ReapplySafe, Ambiguous };
-
-        static RecoverDecision Reconcile(uint64_t currentHash, uint64_t recordedPre, uint64_t recordedPost)
-        {
-            if (currentHash == recordedPost)
-                return RecoverDecision::ProvenDurable; // ties (pre==post) favor proven
-            if (currentHash == recordedPre)
-                return RecoverDecision::ReapplySafe;
-            return RecoverDecision::Ambiguous;
-        }
-
-        void MarkProven() { effectApplied = true; postconditionProven = true; }
-
-        void MarkQuarantined() { quarantined = true; }
-
         // Feeds the typed clear result; returns whether the marker is now
-        // fully consumed (only a confirmed clear ends it and resets the
-        // ledger).
+        // fully consumed. The ledger entry itself is erased by the consume
+        // protocol below - never reset in place.
         bool OnClearResult(EventWriteResult clearResult)
         {
             bool const consumed = clearResult == EventWriteResult::DesiredStateConfirmed;
-            if (consumed)
-                *this = DurableOneShotMarker{};
+            if (!consumed)
+                ++clearAttempts;
             return consumed;
         }
-
-    private:
-        void ConsumeVerifyAttempt()
-        {
-            if (++verifyAttempts >= kMaxVerifyAttempts)
-                quarantined = true;
-        }
     };
+
+    // Ledger of one-shot marker state: bot guid -> marker name -> ledger.
+    // Owned by the manager; ForgetEventCache erases a bot's entry wholesale.
+    using OneShotLedgers = std::map<uint32_t, std::map<std::string, OneShotMarker>>;
+
+    // Drives ONE pass of the one-shot consume protocol - INCLUDING the ledger
+    // lifecycle, which is exactly the part a caller must never improvise: the
+    // ledger entry is the only record that the effect already ran, so it may
+    // be erased only when the durable row is authoritatively absent or the
+    // clear is execution-confirmed. Returns whether the marker is settled.
+    //
+    //   presentKnown == false -> unknown durable state: mutate nothing, keep
+    //                            ownership (not settled).
+    //   present == false      -> settled; any tracked state is dropped.
+    //   effect not yet run    -> applyEffect() exactly once, then the clear.
+    //   clear unconfirmed     -> ledger RETAINED; only the clear retries next
+    //                            pass, unbounded and self-healing.
+    //                            onClearStuck fires once when the attempt
+    //                            count first reaches kStuckClearWarnAttempts.
+    //
+    // The ledgers are re-consulted after applyEffect: its call graph is large
+    // (factory runs, character saves) and must not be assumed to leave the
+    // ledgers untouched.
+    template <typename ApplyFn, typename ClearFn, typename StuckFn>
+    bool ConsumeOneShotMarker(OneShotLedgers& ledgers, uint32_t bot, std::string const& marker,
+        bool presentKnown, bool present, ApplyFn&& applyEffect, ClearFn&& clearMarker,
+        StuckFn&& onClearStuck)
+    {
+        // find(), never operator[]: probing must not default-insert per-bot
+        // maps for the common no-marker case.
+        auto tracked = [&]() -> OneShotMarker*
+        {
+            auto botIt = ledgers.find(bot);
+            if (botIt == ledgers.end())
+                return nullptr;
+            auto markerIt = botIt->second.find(marker);
+            return markerIt == botIt->second.end() ? nullptr : &markerIt->second;
+        };
+        auto dropTracked = [&]()
+        {
+            auto botIt = ledgers.find(bot);
+            if (botIt == ledgers.end())
+                return;
+            botIt->second.erase(marker);
+            if (botIt->second.empty())
+                ledgers.erase(botIt); // never retain empty per-bot maps
+        };
+
+        if (!presentKnown)
+            return false;
+
+        if (!present)
+        {
+            dropTracked();
+            return true; // authoritatively absent: settled
+        }
+
+        OneShotMarker* oneShot = tracked();
+        if (!oneShot || !oneShot->effectApplied)
+        {
+            applyEffect();
+            ledgers[bot][marker].OnEffectApplied(); // re-acquired post-effect
+        }
+
+        bool const cleared = clearMarker();
+        oneShot = tracked();
+        if (!oneShot)
+            return false; // ledger vanished mid-consume (bot forgotten): keep ownership
+
+        if (oneShot->OnClearResult(cleared ? EventWriteResult::DesiredStateConfirmed
+                                           : EventWriteResult::StateUnknown))
+        {
+            dropTracked();
+            return true;
+        }
+
+        if (oneShot->clearAttempts == OneShotMarker::kStuckClearWarnAttempts)
+            onClearStuck(oneShot->clearAttempts);
+        return false;
+    }
 }

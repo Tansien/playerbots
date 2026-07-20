@@ -924,8 +924,8 @@ void RandomPlayerbotFactory::CreateRandomBots()
     std::map<std::pair<uint8, uint8>, uint32> remaining = sPlayerbotAIConfig.fixedClassRaceCounts;
 
     // Shared character-slot reservations taken by THIS bulk run, per account:
-    // released only by the execution-ordered per-account readback registered
-    // after the save barrier (never merely because SaveToDB returned).
+    // released once this run's saves have been queued (see the release loop at
+    // the end of the fill for the window that leaves open).
     std::map<uint32, uint32> bulkReservedSlots;
 
     for (uint32 accountNumber = 0; accountNumber < sPlayerbotAIConfig.randomBotAccountCount; ++accountNumber)
@@ -1110,13 +1110,16 @@ void RandomPlayerbotFactory::CreateRandomBots()
         account_creations[i].wait();
     }
 
-    // Every queued character above occupies one shared reservation. Register
-    // the execution-ordered per-account readback (issued after the saves were
-    // queued on the same FIFO thread): the creation-finalizer pump releases
-    // the reservations when it returns, and KEEPS them on bounded failure -
-    // never merely because SaveToDB returned.
+    // The shared reservations held during this fill are released now that the
+    // saves are QUEUED - not executed. ponytail: a single creation racing this
+    // window admits against a durable count that does not yet include the
+    // queued characters, so that account can end up over MaxCharsPerAccount().
+    // The surplus is PERMANENT (reservation only refuses further additions, it
+    // does not remove anything); accepted because the window is one startup
+    // fill and the cap is a soft provisioning limit, not a correctness bound.
     for (auto const& [reservedAccountId, reservedSlots] : bulkReservedSlots)
-        PlayerbotHolder::BeginBulkReservationVerify(reservedAccountId, reservedSlots);
+        for (uint32 slot = 0; slot < reservedSlots; ++slot)
+            PlayerbotHolder::ReleaseCharacterSlot(reservedAccountId);
 
     std::vector<Player*> players;
 

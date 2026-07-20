@@ -228,12 +228,7 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
     sLog.outDetail("Initializing talents...");
     //InitTalentsTree(incremental);
     //sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", 0);
-    if (!deferSave)
-        ai->DoSpecificAction("auto talents");
-    // deferSave: talent selection is performed by the OWNING CONSUME through
-    // the persistence-free SelectTalents right after this returns, and the
-    // spec-event writes are staged until the player save is proven durable -
-    // phase 1 must make no independent durable writes.
+    ai->DoSpecificAction("auto talents");
 
     if (!incremental && isRandomBot)
         sPlayerbotDbStore.Reset(ai);
@@ -307,13 +302,8 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
         InitInventory();
     }
 
-    if (isRandomBot && !deferSave)
+    if (isRandomBot)
     {
-        // Guild and arena membership write their OWN tables outside any
-        // character-save transaction and are not idempotent to replay (a
-        // re-run may join a different random guild). Under deferSave (the
-        // durable post-create marker consume) they are skipped entirely:
-        // phase 1 must perform no independent, non-idempotent durable writes.
         auto pmo_guild_teams = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Guilds & ArenaTeams");
         sLog.outDetail("Initializing guilds & ArenaTeams");
         InitGuild();
@@ -359,21 +349,10 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 
     pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Save");
     sLog.outDetail("Saving to DB...");
-    // deferSave: the durable-marker consume owns the ONE save (queued only
-    // after its phase-2 record is execution-confirmed); a nested save here
-    // could commit the effect while the marker still claims it unapplied.
-    if (!deferSave && sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
+    if (sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
         bot->SaveToDB();
     sLog.outDetail("Done.");
     pmo.reset();
-}
-
-void PlayerbotFactory::SavePetForOwner(Player* owner)
-{
-    // Staged pet persistence for the durable-marker consume: keyed per pet
-    // slot in every pinned core, so re-application overwrites idempotently.
-    if (Pet* pet = owner->GetPet())
-        pet->SavePetToDB(PET_SAVE_AS_CURRENT, owner);
 }
 
 void PlayerbotFactory::Refresh()
@@ -387,7 +366,7 @@ void PlayerbotFactory::Refresh()
     InitPotions();
     InitReagents();
     AddConsumables();
-    if (!deferSave && sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
+    if (sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
         bot->SaveToDB();
 }
 
@@ -651,10 +630,7 @@ void PlayerbotFactory::InitPet()
 #endif
 
             sLog.outDebug(  "Bot %s: assign pet %d (%d level)", bot->GetName(), co->Entry, bot->GetLevel());
-            // Under deferSave the pet save is STAGED by the marker consume
-            // and performed only after the player save is proven durable.
-            if (!deferSave)
-                pet->SavePetToDB(PET_SAVE_AS_CURRENT, bot);
+            pet->SavePetToDB(PET_SAVE_AS_CURRENT, bot);
             bot->PetSpellInitialize();
             break;
         }

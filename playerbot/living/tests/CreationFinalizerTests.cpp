@@ -9,12 +9,12 @@
 using namespace living;
 
 // CreationFinalizer is the exact deferred-callback registry the production
-// finalizer drives: SQL result callbacks may only call OnCallbackResult /
-// OnBulkCallbackResult (a copy into the owning record's or generation's
-// mailbox - never dropped, never any ops), and every lifecycle transition,
-// metadata write, cleanup, retry and follow-up query runs in Pump. These are
-// spy-backed fault-injection tests of that production decision core; the live
-// async-queue/MySQL wiring is exercised only in-world.
+// finalizer drives: SQL result callbacks may only call OnCallbackResult (a
+// copy into the owning record's mailbox - never dropped, never any ops), and
+// every lifecycle transition, metadata write, cleanup, retry and follow-up
+// query runs in Pump. These are spy-backed fault-injection tests of that
+// production decision core; the live async-queue/MySQL wiring is exercised
+// only in-world.
 
 namespace
 {
@@ -26,22 +26,16 @@ namespace
         std::vector<uint32_t> eventDeletes;
         std::vector<uint32_t> characterDeletes;
         std::vector<uint32_t> created;
-        std::vector<std::pair<uint32_t, uint64_t>> bulkVerifyRequests;
 
         bool metadataSucceeds = true;
         bool eventDeleteSucceeds = true;
         bool verifyEnqueueSucceeds = true;
         bool cleanupEnqueueSucceeds = true;
-        bool bulkEnqueueSucceeds = true;
-
-        uint32_t bulkGaveUpAccount = 0;
-        uint32_t bulkGaveUpKept = 0;
 
         size_t TotalOps() const
         {
             return verifyRequests.size() + cleanupVerifyRequests.size() + metadataWrites.size()
-                + eventDeletes.size() + characterDeletes.size() + created.size()
-                + bulkVerifyRequests.size();
+                + eventDeletes.size() + characterDeletes.size() + created.size();
         }
 
         CreationFinalizerOps Make()
@@ -53,16 +47,6 @@ namespace
             ops.deleteEventRows = [this](uint32_t guid) { eventDeletes.push_back(guid); return eventDeleteSucceeds; };
             ops.deleteCharacter = [this](uint32_t guid, uint32_t) { characterDeletes.push_back(guid); };
             ops.onCreated = [this](uint32_t guid, uint32_t, std::string const&, bool) { created.push_back(guid); };
-            ops.requestBulkCountVerify = [this](uint32_t accountId, uint64_t generation)
-            {
-                bulkVerifyRequests.push_back({ accountId, generation });
-                return bulkEnqueueSucceeds;
-            };
-            ops.onBulkVerifyGaveUp = [this](uint32_t accountId, uint32_t kept)
-            {
-                bulkGaveUpAccount = accountId;
-                bulkGaveUpKept = kept;
-            };
             return ops;
         }
     };
@@ -369,131 +353,28 @@ LIVING_TEST(creation_finalizer_reserves_account_capacity_before_save)
     LIVING_CHECK(!finalizer.TryReserveAccountSlot(50, durable, 9));
 }
 
-LIVING_TEST(creation_finalizer_bulk_barriers_are_generation_scoped)
+LIVING_TEST(creation_finalizer_callback_delivery_is_lossless)
 {
-    // The exact ordering finding: generation A's saves and barrier are
-    // queued, then generation B's saves and barrier, BEFORE A's callback
-    // arrives. A's callback releases ONLY A's slots (its query proves nothing
-    // about B's later saves); B stays reserved until B's own barrier returns.
+    // Callback storage lives in each record's own mailbox, so callbacks for
+    // every admitted record survive arriving before any pump - none dropped.
     CreationFinalizer finalizer;
     SpyOps spy;
     auto ops = spy.Make();
 
-    // Generation A: 2 slots on account 70.
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
-    uint64_t const generationA = finalizer.BeginBulkVerify(70, 2, ops);
-    LIVING_CHECK(generationA != 0);
-
-    // Generation B: 3 more slots on the SAME account, before A's callback.
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(70, 0, 9));
-    uint64_t const generationB = finalizer.BeginBulkVerify(70, 3, ops);
-    LIVING_CHECK(generationB != 0 && generationB != generationA);
-    LIVING_CHECK(finalizer.ReservedCount(70) == 5);
-    LIVING_CHECK(spy.bulkVerifyRequests.size() == 2); // one barrier per generation
-
-    // A's callback: releases exactly A's 2 slots; B's 3 remain reserved.
-    finalizer.OnBulkCallbackResult(generationA, RowVerifyOutcome::Verified);
-    finalizer.Pump(ops);
-    LIVING_CHECK(finalizer.ReservedCount(70) == 3);
-    LIVING_CHECK(finalizer.PendingBulkVerifyCount() == 1);
-
-    // A duplicate/stale result for A matches nothing and is ignored.
-    finalizer.OnBulkCallbackResult(generationA, RowVerifyOutcome::Verified);
-    finalizer.Pump(ops);
-    LIVING_CHECK(finalizer.ReservedCount(70) == 3);
-
-    // B's own barrier releases B.
-    finalizer.OnBulkCallbackResult(generationB, RowVerifyOutcome::Verified);
-    finalizer.Pump(ops);
-    LIVING_CHECK(finalizer.ReservedCount(70) == 0);
-    LIVING_CHECK(finalizer.PendingBulkVerifyCount() == 0);
-}
-
-LIVING_TEST(creation_finalizer_bulk_generation_retries_independently)
-{
-    // Generation A keeps failing (retrying after B's saves is harmless: it
-    // still releases only A's slots) while B completes; A's bounded give-up
-    // keeps only A's reservations.
-    CreationFinalizer finalizer;
-    SpyOps spy;
-    auto ops = spy.Make();
-
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(71, 0, 9));
-    uint64_t const generationA = finalizer.BeginBulkVerify(71, 1, ops);
-
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(71, 0, 9));
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(71, 0, 9));
-    uint64_t const generationB = finalizer.BeginBulkVerify(71, 2, ops);
-
-    // A fails once; B completes meanwhile.
-    finalizer.OnBulkCallbackResult(generationA, RowVerifyOutcome::QueryFailed);
-    finalizer.OnBulkCallbackResult(generationB, RowVerifyOutcome::Verified);
-    finalizer.Pump(ops);
-    LIVING_CHECK(finalizer.ReservedCount(71) == 1); // only A's slot remains
-    LIVING_CHECK(spy.bulkVerifyRequests.size() == 3); // A's retry was issued
-
-    // A's retry succeeds after B's saves: releases exactly A's slot.
-    finalizer.OnBulkCallbackResult(generationA, RowVerifyOutcome::Verified);
-    finalizer.Pump(ops);
-    LIVING_CHECK(finalizer.ReservedCount(71) == 0);
-
-    // A generation whose readback NEVER succeeds gives up bounded and keeps
-    // its slots.
-    LIVING_CHECK(finalizer.TryReserveAccountSlot(72, 0, 9));
-    uint64_t const generationC = finalizer.BeginBulkVerify(72, 1, ops);
-    for (uint32_t i = 0; i < CreationFinalizer::kMaxBulkVerifyAttempts; ++i)
-    {
-        finalizer.OnBulkCallbackResult(generationC, RowVerifyOutcome::QueryFailed);
-        finalizer.Pump(ops);
-    }
-    LIVING_CHECK(spy.bulkGaveUpAccount == 72 && spy.bulkGaveUpKept == 1);
-    LIVING_CHECK(finalizer.ReservedCount(72) == 1); // conservatively blocked
-    LIVING_CHECK(finalizer.PendingBulkVerifyCount() == 0);
-}
-
-LIVING_TEST(creation_finalizer_callback_delivery_is_lossless_past_256)
-{
-    // The former drop-on-256 queue scenario: more than 256 combined ordinary
-    // and bulk callbacks (the 257th event included) - every one is delivered
-    // through its owner's mailbox and every reservation reaches release.
-    CreationFinalizer finalizer;
-    SpyOps spy;
-    auto ops = spy.Make();
-
-    // 60 ordinary records (within the 64-record admission bound)...
     std::vector<uint64_t> tokens;
     for (uint32_t guid = 1000; guid < 1060; ++guid)
         tokens.push_back(finalizer.Begin(MakeRecord(guid, 1, "Bot" + std::to_string(guid)), ops));
 
-    // ...plus 200 bulk generations with one reserved slot each.
-    std::vector<uint64_t> generations;
-    for (uint32_t account = 2000; account < 2200; ++account)
-    {
-        LIVING_CHECK(finalizer.TryReserveAccountSlot(account, 0, 9));
-        generations.push_back(finalizer.BeginBulkVerify(account, 1, ops));
-    }
-
-    // 260 callbacks arrive before any pump - beyond the old 256-event queue.
     for (uint32_t guid = 1000; guid < 1060; ++guid)
         finalizer.OnCallbackResult(guid, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
-    for (uint64_t generation : generations)
-        finalizer.OnBulkCallbackResult(generation, RowVerifyOutcome::Verified);
 
-    LIVING_CHECK(finalizer.PendingCallbackCount() == 260);
+    LIVING_CHECK(finalizer.PendingCallbackCount() == 60);
 
     finalizer.Pump(ops);
 
-    // Nothing was dropped: every record finalized and every bulk generation
-    // released its reservation.
     LIVING_CHECK(finalizer.PendingCallbackCount() == 0);
     LIVING_CHECK(finalizer.RecordCount() == 0);
-    LIVING_CHECK(finalizer.PendingBulkVerifyCount() == 0);
     LIVING_CHECK(spy.created.size() == 60);
-    for (uint32_t account = 2000; account < 2200; ++account)
-        LIVING_CHECK(finalizer.ReservedCount(account) == 0);
 }
 
 LIVING_TEST(creation_finalizer_bulk_and_manual_reservations_share_one_ledger)
@@ -1004,9 +885,12 @@ LIVING_TEST(group_batch_request_plan_rejects_changed_options_over_retained_unjoi
 LIVING_TEST(group_batch_request_plan_credits_dependencies_without_false_undersize)
 {
     // Completed-unjoined batch followed by a compatible LARGER request: the
-    // fresh batch credits the dependency in its baseline, queues only the
-    // residual, and its completion must NOT report a false undersize for the
-    // slot the older batch's ledger still owns.
+    // fresh batch folds the credited slot into its preexisting baseline as a
+    // plain count, queues only the residual, and its completion does not
+    // report a false undersize for the slot the older batch's ledger still
+    // owns. (If a credited member later expires without joining, the group is
+    // simply undersized and the user re-runs the command - the documented
+    // no-tracking trade.)
     CreationBatchRegistry registry;
 
     CreationBatchRegistry::Batch a;
@@ -1024,171 +908,114 @@ LIVING_TEST(group_batch_request_plan_credits_dependencies_without_false_undersiz
         /*live*/ 1, /*requested*/ 4, Options("epic"));
     LIVING_CHECK(plan.action == GroupBatchRequestAction::BeginNew);
     LIVING_CHECK(plan.outstandingSlots == 1);
-    LIVING_CHECK(plan.creditedPreexisting == 2); // live + credited dependency
-    LIVING_CHECK(plan.creditedDependencies.size() == 1); // tracked by reference
+    LIVING_CHECK(plan.effectiveMembers == 2); // live + credited dependency
 
-    // The handler's follow-through: residual deficit is 4 - 2 = 2 members;
-    // the live baseline and the credited REFERENCE are stored separately.
+    // The handler's follow-through: residual deficit is 4 - 2 = 2 members.
+    // The live and credited halves are stored SEPARATELY.
     CreationBatchRegistry::Batch b;
     b.initiatorGuid = 88;
     b.desiredSize = 4;
-    b.preexistingMembers = 1; // live members only
-    b.creditedDependencies = plan.creditedDependencies;
+    b.preexistingMembers = 1;                          // live
+    b.creditedMembers = plan.outstandingSlots;         // older batch's unjoined slot
     b.members = { PendingMember(62, 2, 2), PendingMember(63, 3, 4) };
     uint64_t const tokenB = registry.Begin(std::move(b));
 
     registry.OnCreationTerminal(MakeCompletion(62, CreationPollStatus::Created, 8002), 2);
     registry.OnCreationTerminal(MakeCompletion(63, CreationPollStatus::Created, 8003), 3);
 
-    // Own members are done, but the referenced credit is UNRESOLVED: the
-    // batch must NOT report final success yet - the credited member could
-    // still vanish. (This used to poll Complete prematurely.)
-    LIVING_CHECK(registry.Poll(tokenB, false).status == BatchPollStatus::Pending);
-
-    // The credited member joins: the per-pump re-evaluation confirms the
-    // credit, and only now is completion final and genuinely full-size.
-    auto joined8001For = [](uint32_t, uint32_t guid) { return guid == 8001; };
-    registry.ReevaluateCredits(10, joined8001For);
     BatchPollResult const result = registry.Poll(tokenB, false);
     LIVING_CHECK(result.status == BatchPollStatus::Complete);
-    LIVING_CHECK(!result.undersized); // pre-fix: 1 + 2 < 4 -> false undersize
+    LIVING_CHECK(!result.undersized); // 2 credited + 2 own >= 4
     LIVING_CHECK(result.failures.empty());
 }
 
-LIVING_TEST(group_batch_expired_predecessor_credit_is_replaced_or_reported)
+LIVING_TEST(group_batch_extension_preserves_the_credited_baseline)
 {
-    // Finding: a fresh batch's credit for a predecessor's finalized-unjoined
-    // member used to be a bare number, so the predecessor could expire (be
-    // pruned after retention) while the new batch was still active - and the
-    // new batch then reported a FULL-SIZE success on the vanished credit.
-    // Tracked credits re-evaluate every pump: a joined member confirms, a
-    // vanished one is replaced within the bounded budget or reported.
+    // Regression: the credited half of the baseline is owned by OLDER batches,
+    // so an extension - which recomputes the live half from its own
+    // observation - must not discard it. It used to overwrite the single
+    // combined field, reporting a genuinely full group as undersized.
+    CreationBatchRegistry registry;
+
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 88;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.members.push_back(PendingMember(61, 1, 1));
+    registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(61, CreationPollStatus::Created, 8001), 1);
+
     auto nobodyJoined = [](uint32_t) { return false; };
-    auto nobodyJoinedFor = [](uint32_t, uint32_t) { return false; };
 
-    // --- Lost credit WITH replacement budget: a replacement slot is added.
-    {
-        CreationBatchRegistry registry;
-        CreationBatchRegistry::Batch a;
-        a.initiatorGuid = 91;
-        a.desiredSize = 2;
-        a.preexistingMembers = 1;
-        a.memberGear = "epic";
-        a.members.push_back(PendingMember(71, 1, 1));
-        uint64_t const tokenA = registry.Begin(std::move(a));
-        registry.OnCreationTerminal(MakeCompletion(71, CreationPollStatus::Created, 9101), 1);
-        // A is now completed-retained with one finalized-UNJOINED member.
+    // Fresh batch crediting A's finalized-but-unjoined member.
+    CreationBatchRegistry::Batch b;
+    b.initiatorGuid = 88;
+    b.desiredSize = 4;
+    b.preexistingMembers = 1; // live
+    b.creditedMembers = 1;    // A's unjoined slot
+    b.memberGear = "epic";
+    b.members = { PendingMember(62, 2, 2), PendingMember(63, 3, 4) };
+    uint64_t const tokenB = registry.Begin(std::move(b));
 
-        GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 91, nobodyJoined,
-            /*live*/ 1, /*requested*/ 3, Options("epic"));
-        LIVING_CHECK(plan.action == GroupBatchRequestAction::BeginNew);
-        LIVING_CHECK(plan.creditedDependencies.size() == 1);
+    // A repeated identical request extends B while its members are pending.
+    LIVING_CHECK(registry.ExtendDesiredSize(tokenB, 4, /*live*/ 1, nobodyJoined));
+    LIVING_CHECK(registry.Find(tokenB)->creditedMembers == 1);      // NOT clobbered
+    LIVING_CHECK(registry.Find(tokenB)->EffectivePreexisting() == 2);
 
-        CreationBatchRegistry::Batch b;
-        b.initiatorGuid = 91;
-        b.desiredSize = 3;
-        b.preexistingMembers = 1;
-        b.creditedDependencies = plan.creditedDependencies;
-        b.replacementBudget = 3;
-        // The residual deficit is still pending, so B stays ACTIVE far beyond
-        // the predecessor's retention - the finding's exact window.
-        b.members = { PendingMember(72, 2, 2) };
-        uint64_t const tokenB = registry.Begin(std::move(b));
+    registry.OnCreationTerminal(MakeCompletion(62, CreationPollStatus::Created, 8002), 2);
+    registry.OnCreationTerminal(MakeCompletion(63, CreationPollStatus::Created, 8003), 3);
 
-        // The predecessor expires (retention elapsed, member never joined)
-        // while B is still active.
-        registry.PruneExpired(10);
-        registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
-        LIVING_CHECK(registry.Find(tokenA) == nullptr);
-        LIVING_CHECK(registry.Find(tokenB) != nullptr);
+    BatchPollResult const result = registry.Poll(tokenB, false);
+    LIVING_CHECK(result.status == BatchPollStatus::Complete);
+    LIVING_CHECK(!result.undersized); // pre-fix: (1 + 2 < 4) reported a false undersize
+}
 
-        // Re-evaluation replaces the vanished credit within the budget.
-        registry.ReevaluateCredits(20000, nobodyJoinedFor);
-        LIVING_CHECK(registry.Find(tokenB)->creditedDependencies.empty());
-        LIVING_CHECK(registry.Find(tokenB)->replacementBudget == 2);
+LIVING_TEST(group_batch_extension_retires_credits_that_joined)
+{
+    // The symmetric hazard of preserving the credit: a credited member of an
+    // OLDER batch who has since JOINED is inside the extension's fresh live
+    // observation. Keeping the stale credit too would count that body twice,
+    // and a genuinely short group would report Complete-and-full-size. The
+    // extension therefore RETIRES credits against the same observation it
+    // refreshes the live half from.
+    CreationBatchRegistry registry;
 
-        // Both the residual member and the replacement finalize: completion
-        // is genuine (1 live + 2 own members = 3), not credit-inflated.
-        registry.OnCreationTerminal(MakeCompletion(72, CreationPollStatus::Created, 9102), 20000);
-        auto due = registry.TakeDueAttempts(20001);
-        LIVING_CHECK(due.size() == 1);
-        registry.OnAttemptResult(due[0].batchToken, due[0].memberIndex,
-            BotCreateStatus::PendingPersistence, 90, 3, 20001, 4);
-        registry.OnCreationTerminal(MakeCompletion(90, CreationPollStatus::Created, 9103), 20002);
-        BatchPollResult const result = registry.Poll(tokenB, false);
-        LIVING_CHECK(result.status == BatchPollStatus::Complete);
-        LIVING_CHECK(!result.undersized);
-    }
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 89;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.members.push_back(PendingMember(71, 1, 1));
+    registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(71, CreationPollStatus::Created, 9001), 1);
+    // A is retained with one finalized-but-unjoined member.
 
-    // --- Lost credit WITHOUT budget: reported, and completion is undersized.
-    {
-        CreationBatchRegistry registry;
-        CreationBatchRegistry::Batch a;
-        a.initiatorGuid = 92;
-        a.desiredSize = 2;
-        a.preexistingMembers = 1;
-        a.memberGear = "epic";
-        a.members.push_back(PendingMember(81, 1, 1));
-        registry.Begin(std::move(a));
-        registry.OnCreationTerminal(MakeCompletion(81, CreationPollStatus::Created, 9201), 1);
+    CreationBatchRegistry::Batch b;
+    b.initiatorGuid = 89;
+    b.desiredSize = 4;
+    b.preexistingMembers = 1; // live at Begin
+    b.creditedMembers = 1;    // A's unjoined slot at Begin
+    b.memberGear = "epic";
+    b.members = { PendingMember(72, 2, 2), PendingMember(73, 3, 4) };
+    uint64_t const tokenB = registry.Begin(std::move(b));
 
-        GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 92, nobodyJoined,
-            1, 3, Options("epic"));
-        CreationBatchRegistry::Batch b;
-        b.initiatorGuid = 92;
-        b.desiredSize = 3;
-        b.preexistingMembers = 1;
-        b.creditedDependencies = plan.creditedDependencies;
-        b.replacementBudget = 0; // exhausted
-        b.members = { PendingMember(82, 2, 2) }; // keeps B active through the prunes
-        uint64_t const tokenB = registry.Begin(std::move(b));
+    // A's member JOINS: live membership grows to 2. A repeated request
+    // extends B against that fresh observation.
+    auto joined9001 = [](uint32_t guid) { return guid == 9001; };
+    LIVING_CHECK(registry.ExtendDesiredSize(tokenB, 4, /*live*/ 2, joined9001));
+    LIVING_CHECK(registry.Find(tokenB)->preexistingMembers == 2); // includes the joiner
+    LIVING_CHECK(registry.Find(tokenB)->creditedMembers == 0);    // credit RETIRED
+    LIVING_CHECK(registry.Find(tokenB)->EffectivePreexisting() == 2); // never 3
 
-        registry.PruneExpired(10);
-        registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
-        registry.ReevaluateCredits(20000, nobodyJoinedFor);
-        registry.OnCreationTerminal(MakeCompletion(82, CreationPollStatus::Created, 9202), 20001);
-
-        BatchPollResult const result = registry.Poll(tokenB, false);
-        LIVING_CHECK(result.status == BatchPollStatus::Complete);
-        LIVING_CHECK(result.undersized);          // pre-fix: full-size success
-        LIVING_CHECK(!result.failures.empty());   // the loss is reported
-    }
-
-    // --- The credited member JOINS before expiry: confirmed permanently,
-    // and survives the predecessor's later pruning.
-    {
-        CreationBatchRegistry registry;
-        CreationBatchRegistry::Batch a;
-        a.initiatorGuid = 93;
-        a.desiredSize = 2;
-        a.preexistingMembers = 1;
-        a.memberGear = "epic";
-        a.members.push_back(PendingMember(85, 1, 1));
-        registry.Begin(std::move(a));
-        registry.OnCreationTerminal(MakeCompletion(85, CreationPollStatus::Created, 9301), 1);
-
-        GroupBatchRequestPlan const plan = PlanGroupBatchRequest(registry, 93, nobodyJoined,
-            1, 3, Options("epic"));
-        CreationBatchRegistry::Batch b;
-        b.initiatorGuid = 93;
-        b.desiredSize = 3;
-        b.preexistingMembers = 1;
-        b.creditedDependencies = plan.creditedDependencies;
-        b.members = { PendingMember(86, 2, 2) }; // keeps B active through the prunes
-        uint64_t const tokenB = registry.Begin(std::move(b));
-
-        auto joined9301For = [](uint32_t, uint32_t guid) { return guid == 9301; };
-        registry.ReevaluateCredits(100, joined9301For);
-        LIVING_CHECK(registry.Find(tokenB)->preexistingMembers == 2); // confirmed
-        LIVING_CHECK(registry.Find(tokenB)->creditedDependencies.empty());
-
-        registry.PruneExpired(10);
-        registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
-        registry.OnCreationTerminal(MakeCompletion(86, CreationPollStatus::Created, 9302), 20001);
-        BatchPollResult const result = registry.Poll(tokenB, false);
-        LIVING_CHECK(result.status == BatchPollStatus::Complete);
-        LIVING_CHECK(!result.undersized); // 2 + 1 own >= 3
-    }
+    // One of B's members fails terminally, one finalizes: the group is
+    // genuinely 3 of 4 and must SAY so - a stale credit would have computed
+    // (3 + 1 >= 4) and reported a clean full-size success.
+    registry.OnCreationTerminal(MakeCompletion(72, CreationPollStatus::Created, 9002), 2);
+    registry.OnCreationTerminal(MakeCompletion(73, CreationPollStatus::FailedTerminal, 0), 3);
+    BatchPollResult const result = registry.Poll(tokenB, false);
+    LIVING_CHECK(result.status == BatchPollStatus::Complete);
+    LIVING_CHECK(result.undersized); // 2 + 1 < 4: honest shortfall
 }
 
 LIVING_TEST(group_batch_extension_refreshes_live_membership_baseline)
@@ -1234,158 +1061,4 @@ LIVING_TEST(group_batch_extension_refreshes_live_membership_baseline)
     // 3 preexisting + 3 finalized >= 6: the stale baseline (1) would have
     // reported this complete group as undersized.
     LIVING_CHECK(!result.undersized);
-}
-
-LIVING_TEST(group_batch_credits_have_exactly_one_owner)
-{
-    // Three identical covered requests over one predecessor slot: the FIRST
-    // creates the tracking owner; the second and third find that owner ACTIVE
-    // (unresolved credits make a batch active) and never spawn independent
-    // trackers - so predecessor expiry produces exactly ONE replacement.
-    CreationBatchRegistry registry;
-    auto nobodyJoined = [](uint32_t) { return false; };
-    auto nobodyJoinedFor = [](uint32_t, uint32_t) { return false; };
-
-    CreationBatchRegistry::Batch a;
-    a.initiatorGuid = 95;
-    a.desiredSize = 2;
-    a.preexistingMembers = 1;
-    a.memberGear = "epic";
-    a.members.push_back(PendingMember(41, 1, 1));
-    uint64_t const tokenA = registry.Begin(std::move(a));
-    registry.OnCreationTerminal(MakeCompletion(41, CreationPollStatus::Created, 9401), 1);
-    // A is completed-retained with one finalized-UNJOINED member.
-
-    // Request 1: covered - creates the tracking owner with the credit.
-    GroupBatchRequestPlan plan1 = PlanGroupBatchRequest(registry, 95, nobodyJoined, 1, 2, Options("epic"));
-    LIVING_CHECK(plan1.action == GroupBatchRequestAction::AlreadyCovered);
-    LIVING_CHECK(plan1.creditedDependencies.size() == 1);
-    CreationBatchRegistry::Batch tracker;
-    tracker.initiatorGuid = 95;
-    tracker.desiredSize = 2;
-    tracker.preexistingMembers = 1;
-    tracker.creditedDependencies = plan1.creditedDependencies;
-    tracker.replacementBudget = 2;
-    tracker.memberGear = "epic";
-    uint64_t const trackerToken = registry.Begin(std::move(tracker));
-
-    // Requests 2 and 3: the tracker is now the ACTIVE owner (unresolved
-    // credits count), so the handler extends it instead of creating another -
-    // and even if a plan were computed, the credit is no longer collectable.
-    LIVING_CHECK(registry.FindBatchTokenForInitiator(95) == trackerToken);
-    GroupBatchRequestPlan plan2 = PlanGroupBatchRequest(registry, 95, nobodyJoined, 1, 2, Options("epic"));
-    LIVING_CHECK(plan2.action == GroupBatchRequestAction::ExtendExisting);
-    LIVING_CHECK(plan2.existingToken == trackerToken);
-    LIVING_CHECK(registry.CollectOutstandingMemberRefs(95, nobodyJoined).empty()); // credit already owned
-    LIVING_CHECK(registry.IsCreditOwned(tokenA, 0));
-
-    // Changed options while the credit is unresolved: REJECTED - the credit
-    // holder participates in option-compatibility accounting.
-    GroupBatchRequestPlan incompatible = PlanGroupBatchRequest(registry, 95, nobodyJoined, 1, 2, Options("default"));
-    LIVING_CHECK(incompatible.action == GroupBatchRequestAction::RejectIncompatible);
-
-    // Predecessor expires: exactly ONE replacement appears, in the tracker.
-    registry.PruneExpired(10);
-    registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
-    LIVING_CHECK(registry.Find(tokenA) == nullptr);
-    registry.ReevaluateCredits(20000, nobodyJoinedFor);
-
-    uint32_t replacements = 0;
-    for (living::CreationBatchMember const& member : registry.Find(trackerToken)->members)
-        if (member.state == BatchMemberState::AwaitingAttempt)
-            ++replacements;
-    LIVING_CHECK(replacements == 1);
-    LIVING_CHECK(registry.Find(trackerToken)->creditedDependencies.empty());
-
-    // The replacement finalizes: an observable, genuine completion.
-    auto due = registry.TakeDueAttempts(20001);
-    LIVING_CHECK(due.size() == 1);
-    registry.OnAttemptResult(due[0].batchToken, due[0].memberIndex,
-        BotCreateStatus::PendingPersistence, 99, 3, 20001, 4);
-    registry.OnCreationTerminal(MakeCompletion(99, CreationPollStatus::Created, 9402), 20002);
-    LIVING_CHECK(registry.Poll(trackerToken, false).status == BatchPollStatus::Complete);
-    LIVING_CHECK(!registry.Poll(trackerToken, false).undersized);
-    LIVING_CHECK(registry.TakeNewlyCompleted().size() == 1); // notified exactly once
-
-    // Predecessor JOINS variant: the credit confirms into the baseline and no
-    // replacement is created.
-    CreationBatchRegistry joins;
-    CreationBatchRegistry::Batch b;
-    b.initiatorGuid = 96;
-    b.desiredSize = 2;
-    b.preexistingMembers = 1;
-    b.memberGear = "epic";
-    b.members.push_back(PendingMember(51, 1, 1));
-    joins.Begin(std::move(b));
-    joins.OnCreationTerminal(MakeCompletion(51, CreationPollStatus::Created, 9501), 1);
-    GroupBatchRequestPlan planJ = PlanGroupBatchRequest(joins, 96, nobodyJoined, 1, 2, Options("epic"));
-    CreationBatchRegistry::Batch trackerJ;
-    trackerJ.initiatorGuid = 96;
-    trackerJ.desiredSize = 2;
-    trackerJ.preexistingMembers = 1;
-    trackerJ.creditedDependencies = planJ.creditedDependencies;
-    trackerJ.replacementBudget = 2;
-    trackerJ.memberGear = "epic";
-    uint64_t const tokenJ = joins.Begin(std::move(trackerJ));
-    joins.ReevaluateCredits(5, [](uint32_t, uint32_t guid) { return guid == 9501; });
-    LIVING_CHECK(joins.Find(tokenJ)->preexistingMembers == 2); // confirmed
-    LIVING_CHECK(joins.Find(tokenJ)->members.empty());          // no replacement
-    LIVING_CHECK(joins.Poll(tokenJ, false).status == BatchPollStatus::Complete);
-}
-
-LIVING_TEST(group_batch_prune_request_reevaluate_creates_one_replacement)
-{
-    // The production ordering that used to double-replace one lost slot:
-    // the credited predecessor is PRUNED, a repeated request arrives BEFORE
-    // the next credit re-evaluation, and only then does the re-evaluation
-    // run. Source-gone credits now count as outstanding, so the repeated
-    // request sees the deficit covered and enqueues nothing; the
-    // re-evaluation then produces exactly ONE replacement.
-    CreationBatchRegistry registry;
-    auto nobodyJoined = [](uint32_t) { return false; };
-    auto nobodyJoinedFor = [](uint32_t, uint32_t) { return false; };
-
-    CreationBatchRegistry::Batch a;
-    a.initiatorGuid = 97;
-    a.desiredSize = 2;
-    a.preexistingMembers = 1;
-    a.memberGear = "epic";
-    a.members.push_back(PendingMember(61, 1, 1));
-    uint64_t const tokenA = registry.Begin(std::move(a));
-    registry.OnCreationTerminal(MakeCompletion(61, CreationPollStatus::Created, 9601), 1);
-
-    GroupBatchRequestPlan const plan1 = PlanGroupBatchRequest(registry, 97, nobodyJoined, 1, 2, Options("epic"));
-    CreationBatchRegistry::Batch tracker;
-    tracker.initiatorGuid = 97;
-    tracker.desiredSize = 2;
-    tracker.preexistingMembers = 1;
-    tracker.creditedDependencies = plan1.creditedDependencies;
-    tracker.replacementBudget = 2;
-    tracker.memberGear = "epic";
-    uint64_t const trackerToken = registry.Begin(std::move(tracker));
-
-    // Predecessor expires; the repeated request lands BEFORE re-evaluation.
-    registry.PruneExpired(10);
-    registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
-    LIVING_CHECK(registry.Find(tokenA) == nullptr);
-
-    // The source-gone credit still counts as one outstanding slot, so the
-    // repeated request is COVERED (1 live + 1 owed = 2) - it must not
-    // recreate the deficit that the coming re-evaluation will also replace.
-    LIVING_CHECK(registry.OutstandingSlotsForInitiator(97, nobodyJoined) == 1);
-    GroupBatchRequestPlan const plan2 = PlanGroupBatchRequest(registry, 97, nobodyJoined, 1, 2, Options("epic"));
-    LIVING_CHECK(plan2.action == GroupBatchRequestAction::ExtendExisting);
-    LIVING_CHECK(plan2.existingToken == trackerToken);
-    LIVING_CHECK(plan2.effectiveMembers >= 2); // covered: the handler enqueues nothing
-
-    // Re-evaluation: exactly one replacement for the one lost slot.
-    registry.ReevaluateCredits(20000, nobodyJoinedFor);
-    uint32_t replacements = 0;
-    for (living::CreationBatchMember const& member : registry.Find(trackerToken)->members)
-        if (member.state == BatchMemberState::AwaitingAttempt)
-            ++replacements;
-    LIVING_CHECK(replacements == 1);
-    LIVING_CHECK(registry.Find(trackerToken)->creditedDependencies.empty());
-    // And afterwards the deficit is carried by the concrete member, still 1.
-    LIVING_CHECK(registry.OutstandingSlotsForInitiator(97, nobodyJoined) == 1);
 }
