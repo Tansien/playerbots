@@ -192,14 +192,12 @@ namespace
         std::vector<uint32_t> deletes;
         std::vector<std::pair<uint32_t, uint32_t>> verifyRequests; // (guid, generation)
         std::vector<uint32_t> metadataClears;
-        std::vector<uint32_t> intentClears;
         std::vector<uint32_t> revokedLogins;
         std::vector<std::pair<uint32_t, uint32_t>> confirmed;
         std::vector<uint32_t> quarantined;
 
         bool verifyEnqueueSucceeds = true;
         bool clearSucceeds = true;
-        bool intentClearSucceeds = true;
 
         CharacterDeletionOps Make()
         {
@@ -211,7 +209,6 @@ namespace
                 return verifyEnqueueSucceeds;
             };
             ops.clearMetadata = [this](uint32_t guid) { metadataClears.push_back(guid); return clearSucceeds; };
-            ops.clearIntent = [this](uint32_t guid) { intentClears.push_back(guid); return intentClearSucceeds; };
             ops.revokeLogin = [this](uint32_t guid) { revokedLogins.push_back(guid); };
             ops.onConfirmedDeleted = [this](uint32_t guid, uint32_t accountId) { confirmed.push_back({ guid, accountId }); };
             ops.onQuarantined = [this](uint32_t guid) { quarantined.push_back(guid); };
@@ -233,7 +230,10 @@ LIVING_TEST(durable_deletion_confirmed_absence_clears_metadata_then_completes)
     deletions.Adopt(7001, 42, "Botname", spy.Make());
     LIVING_CHECK(spy.revokedLogins == std::vector<uint32_t>{ 7001 }); // immediately login-ineligible
     LIVING_CHECK(deletions.Owns(7001));
-    LIVING_CHECK(deletions.ExpectedNameFor(7001) == "Botname");
+    std::string expectedName;
+    uint32_t expectedAccount = 0;
+    LIVING_CHECK(deletions.TryGetExpectedIdentity(7001, expectedName, expectedAccount));
+    LIVING_CHECK(expectedName == "Botname" && expectedAccount == 42);
 
     deletions.Pump(spy.Make());
     LIVING_CHECK(spy.verifyRequests.size() == 1);
@@ -245,7 +245,7 @@ LIVING_TEST(durable_deletion_confirmed_absence_clears_metadata_then_completes)
     LIVING_CHECK(spy.metadataClears == std::vector<uint32_t>{ 7001 });
     LIVING_CHECK(spy.confirmed.size() == 1 && spy.confirmed[0].first == 7001 && spy.confirmed[0].second == 42);
     LIVING_CHECK(!deletions.Owns(7001));
-    LIVING_CHECK(spy.quarantined.empty() && spy.intentClears.empty());
+    LIVING_CHECK(spy.quarantined.empty());
 
     // Duplicate adoption merges: re-adopting an owned guid re-revokes login
     // but never duplicates the record.
@@ -336,26 +336,27 @@ LIVING_TEST(durable_deletion_failed_metadata_clear_retries_then_fails_closed)
     LIVING_CHECK(spy.metadataClears.size() == DurableCharacterDeletions::kMaxClearAttempts);
 }
 
-LIVING_TEST(durable_deletion_guid_reuse_clears_only_the_intent)
+LIVING_TEST(durable_deletion_unproven_identity_fails_closed)
 {
-    // GUID reuse: the readback finds the guid occupied by a DIFFERENT name -
-    // the original deletion verifiably succeeded. Only the deletion-intent
-    // row is cleared; the metadata rows (which may belong to the new
-    // identity) and the character itself are never touched, and the deletion
-    // is never re-issued at the reused guid.
+    // The readback finds the guid occupied but the identity does not match
+    // the recorded (name, account) - rename and reuse are indistinguishable
+    // here, so the owner FAILS CLOSED: it quarantines with everything
+    // retained. Nothing is deleted at the unproven guid, no metadata or
+    // intent is cleared, and nothing reports success.
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
     deletions.Adopt(7040, 42, "OldBot", spy.Make());
     deletions.Pump(spy.Make());
     deletions.OnAbsenceVerify(7040, spy.LastGeneration(), RowVerifyOutcome::IdentityMismatch);
-    deletions.Pump(spy.Make()); // consume the outcome
-    deletions.Pump(spy.Make()); // intent-only clear + completion
-    LIVING_CHECK(spy.intentClears == std::vector<uint32_t>{ 7040 });
-    LIVING_CHECK(spy.metadataClears.empty()); // the new identity's rows survive
-    LIVING_CHECK(spy.deletes.empty());        // never delete the reused guid
-    LIVING_CHECK(spy.confirmed.size() == 1);
-    LIVING_CHECK(!deletions.Owns(7040));
+    deletions.Pump(spy.Make()); // consume the outcome -> quarantine
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(deletions.IsQuarantined(7040));
+    LIVING_CHECK(spy.quarantined == std::vector<uint32_t>{ 7040 });
+    LIVING_CHECK(spy.metadataClears.empty()); // rows retained fail-closed
+    LIVING_CHECK(spy.deletes.empty());        // never delete an unproven guid
+    LIVING_CHECK(spy.confirmed.empty());
+    LIVING_CHECK(deletions.Owns(7040));       // ownership retained (quarantined)
 }
 
 LIVING_TEST(durable_deletion_lost_callback_watchdog_rearms_and_ignores_stale)
@@ -415,16 +416,33 @@ LIVING_TEST(durable_deletion_capacity_pressure_revokes_but_fails_closed)
 LIVING_TEST(durable_deletion_restart_recovery_follows_the_intent_plan)
 {
     // Crash before the queued deletion executed: the intent row survives, and
-    // the startup scan's recovery plan re-runs the full deletion for a
-    // character still present under the RECORDED name, adopts for
-    // confirmation when absent, and adopts (identity mismatch path) when the
-    // guid was reused.
-    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", "OldBot")
+    // the startup scan's recovery plan re-runs the full deletion ONLY for a
+    // character present under its FULL recorded identity (name AND account).
+    // Absent rows adopt for confirmation (cleanup uses the recorded account);
+    // renamed, account-moved, reused, or unrecorded identities adopt and fail
+    // closed in the readback.
+    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", 42, "OldBot", 42)
         == DeletionIntentRecovery::RequeueDeletion);
-    LIVING_CHECK(PlanDeletionIntentRecovery(false, "", "OldBot")
+    LIVING_CHECK(PlanDeletionIntentRecovery(false, "", 0, "OldBot", 42)
         == DeletionIntentRecovery::AdoptForConfirmation);
-    LIVING_CHECK(PlanDeletionIntentRecovery(true, "NewOwner", "OldBot")
-        == DeletionIntentRecovery::AdoptForConfirmation);
+    LIVING_CHECK(PlanDeletionIntentRecovery(true, "NewOwner", 42, "OldBot", 42)
+        == DeletionIntentRecovery::AdoptForConfirmation); // renamed/reused
+    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", 77, "OldBot", 42)
+        == DeletionIntentRecovery::AdoptForConfirmation); // account moved
+    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", 42, "", 0)
+        == DeletionIntentRecovery::AdoptForConfirmation); // identity never recorded
+
+    // The durable intent payload round-trips name and ORIGINAL account (the
+    // account makes empty-account cleanup possible when the row is already
+    // absent); legacy name-only payloads decode with account 0.
+    std::string name;
+    uint32_t account = 0;
+    DecodeDeletionIntent(EncodeDeletionIntent("OldBot", 42), name, account);
+    LIVING_CHECK(name == "OldBot" && account == 42);
+    DecodeDeletionIntent(EncodeDeletionIntent("", 7), name, account);
+    LIVING_CHECK(name.empty() && account == 7);
+    DecodeDeletionIntent("LegacyName", name, account);
+    LIVING_CHECK(name == "LegacyName" && account == 0);
 
     // The re-adopted owner in a FRESH process completes normally.
     DurableCharacterDeletions restarted;

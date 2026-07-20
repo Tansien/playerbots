@@ -376,7 +376,12 @@ namespace living
                 return result;
 
             Batch const& batch = it->second;
-            bool anyOutstanding = false;
+            // Unresolved credited dependencies BLOCK final completion: a
+            // request must never report final success while a referenced
+            // credit could still vanish - the per-pump re-evaluation resolves
+            // every credit (confirm, replace, or report) in bounded time, and
+            // only then may the batch complete, notify, and expire.
+            bool anyOutstanding = !batch.creditedDependencies.empty();
             for (CreationBatchMember const& member : batch.members)
             {
                 if (member.state == BatchMemberState::AwaitingAttempt
@@ -627,7 +632,7 @@ namespace living
             std::vector<Batch const*> completed;
             for (auto& [token, batch] : batches)
             {
-                bool anyOutstanding = false;
+                bool anyOutstanding = !batch.creditedDependencies.empty();
                 for (CreationBatchMember const& member : batch.members)
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence)
@@ -649,7 +654,7 @@ namespace living
             for (auto it = batches.begin(); it != batches.end();)
             {
                 Batch& batch = it->second;
-                bool anyOutstanding = false;
+                bool anyOutstanding = !batch.creditedDependencies.empty();
                 for (CreationBatchMember const& member : batch.members)
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence)
@@ -769,14 +774,13 @@ namespace living
             return plan;
         }
 
-        if (plan.effectiveMembers >= requestedSize)
-        {
-            plan.action = GroupBatchRequestAction::AlreadyCovered;
-            return plan;
-        }
-
-        plan.action = GroupBatchRequestAction::BeginNew;
+        // Both AlreadyCovered and BeginNew reference the credited slots BY
+        // dependency: AlreadyCovered must retain ownership of the credits it
+        // reported as coverage (a tracking batch), never an untracked number.
         plan.creditedDependencies = registry.CollectOutstandingMemberRefs(initiatorGuid, isJoined);
+        plan.action = plan.effectiveMembers >= requestedSize
+            ? GroupBatchRequestAction::AlreadyCovered
+            : GroupBatchRequestAction::BeginNew;
         return plan;
     }
 }

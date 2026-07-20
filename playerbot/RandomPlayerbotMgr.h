@@ -78,14 +78,23 @@ private:
         void DelayedFacingFix();
         void LoginFreeBots();
 public:
-        // Rebuilds the TRANSIENT post-create scheduler owners (guid ->
-        // account) from the durable unsettled markers (create levelup/gear/
-        // group, test) at startup/config reload: creation persists those
-        // markers durably, but the always-online list they used to ride on is
-        // rebuilt from always-state only, which orphaned unfinished work. A
-        // failed scan keeps the existing owners - unknown state never removes
-        // an owner.
+        // Rebuilds the TRANSIENT post-create scheduler owners from the
+        // durable unsettled markers (create levelup/gear/group, test) at
+        // startup/config reload: creation persists those markers durably, but
+        // the always-online list they used to ride on is rebuilt from
+        // always-state only, which orphaned unfinished work. Deletion-pending
+        // guids are excluded. A failed scan keeps the existing owners
+        // (unknown state never removes one) and arms a bounded-backoff retry
+        // from the LoginFreeBots pass.
         void ReconstructPostCreateOwners();
+        // Registers ownership at creation FINALIZATION (same process), so the
+        // obligations have an owner even before any startup scan runs.
+        // `mayAutoLogin` records the creation's login authorization: lifecycle
+        // ownership never overrides login=0.
+        void RegisterPostCreateOwner(uint32 botGuid, uint32 accountId, bool mayAutoLogin)
+        {
+            postCreateOwners[botGuid] = PostCreateOwner{ accountId, mayAutoLogin };
+        }
         // Drops a guid from the transient owner set (its deletion was adopted).
         void ForgetPostCreateOwner(uint32 botGuid) { postCreateOwners.erase(botGuid); }
         static void DatabasePing(QueryResult* result, uint32 pingStart, std::string db);
@@ -372,11 +381,24 @@ public:
         // postcondition landed. Ambiguity quarantines with an error instead of
         // clearing. ForgetEventCache drops the ledger on guid reuse.
         std::map<uint32, std::map<std::string, living::DurableOneShotMarker> > durableOneShotMarkers;
-        // Transient post-create scheduler owners (guid -> account), SEPARATE
-        // from the always-online freeAltBots membership: reconstructed from
-        // durable markers by ReconstructPostCreateOwners and released only
-        // when a bot's post-create work is settled or quarantined.
-        std::map<uint32, uint32> postCreateOwners;
+        // Transient post-create scheduler owners, SEPARATE from the
+        // always-online freeAltBots membership: registered at creation
+        // finalization, reconstructed from durable markers on reload, and
+        // released only when a bot's post-create work is settled or
+        // quarantined. `mayAutoLogin` keeps lifecycle ownership independent
+        // from login authorization (login=0 survives restarts: a
+        // reconstructed owner may auto-login only if the always-online
+        // membership already authorizes it).
+        struct PostCreateOwner
+        {
+            uint32 accountId = 0;
+            bool mayAutoLogin = false;
+        };
+        std::map<uint32, PostCreateOwner> postCreateOwners;
+        // Bounded-backoff retry for a failed owner-reconstruction scan.
+        bool postCreateScanFailed = false;
+        uint32 postCreateScanRetryPasses = 0;
+        static constexpr uint32 kOwnerScanRetryPasses = 600; // ~seconds of passes between retries
         // Save-verification bookkeeping: token -> (bot, marker, expected
         // fingerprint, request generation) for the async equipment readback
         // queued BEHIND the effect's SaveToDB on the same FIFO thread. Results

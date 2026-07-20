@@ -453,3 +453,230 @@ LIVING_TEST(durable_marker_data_codec_roundtrips_and_rejects_garbage)
     LIVING_CHECK(HashEquipmentState({ { 0, 1 } }) != HashEquipmentState({ { 1, 1 } }));
     LIVING_CHECK(HashEquipmentState({ { 0, 1 }, { 1, 2 } }) == HashEquipmentState({ { 0, 1 }, { 1, 2 } }));
 }
+
+// Round-3 boundaries: the commit-state tuple now carries equipment AND money,
+// with the consume wrapper granting one copper as a COMMIT TOKEN before
+// capturing the post state. Modeled here as two components (equip, money)
+// hashed together, exactly like the production tuple.
+
+namespace
+{
+    struct TupleMarkerHarness
+    {
+        DurableOneShotMarker ledger;
+        uint32_t durablePhase = kMarkerPhasePending;
+        std::string durableData = "sync@70";
+        uint64_t liveEquip = 100, liveMoney = 5000;
+        uint64_t durableEquip = 100, durableMoney = 5000;
+        bool equipChangesOnApply = true; // false models an equipment-neutral effect
+        bool savesCommit = true;
+        int effects = 0;
+
+        uint64_t Hash(uint64_t equip, uint64_t money) const
+        {
+            return HashEquipmentState({ { 0, static_cast<uint32_t>(equip) },
+                                        { 255, static_cast<uint32_t>(money) } });
+        }
+        uint64_t LiveHash() const { return Hash(liveEquip, liveMoney); }
+        uint64_t DurableHash() const { return Hash(durableEquip, durableMoney); }
+
+        bool Pass()
+        {
+            auto clearProven = [&]() -> bool
+            {
+                if (ledger.OnClearResult(EventWriteResult::DesiredStateConfirmed))
+                {
+                    durablePhase = 0;
+                    return true;
+                }
+                return false;
+            };
+            auto recordThenSaveAndVerify = [&]() -> bool
+            {
+                uint64_t const post = LiveHash();
+                if (!ledger.phaseRecorded || post != ledger.postHash)
+                {
+                    ledger.postHash = post;
+                    durablePhase = kMarkerPhaseApplied;
+                    durableData = EncodeDurableMarkerData(ledger.originalData, ledger.preHash, ledger.postHash);
+                    ledger.OnPhaseRecorded();
+                }
+                if (savesCommit)
+                {
+                    durableEquip = liveEquip;
+                    durableMoney = liveMoney;
+                }
+                ledger.OnVerifyRequested(true);
+                lastGeneration = ledger.BeginVerify();
+                ledger.verifyOutstanding = true;
+                return false;
+            };
+
+            switch (ledger.Plan(durablePhase))
+            {
+                case DurableMarkerStep::Idle:
+                    return true;
+                case DurableMarkerStep::ApplyThenRecord:
+                {
+                    uint64_t const pre = LiveHash();
+                    if (equipChangesOnApply)
+                        liveEquip += 11;   // the effect's own equipment delta
+                    ++effects;             // (non-equipment changes are implicit)
+                    liveMoney += 1;        // the one-copper COMMIT TOKEN
+                    ledger.OnEffectApplied(pre, LiveHash(), durableData);
+                    return recordThenSaveAndVerify();
+                }
+                case DurableMarkerStep::RecordApplied:
+                case DurableMarkerStep::SaveAndVerify:
+                    return recordThenSaveAndVerify();
+                case DurableMarkerStep::AwaitVerify:
+                    return false;
+                case DurableMarkerStep::ClearConfirmed:
+                    return clearProven();
+                case DurableMarkerStep::RecoverProbe:
+                {
+                    std::string original;
+                    uint64_t pre = 0, post = 0;
+                    if (!TryDecodeDurableMarkerData(durableData, original, pre, post))
+                    {
+                        ledger.MarkQuarantined();
+                        return true;
+                    }
+                    switch (DurableOneShotMarker::Reconcile(LiveHash(), pre, post))
+                    {
+                        case DurableOneShotMarker::RecoverDecision::ProvenDurable:
+                            ledger.MarkProven();
+                            return clearProven();
+                        case DurableOneShotMarker::RecoverDecision::ReapplySafe:
+                            durablePhase = kMarkerPhasePending;
+                            durableData = original;
+                            return false;
+                        default:
+                            ledger.MarkQuarantined();
+                            return true;
+                    }
+                }
+                case DurableMarkerStep::Quarantined:
+                    return true;
+            }
+            return false;
+        }
+
+        MarkerVerifyAction DeliverVerify()
+        {
+            return ledger.OnVerifyResult(lastGeneration,
+                DurableHash() == ledger.postHash ? DurableOneShotMarker::VerifyOutcome::Match
+                                                 : DurableOneShotMarker::VerifyOutcome::Mismatch);
+        }
+
+        void Restart()
+        {
+            ledger = DurableOneShotMarker{};
+            liveEquip = durableEquip;
+            liveMoney = durableMoney;
+        }
+
+        uint32_t lastGeneration = 0;
+    };
+}
+
+LIVING_TEST(durable_marker_commit_token_detects_rollback_of_nonequipment_state)
+{
+    // An EQUIPMENT-NEUTRAL effect (spells/skills/talents only) whose save
+    // rolls back: the equipment-only hash could never see it, but the
+    // one-copper commit token makes the tuple differ - the rollback reads
+    // back as pre-state (RetrySave in-process, safe re-apply on restart).
+    TupleMarkerHarness h;
+    h.equipChangesOnApply = false; // unchanged equipment
+    h.savesCommit = false;         // rolled-back save
+
+    LIVING_CHECK(!h.Pass());
+    LIVING_CHECK(h.ledger.preHash != h.ledger.postHash); // token guarantees the delta
+    LIVING_CHECK(h.DeliverVerify() == MarkerVerifyAction::RetrySave); // rollback DETECTED
+
+    // The re-save commits: proven, cleared - no silent success on rollback.
+    h.savesCommit = true;
+    LIVING_CHECK(!h.Pass());
+    LIVING_CHECK(h.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(h.Pass());
+    LIVING_CHECK(h.effects == 1);
+
+    // Restart variant: crash while the rolled-back save left durable state at
+    // pre - recovery proves the loss (pre-match) and re-applies; nothing is
+    // silently cleared or silently lost.
+    TupleMarkerHarness crashed;
+    crashed.equipChangesOnApply = false;
+    crashed.savesCommit = false;
+    LIVING_CHECK(!crashed.Pass());
+    crashed.Restart();
+    crashed.savesCommit = true;
+    LIVING_CHECK(!crashed.Pass()); // pre-match -> rewind to phase 1
+    LIVING_CHECK(crashed.durablePhase == kMarkerPhasePending);
+    LIVING_CHECK(!crashed.Pass()); // fresh safe application
+    LIVING_CHECK(crashed.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(crashed.Pass());
+    // Exactly ONE committed application: the rolled-back attempt's token
+    // grant never persisted, the re-application's did.
+    LIVING_CHECK(crashed.durableMoney == 5001);
+    LIVING_CHECK(crashed.durableEquip == 100); // equipment-neutral effect stayed neutral
+}
+
+LIVING_TEST(durable_marker_no_save_application_keeps_phase1_recovery_sound)
+{
+    // The no-save application path (PlayerbotFactory::deferSave): applying
+    // the effect mutates NOTHING durable, so a crash after the formerly
+    // nested save point but before the phase-2 record leaves durable phase 1
+    // with pre-effect durable state - recovery re-applies exactly once,
+    // neither repeating nor losing the effect.
+    TupleMarkerHarness h;
+    // Model the crash window: the effect applied in memory but the phase-2
+    // record was never written (simulate by capturing state, then restarting
+    // before recordThenSaveAndVerify's durable writes are honored).
+    uint64_t const durableEquipBefore = h.durableEquip;
+    uint64_t const durableMoneyBefore = h.durableMoney;
+    h.savesCommit = false; // and the phase write is the only durable change
+
+    LIVING_CHECK(!h.Pass()); // applied in memory; save rolled back (worst case)
+    LIVING_CHECK(h.durableEquip == durableEquipBefore && h.durableMoney == durableMoneyBefore);
+
+    h.Restart();
+    // durable phase is 2 here (the record write is synchronous Direct in
+    // production); the rolled-back save keeps durable state at pre -> the
+    // reconcile proves the loss and re-applies. With the record ALSO lost
+    // (crash before it), durablePhase stays 1 and re-application is trivially
+    // safe - both windows recover to exactly one durable application.
+    h.savesCommit = true;
+    while (!h.Pass()) // rewind (if phase 2) -> re-apply -> verify -> clear
+        if (h.ledger.verifyOutstanding)
+            h.DeliverVerify();
+    LIVING_CHECK(h.durablePhase == 0);
+    LIVING_CHECK(h.durableEquip == 100 + 11);   // effect applied ONCE durably
+    LIVING_CHECK(h.durableMoney == 5000 + 1);   // one committed token grant
+}
+
+LIVING_TEST(durable_markers_serialize_levelup_before_gear)
+{
+    // The two destructive markers share the commit-state tuple, so their
+    // proofs are NOT composable: gear must not mutate state while levelup's
+    // outcome is still being proven or recovered. The production pass gates
+    // the gear consume on the levelup marker being fully settled; interacting
+    // effects (levelup A->B then gear B->C before a restart) therefore cannot
+    // exist - levelup's marker is always resolved against a state gear has
+    // not yet touched.
+    TupleMarkerHarness levelup;
+    bool gearApplied = false;
+
+    auto pass = [&]() -> bool
+    {
+        bool const levelupSettled = levelup.Pass();
+        if (levelupSettled)
+            gearApplied = true; // gear consume would run only now
+        return levelupSettled;
+    };
+
+    LIVING_CHECK(!pass()); // levelup applied, verify outstanding
+    LIVING_CHECK(!gearApplied);
+    LIVING_CHECK(levelup.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(pass()); // levelup cleared -> gear may proceed
+    LIVING_CHECK(gearApplied);
+}

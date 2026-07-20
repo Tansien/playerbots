@@ -902,12 +902,17 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
 {
     // COUNT-first over the JOINed scan so "no unsettled markers" is
     // distinguishable from "could not ask": the pinned cores return a null
-    // result for BOTH an empty row set and a failed query.
+    // result for BOTH an empty row set and a failed query. Deletion-pending
+    // characters are excluded at the SQL level (durable intents) AND below
+    // via the in-memory confirmer (a deletion-pending bot must never regain
+    // a lifecycle owner that could log it in or mutate it).
     static char const* kScanCondition =
         "ai_playerbot_random_bots.owner = 0 AND ai_playerbot_random_bots.event IN "
-        "('create levelup', 'create gear', 'create group', 'test')";
+        "('create levelup', 'create gear', 'create group', 'test') "
+        "AND ai_playerbot_random_bots.bot NOT IN "
+        "(SELECT d.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'delete') d)";
 
-    std::map<uint32, uint32> scanned;
+    std::map<uint32, PostCreateOwner> scanned;
     bool scanSucceeded = false;
     if (auto countResult = CharacterDatabase.PQuery(
             "SELECT COUNT(DISTINCT ai_playerbot_random_bots.bot) FROM ai_playerbot_random_bots "
@@ -922,17 +927,28 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
             do
             {
                 Field* fields = rows->Fetch();
-                scanned[fields[0].GetUInt32()] = fields[1].GetUInt32();
+                uint32 const guid = fields[0].GetUInt32();
+                if (PlayerbotHolder::IsDeletionPending(guid))
+                    continue; // in-memory adoption not yet durably visible
+
+                // Lifecycle ownership is reconstructed INDEPENDENTLY of login
+                // authorization: only the always-online membership authorizes
+                // an automatic login, so login=0 survives the restart - the
+                // obligations wait for the bot's next authorized login.
+                scanned[guid] = PostCreateOwner{ fields[1].GetUInt32(),
+                    sPlayerbotAIConfig.IsFreeAltBot(guid) };
             } while (rows->NextRow());
             scanSucceeded = true;
         }
     }
 
     if (!scanSucceeded)
-        sLog.outError("ReconstructPostCreateOwners: durable marker scan failed; existing owners are kept");
+        sLog.outError("ReconstructPostCreateOwners: durable marker scan failed; existing owners are kept and the scan retries with backoff");
     else if (!scanned.empty())
         sLog.outString("Reconstructed %zu post-create scheduler owner(s) from durable markers", scanned.size());
 
+    postCreateScanFailed = !scanSucceeded;
+    postCreateScanRetryPasses = 0;
     postCreateOwners = living::ReconcilePostCreateOwners(postCreateOwners, scanSucceeded, scanned);
 }
 
@@ -942,29 +958,63 @@ void RandomPlayerbotMgr::LoginFreeBots()
     // sweep so a marker whose postcondition was proven can clear this pass.
     DrainPostCreateSaveVerifies();
 
-    if ((!sPlayerbotAIConfig.freeAltBots.empty() || !postCreateOwners.empty())
-        && sPlayerbotAIConfig.botAutologin != BotAutoLogin::LOGIN_ONLY_ALWAYS_ACTIVE)
+    // Bounded-backoff retry of a failed owner-reconstruction scan: transient
+    // database failure must not orphan durable obligations until the next
+    // manual reload.
+    if (postCreateScanFailed && ++postCreateScanRetryPasses >= kOwnerScanRetryPasses)
+        ReconstructPostCreateOwners();
+
+    if (!sPlayerbotAIConfig.freeAltBots.empty() || !postCreateOwners.empty())
     {
+        // LOGIN_ONLY_ALWAYS_ACTIVE suppresses only the LOGINS this sweep
+        // would initiate; lifecycle obligations of bots that are already
+        // online are still serviced (they used to starve in that mode).
+        bool const autoLoginAllowed =
+            sPlayerbotAIConfig.botAutologin != BotAutoLogin::LOGIN_ONLY_ALWAYS_ACTIVE;
+
         std::vector<std::pair<uint32, uint32>> botsToRemove;
 
         // The sweep services the always-online membership AND the transient
         // post-create owners: a bot whose durable markers are unsettled keeps
         // its scheduler even when it is not (or no longer) always-online.
-        std::vector<std::pair<uint32, uint32>> sweep(sPlayerbotAIConfig.freeAltBots.begin(),
-            sPlayerbotAIConfig.freeAltBots.end());
-        for (auto const& [ownerGuid, ownerAccount] : postCreateOwners)
+        // Owner entries carry their own login authorization; membership
+        // entries are authorized by definition.
+        struct SweepEntry
+        {
+            uint32 accountId;
+            uint32 botGuid;
+            bool mayAutoLogin;
+        };
+        std::vector<SweepEntry> sweep;
+        for (auto const& [entryAccount, entryGuid] : sPlayerbotAIConfig.freeAltBots)
+            sweep.push_back({ entryAccount, entryGuid, true });
+        for (auto const& [ownerGuid, owner] : postCreateOwners)
             if (!sPlayerbotAIConfig.IsFreeAltBot(ownerGuid))
-                sweep.push_back({ ownerAccount, ownerGuid });
+                sweep.push_back({ owner.accountId, ownerGuid, owner.mayAutoLogin });
 
-        for (auto [accountId, botGuid] : sweep)
+        for (auto [accountId, botGuid, mayAutoLogin] : sweep)
         {
             ObjectGuid guid(ObjectGuid(HIGHGUID_PLAYER, botGuid));
             Player* bot = sObjectMgr.GetPlayer(guid, false);
 
+            // A deletion-pending character must never be logged in or receive
+            // post-create mutations, whatever list it is still riding.
+            if (PlayerbotHolder::IsDeletionPending(botGuid))
+                continue;
+
             if (!bot)
             {
-                sLog.outDetail("Add player %d", botGuid);
-                AddPlayerBot(botGuid, accountId);
+                // Login only when the mode AND the entry's own authorization
+                // allow it (login=0 lifecycle owners wait for an authorized
+                // login instead of forcing one). Deletion-pending was already
+                // excluded above; the shared predicate keeps the policy
+                // testable in one place.
+                if (living::MayAutoLoginPostCreateOwner(autoLoginAllowed, mayAutoLogin,
+                        PlayerbotHolder::IsDeletionPending(botGuid)))
+                {
+                    sLog.outDetail("Add player %d", botGuid);
+                    AddPlayerBot(botGuid, accountId);
+                }
             }
             else if (!bot->IsBeingTeleported())
             {
@@ -1024,12 +1074,21 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 // landed. Recovery reconciles fingerprints: proven-durable
                 // clears, provably-lost rewinds to phase 1 and re-applies,
                 // ambiguity quarantines with an actionable error.
-                auto equipmentHash = [&]() -> uint64
+                // Commit-state tuple: equipped item guids PLUS money as the
+                // sentinel pair (255, money). The consume wrapper grants one
+                // copper as a COMMIT TOKEN before capturing the post state, so
+                // post always differs from pre - this is not a completeness
+                // claim over the hash (spells/skills/talents ride the SAME
+                // atomic save transaction), it is proof that THAT transaction
+                // committed: any strict subset of an atomic write set that
+                // provably changed proves the whole set.
+                auto commitStateHash = [&]() -> uint64
                 {
                     std::vector<std::pair<uint8, uint32>> slotItems;
                     for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
                         if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
                             slotItems.push_back({ slot, item->GetGUIDLow() });
+                    slotItems.push_back({ 255, bot->GetMoney() });
                     return living::HashEquipmentState(slotItems);
                 };
 
@@ -1054,12 +1113,16 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         return false;
                     };
 
-                    // Durably record phase 2 with the fingerprints, then queue
-                    // the save and request the postcondition verification.
+                    // Durably record phase 2 with the commit state, then queue
+                    // the save and request the postcondition verification. The
+                    // post state is RE-CAPTURED on every (re-)save so the
+                    // record always matches the state the queued save writes.
                     auto recordThenSaveAndVerify = [&]() -> bool
                     {
-                        if (!ledger.phaseRecorded)
+                        uint64 const post = commitStateHash();
+                        if (!ledger.phaseRecorded || post != ledger.postHash)
                         {
+                            ledger.postHash = post;
                             if (!sRandomPlayerbotMgr.SetValue(botGuid, marker, living::kMarkerPhaseApplied,
                                     living::EncodeDurableMarkerData(ledger.originalData, ledger.preHash, ledger.postHash)))
                                 return false; // retry the record alone next pass
@@ -1080,9 +1143,14 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         case living::DurableMarkerStep::ApplyThenRecord:
                         {
                             std::string const data = sRandomPlayerbotMgr.GetData(botGuid, marker);
-                            uint64 const pre = equipmentHash();
+                            uint64 const pre = commitStateHash();
                             applyEffect();
-                            ledger.OnEffectApplied(pre, equipmentHash(), data);
+                            // The one-copper commit token: guarantees the post
+                            // state differs from pre, so a rolled-back save is
+                            // always detectable (readback == pre) and pre==post
+                            // ambiguity cannot arise.
+                            bot->ModifyMoney(1);
+                            ledger.OnEffectApplied(pre, commitStateHash(), data);
                             return recordThenSaveAndVerify();
                         }
                         case living::DurableMarkerStep::RecordApplied:
@@ -1122,7 +1190,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
                                 return true;
                             }
 
-                            switch (living::DurableOneShotMarker::Reconcile(equipmentHash(), recordedPre, recordedPost))
+                            switch (living::DurableOneShotMarker::Reconcile(commitStateHash(), recordedPre, recordedPost))
                             {
                                 case living::DurableOneShotMarker::RecoverDecision::ProvenDurable:
                                     ledger.MarkProven();
@@ -1151,11 +1219,17 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     return false;
                 };
 
-                postCreateSettled &= consumeDurableOneShot("create levelup", [&]()
+                bool const levelupSettled = consumeDurableOneShot("create levelup", [&]()
                 {
                     PlayerbotFactory factory(bot, bot->GetLevel());
+                    // No-save application path: the consume owns the ONE save,
+                    // queued only after the phase-2 record is confirmed - a
+                    // nested save here could commit the effect while the
+                    // marker still claims it unapplied.
+                    factory.deferSave = true;
                     factory.Randomize(true, false);
                 });
+                postCreateSettled &= levelupSettled;
 
                 Player* master = nullptr;
 
@@ -1250,6 +1324,41 @@ void RandomPlayerbotMgr::LoginFreeBots()
                             sLog.outDetail("Bot %s: giving up on group target '%s' (%s)", bot->GetName(), groupWith.c_str(),
                                 existence == living::TargetExistence::ConfirmedMissing ? "target deleted" : "retry budget exhausted");
 
+                        // Before the ONLY durable copy of the verified target
+                        // is cleared, copy the verified target LEVEL into a
+                        // dependent, still-unapplied sync/upgrade gear
+                        // obligation (confirmed write): a crash after this
+                        // clear but before the gear effect must recover with
+                        // the original verified target, never silently fall
+                        // back to the bot's own level.
+                        bool targetCaptured = true;
+                        if (plan.decision == living::GroupJoinDecision::ClearJoined && master)
+                        {
+                            uint32 gearPhaseNow = 0;
+                            if (!sRandomPlayerbotMgr.TryGetEventValue(botGuid, "create gear", gearPhaseNow))
+                                targetCaptured = false;
+                            else if (gearPhaseNow == living::kMarkerPhasePending)
+                            {
+                                std::string gearBaseNow;
+                                uint32 capturedLevel = 0;
+                                living::SplitGearTarget(sRandomPlayerbotMgr.GetData(botGuid, "create gear"),
+                                    gearBaseNow, capturedLevel);
+                                if ((gearBaseNow == "sync" || gearBaseNow == "upgrade") && capturedLevel == 0)
+                                    targetCaptured = sRandomPlayerbotMgr.SetValue(botGuid, "create gear",
+                                        living::kMarkerPhasePending,
+                                        living::StampGearTarget(gearBaseNow, master->GetLevel()));
+                            }
+                        }
+
+                        if (!targetCaptured)
+                        {
+                            // The dependent gear target could not be durably
+                            // captured: keep the group marker (the only durable
+                            // target) and retry the terminal step next pass.
+                            groupJoinBackoffUntil[botGuid] = time(0) + 30;
+                        }
+                        else
+                        {
                         bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 0);
                         living::GroupJoinPersist const persist = living::PlanGroupJoinPersist(plan.decision, persistResult(cleared));
                         if (persist.consumed)
@@ -1262,34 +1371,47 @@ void RandomPlayerbotMgr::LoginFreeBots()
                         }
                         else
                             groupJoinBackoffUntil[botGuid] = time(0) + 30; // clear not confirmed: retry it, keep the marker
+                        }
                     }
                 }
                 postCreateSettled &= groupJoinSettled;
 
                 // gear=sync/upgrade is DEFINED against the verified master's
-                // level. While the join is still retryable the un-applied gear
-                // marker is retained (deferred, not consumed); a terminal join
-                // outcome settles it with the bot's own level as the fallback.
-                // Already-applied phases (2+) proceed regardless - only their
-                // durability confirmation remains.
+                // level: once the join verifies, that level is captured into
+                // the gear payload ("sync@<level>"), so a captured obligation
+                // no longer needs a live master. While the join is still
+                // retryable an uncaptured marker is retained (deferred, not
+                // consumed); a terminal join settles it with the bot's own
+                // level as the documented fallback. Already-applied phases
+                // (2+) proceed - only their durability confirmation remains.
+                //
+                // SERIALIZED behind the levelup marker: the two destructive
+                // effects share the commit-state tuple, and their proofs are
+                // not composable - gear must not mutate state while levelup's
+                // outcome is still being proven or recovered.
                 uint32 gearPhase = 0;
                 bool const gearKnown = sRandomPlayerbotMgr.TryGetEventValue(botGuid, "create gear", gearPhase);
+                std::string gearBase;
+                uint32 gearCapturedLevel = 0;
+                if (gearKnown && gearPhase)
+                    living::SplitGearTarget(sRandomPlayerbotMgr.GetData(botGuid, "create gear"),
+                        gearBase, gearCapturedLevel);
                 bool const gearNeedsMaster = gearKnown && gearPhase == living::kMarkerPhasePending
-                    && [&]() {
-                        std::string const gearData = sRandomPlayerbotMgr.GetData(botGuid, "create gear");
-                        return gearData == "sync" || gearData == "upgrade";
-                    }();
-                if (!gearKnown
+                    && (gearBase == "sync" || gearBase == "upgrade") && gearCapturedLevel == 0;
+                if (!gearKnown || !levelupSettled
                     || (gearPhase == living::kMarkerPhasePending
                         && !living::MayApplyMasterDerivedGear(gearNeedsMaster, groupJoinSettled, master != nullptr)))
                 {
-                    postCreateSettled = false; // unknown read, or deferred until the join settles
+                    postCreateSettled = false; // unknown read, levelup unsettled, or join not settled
                 }
                 else
                 {
                 postCreateSettled &= consumeDurableOneShot("create gear", [&]()
                 {
-                    std::string gear = sRandomPlayerbotMgr.GetData(botGuid, "create gear");
+                    std::string gear;
+                    uint32 capturedLevel = 0;
+                    living::SplitGearTarget(sRandomPlayerbotMgr.GetData(botGuid, "create gear"),
+                        gear, capturedLevel);
                     if (gear == "empty")
                     {
                         for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
@@ -1315,12 +1437,17 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     }
                     else if (gear == "upgrade")
                     {
-                        PlayerbotFactory factory(bot, master ? master->GetLevel() : bot->GetLevel(), ITEM_QUALITY_NORMAL);
+                        // Captured verified-target level first; live master
+                        // second (same-pass verification); own level only as
+                        // the terminal-join fallback.
+                        PlayerbotFactory factory(bot, capturedLevel ? capturedLevel
+                            : (master ? master->GetLevel() : bot->GetLevel()), ITEM_QUALITY_NORMAL);
                         factory.UpgradeGear(false);
                     }
                     else if (gear == "sync")
                     {
-                        PlayerbotFactory factory(bot, master ? master->GetLevel() : bot->GetLevel(), ITEM_QUALITY_NORMAL);
+                        PlayerbotFactory factory(bot, capturedLevel ? capturedLevel
+                            : (master ? master->GetLevel() : bot->GetLevel()), ITEM_QUALITY_NORMAL);
                         factory.UpgradeGear(true);
                     }
                     else if (gear == "best")
@@ -1415,7 +1542,8 @@ bool RandomPlayerbotMgr::RequestPostCreateSaveVerify(uint32 botGuid, std::string
     uint64 const verifyToken = nextSaveVerifyToken++;
     if (!CharacterDatabase.AsyncPQuery(this, &RandomPlayerbotMgr::HandlePostCreateSaveVerify, verifyToken,
             "(SELECT slot, item FROM character_inventory WHERE guid = '%u' AND bag = '0' AND slot < '%u') "
-            "UNION ALL (SELECT 255, 0) ORDER BY slot", botGuid, uint32(EQUIPMENT_SLOT_END)))
+            "UNION ALL (SELECT 255, money FROM characters WHERE guid = '%u') ORDER BY slot",
+            botGuid, uint32(EQUIPMENT_SLOT_END), botGuid))
         return false;
 
     saveVerifyTokens[verifyToken] = PostCreateSaveVerify{ botGuid, marker, expectedHash, generation };
@@ -1433,12 +1561,11 @@ void RandomPlayerbotMgr::HandlePostCreateSaveVerify(QueryResult* result, uint64 
         std::vector<std::pair<uint8, uint32>> slotItems;
         do
         {
+            // The sentinel row (255, money) is PART of the commit-state
+            // tuple: it mirrors the in-memory money pair, so the one-copper
+            // commit token makes every post state provably distinct.
             Field* fields = result->Fetch();
-            uint32 const slot = fields[0].GetUInt32();
-            if (slot >= EQUIPMENT_SLOT_END)
-                continue; // the always-present sentinel row
-
-            slotItems.push_back({ static_cast<uint8>(slot), fields[1].GetUInt32() });
+            slotItems.push_back({ static_cast<uint8>(fields[0].GetUInt32()), fields[1].GetUInt32() });
         } while (result->NextRow());
 
         verify.queryOk = true;
@@ -2507,7 +2634,7 @@ void RandomPlayerbotMgr::AddOfflineGroupBots()
                         if (bot.second == guid)
                         {
                             Player* player = GetPlayerBot(bot.second);
-                            if (!player)
+                            if (!player && !PlayerbotHolder::IsDeletionPending(bot.second))
                             {
                                 AddPlayerBot(bot.second, bot.first);
                             }
@@ -2685,6 +2812,12 @@ bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
           priorUpdate, RemainingValidity(bot, "update") },
     };
 
+    if (PlayerbotHolder::IsDeletionPending(bot))
+    {
+        sLog.outDetail("AddRandomBot: refusing guid %u - a character deletion is pending", bot);
+        return false;
+    }
+
     if (!RunActivationPlan(bot, plan))
         return false;
 
@@ -2805,6 +2938,9 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
             { "update", 1, urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime),
               priorUpdate, RemainingValidity(bot, "update") },
         };
+
+        if (PlayerbotHolder::IsDeletionPending(bot))
+            return false; // deletion-pending characters never log in
 
         if (!RunActivationPlan(bot, plan))
             return false;
@@ -5954,9 +6090,29 @@ std::list<std::string> RandomPlayerbotMgr::HandleRemove(Player* bot)
 std::list<std::string> RandomPlayerbotMgr::HandleConsoleReset(std::string param)
 {
     std::list<std::string> messages;
-    CharacterDatabase.PExecute("delete from ai_playerbot_random_bots where event not in ('temporary')");
+
+    // Lifecycle-CONTROL rows are never reset-deleted (see
+    // living::IsLifecycleControlEvent, which this exclusion list mirrors):
+    // active deletion intents and unfinished creation obligations must
+    // survive a console reset, or their owners lose the only durable record.
+    // DirectPExecute (synchronous, execution-confirmed): the empty
+    // authoritative cache below is published ONLY once the delete provably
+    // executed - a queued delete could fail after the cache was already
+    // cleared and reads would then claim confirmed absence over live rows.
+    if (!CharacterDatabase.DirectPExecute(
+            "DELETE FROM ai_playerbot_random_bots WHERE event NOT IN "
+            "('temporary', 'delete', 'create levelup', 'create gear', 'create group', 'test')"))
+    {
+        messages.push_back("Random bot reset FAILED: the delete did not execute; no cache state was changed.");
+        return messages;
+    }
+
+    // The delete is confirmed: drop the cache, load states, and dirty marks
+    // together so typed reads rebuild from durable truth consistently.
     sRandomPlayerbotMgr.eventCache.clear();
-    std::string msg = "Random bots were reset for all players. Please restart the Server.";
+    sRandomPlayerbotMgr.eventCacheLoadState.clear();
+    sRandomPlayerbotMgr.dirtyEvents.clear();
+    std::string msg = "Random bots were reset for all players (lifecycle deletion/creation rows preserved). Please restart the Server.";
     messages.push_back(msg);
     return messages;
 }

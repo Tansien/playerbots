@@ -259,14 +259,66 @@ namespace living
         return out;
     }
 
+    // The FINITE set of supported gear values. Creation input is validated
+    // against exactly this list BEFORE any account/character mutation: an
+    // arbitrary payload used to be accepted (acting as "default"), applied
+    // as an effect, and could then exceed the durable event envelope once
+    // the phase-2 record metadata was appended - an accepted input must
+    // never become impossible to persist.
+    inline bool IsSupportedGearValue(std::string const& value)
+    {
+        static char const* const kSupported[] = {
+            "", "default", "empty", "green", "uncommon", "blue", "rare",
+            "purple", "epic", "upgrade", "sync", "best", "partial",
+        };
+        for (char const* supported : kSupported)
+            if (value == supported)
+                return true;
+        return false;
+    }
+
+    // Splits a gear payload into its base value and the captured verified
+    // group-target level ("sync@70" -> {"sync", 70}). The level suffix is
+    // stamped by the post-create pass when the group join VERIFIES, so the
+    // dependent gear obligation keeps its target level even after the
+    // (only) durable group marker is cleared - recovery must never silently
+    // fall back to the bot's own level. Absent/malformed suffix -> level 0.
+    inline void SplitGearTarget(std::string const& data, std::string& base, uint32_t& level)
+    {
+        base = data;
+        level = 0;
+        size_t const at = data.rfind('@');
+        if (at == std::string::npos)
+            return;
+
+        uint32_t parsed = 0;
+        for (size_t i = at + 1; i < data.size(); ++i)
+        {
+            char const c = data[i];
+            if (c < '0' || c > '9' || parsed > 0xFFFFFFu)
+                return; // malformed suffix: treat the whole payload as base
+            parsed = parsed * 10 + static_cast<uint32_t>(c - '0');
+        }
+        if (at + 1 == data.size())
+            return;
+
+        base = data.substr(0, at);
+        level = parsed;
+    }
+
+    inline std::string StampGearTarget(std::string const& base, uint32_t level)
+    {
+        return base + "@" + std::to_string(level);
+    }
+
     // Reconciliation rule for the transient post-create owner set after a
     // durable marker scan: only a SUCCESSFUL scan is authoritative and
     // replaces the set; a failed scan (database unavailable) keeps every
     // existing owner - unknown state must never remove an owner that still
     // has unsettled durable work.
-    inline std::map<uint32_t, uint32_t> ReconcilePostCreateOwners(
-        std::map<uint32_t, uint32_t> const& existing, bool scanSucceeded,
-        std::map<uint32_t, uint32_t> const& scanned)
+    template <typename OwnerMap>
+    OwnerMap ReconcilePostCreateOwners(OwnerMap const& existing, bool scanSucceeded,
+        OwnerMap const& scanned)
     {
         return scanSucceeded ? scanned : existing;
     }
@@ -282,6 +334,18 @@ namespace living
     inline bool MayApplyMasterDerivedGear(bool needsMaster, bool joinSettled, bool masterVerified)
     {
         return !needsMaster || masterVerified || joinSettled;
+    }
+
+    // Login decision for one offline sweep entry: an automatic login needs
+    // the MODE to allow it (LOGIN_ONLY_ALWAYS_ACTIVE suppresses sweep logins
+    // entirely), the entry's OWN authorization (lifecycle ownership never
+    // overrides login=0 - reconstructed owners are authorized only through
+    // the always-online membership), and no pending deletion (a
+    // deletion-pending character never logs in).
+    inline bool MayAutoLoginPostCreateOwner(bool modeAllowsAutoLogin, bool entryMayAutoLogin,
+        bool deletionPending)
+    {
+        return modeAllowsAutoLogin && entryMayAutoLogin && !deletionPending;
     }
 
     // Scheduler-ownership rule for LoginFreeBots: a bot stays scheduled while
