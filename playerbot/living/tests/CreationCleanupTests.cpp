@@ -359,48 +359,13 @@ LIVING_TEST(durable_deletion_unproven_identity_fails_closed)
     LIVING_CHECK(deletions.Owns(7040));       // ownership retained (quarantined)
 }
 
-LIVING_TEST(durable_deletion_lost_callback_watchdog_rearms_and_ignores_stale)
+LIVING_TEST(durable_deletion_capacity_overflow_stays_owned_and_fails_closed)
 {
-    // Enqueue succeeds but the callback never arrives: the deadline watchdog
-    // abandons the wait (one bounded attempt), re-arms under a NEW
-    // generation, and the stale callback that straggles in afterwards cannot
-    // settle the owner - only the current generation may.
-    DurableCharacterDeletions deletions;
-    DeletionSpyOps spy;
-
-    deletions.Adopt(7050, 42, "Lost", true, spy.Make());
-    deletions.Pump(spy.Make());
-    LIVING_CHECK(spy.verifyRequests.size() == 1);
-    uint32_t const staleGeneration = spy.LastGeneration();
-
-    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxAwaitingPumps; ++i)
-        deletions.Pump(spy.Make());
-    LIVING_CHECK(spy.verifyRequests.size() == 1); // still waiting within the deadline
-
-    deletions.Pump(spy.Make()); // timeout: watchdog re-arms
-    LIVING_CHECK(spy.verifyRequests.size() == 2);
-    LIVING_CHECK(spy.LastGeneration() != staleGeneration);
-
-    // The stale callback arrives now: ignored entirely (no absence claimed).
-    deletions.OnAbsenceVerify(7050, staleGeneration, RowVerifyOutcome::Absent);
-    deletions.Pump(spy.Make());
-    LIVING_CHECK(spy.metadataClears.empty());
-
-    // The current generation settles the owner.
-    deletions.OnAbsenceVerify(7050, spy.LastGeneration(), RowVerifyOutcome::Absent);
-    deletions.Pump(spy.Make());
-    deletions.Pump(spy.Make());
-    LIVING_CHECK(spy.metadataClears == std::vector<uint32_t>{ 7050 });
-    LIVING_CHECK(!deletions.Owns(7050));
-}
-
-LIVING_TEST(durable_deletion_capacity_overflow_is_retained_and_promoted)
-{
-    // Over-capacity adoptions are FAIL-CLOSED: login eligibility is revoked,
-    // the guid is DEFERRED (not dropped) into a bounded overflow set that
-    // still counts as owned - so IsDeletionPending keeps blocking logins and
-    // metadata mutation - and it is promoted into an active record as
-    // capacity frees, eventually confirming like any other deletion.
+    // Over capacity there is no confirmation record - that work waits for the
+    // next restart's scan - but the guid must STILL read as owned. Owns() is
+    // what IsDeletionPending consults to block login and to refuse the guid to
+    // a new creation while its DeleteFromDB is queued; forgetting it here
+    // would fail OPEN.
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
@@ -409,29 +374,129 @@ LIVING_TEST(durable_deletion_capacity_overflow_is_retained_and_promoted)
     LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
 
     deletions.Adopt(99999, 1, "Overflow", true, spy.Make());
-    LIVING_CHECK(spy.revokedLogins.back() == 99999); // revoked regardless
+    LIVING_CHECK(spy.revokedLogins.back() == 99999); // login revoked
     LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
-    LIVING_CHECK(deletions.Owns(99999));             // STILL OWNED: login stays blocked
-    LIVING_CHECK(spy.quarantined.back() == 99999);   // deferral disclosed
+    LIVING_CHECK(deletions.Owns(99999));             // fail closed: still owned
+    LIVING_CHECK(deletions.IsQuarantined(99999));    // and visibly so
+    LIVING_CHECK(spy.quarantined.back() == 99999);   // disclosed
 
-    // One active record completes -> the deferred guid is promoted and runs
-    // the normal confirmation flow to completion.
+    // Re-adopting the same guid is a silent no-op: it is already owned and
+    // already reported - no duplicate disclosure churn.
+    size_t const disclosures = spy.quarantined.size();
+    deletions.Adopt(99999, 1, "Overflow", true, spy.Make());
+    LIVING_CHECK(spy.quarantined.size() == disclosures);
+
+    // Pumping never invents a record for it, and never claims it completed.
     deletions.Pump(spy.Make());
-    deletions.OnAbsenceVerify(10000, deletions.CurrentGeneration(10000), RowVerifyOutcome::Absent);
-    deletions.Pump(spy.Make()); // consume outcome
-    deletions.Pump(spy.Make()); // clear + confirm 10000; capacity frees; 99999 promoted
-    LIVING_CHECK(!deletions.Owns(10000));
+    LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
     LIVING_CHECK(deletions.Owns(99999));
-
-    deletions.Pump(spy.Make()); // promoted record requests its verify
-    deletions.OnAbsenceVerify(99999, deletions.CurrentGeneration(99999), RowVerifyOutcome::Absent);
-    deletions.Pump(spy.Make());
-    deletions.Pump(spy.Make());
-    LIVING_CHECK(!deletions.Owns(99999)); // eventually adopted AND completed
-    bool confirmed99999 = false;
     for (auto const& entry : spy.confirmed)
-        confirmed99999 = confirmed99999 || entry.first == 99999;
-    LIVING_CHECK(confirmed99999);
+        LIVING_CHECK(entry.first != 99999);
+
+    // Quarantined guids do NOT hold record capacity: once an occupant
+    // completes, a brand-new deletion admits normally - the ceiling can only
+    // ever be full of genuinely in-flight confirmations.
+    deletions.OnAbsenceVerify(10000, /*generation*/ 1, RowVerifyOutcome::Absent); // every record's first request
+    deletions.Pump(spy.Make());
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(!deletions.Owns(10000));
+    deletions.Adopt(88888, 7, "Fresh", true, spy.Make());
+    LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
+    LIVING_CHECK(deletions.Owns(88888));
+    LIVING_CHECK(!deletions.IsQuarantined(88888)); // a real record, not a drop
+}
+
+LIVING_TEST(durable_deletion_lost_callback_rearms_and_ignores_stale)
+{
+    // A readback whose callback never arrives is recovered, not terminated:
+    // the watchdog abandons the wait (one bounded attempt), re-arms under a
+    // NEW generation, and the stale result - should it straggle in - no
+    // longer matches. A transient loss therefore self-heals; only attempt
+    // exhaustion fails closed.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7050, 42, "Lost", true, spy.Make());
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.verifyRequests.size() == 1);
+    uint32_t const staleGeneration = spy.LastGeneration();
+
+    // Within the budget: still waiting, no re-request.
+    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxAwaitingPumps; ++i)
+        deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.verifyRequests.size() == 1);
+
+    // Expiry: re-armed under a new generation, not quarantined.
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.verifyRequests.size() == 2);
+    LIVING_CHECK(spy.LastGeneration() != staleGeneration);
+    LIVING_CHECK(!deletions.IsQuarantined(7050));
+    LIVING_CHECK(spy.quarantined.empty());
+
+    // The lost request's callback straggles in now: ignored entirely - a
+    // stale Absent must never license the metadata clear. Two pumps, because
+    // an (incorrectly) accepted absence would confirm on the first and clear
+    // on the second.
+    deletions.OnAbsenceVerify(7050, staleGeneration, RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make());
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.metadataClears.empty());
+    LIVING_CHECK(deletions.Owns(7050)); // nothing settled by the stale result
+
+    // The CURRENT generation settles the owner normally: self-healed.
+    deletions.OnAbsenceVerify(7050, spy.LastGeneration(), RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make());
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.metadataClears == std::vector<uint32_t>{ 7050 });
+    LIVING_CHECK(!deletions.Owns(7050));
+}
+
+LIVING_TEST(durable_deletion_lost_callbacks_exhaust_bounded_then_fail_closed)
+{
+    // Every re-armed wait that also never answers consumes one of the bounded
+    // attempts; exhaustion quarantines with disclosure - fail closed, rows
+    // kept for the next restart, and the guid stays owned.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7052, 42, "VeryLost", true, spy.Make());
+    for (uint32_t attempt = 0; attempt < DurableCharacterDeletions::kMaxVerifyAttempts; ++attempt)
+        for (uint32_t i = 0; i <= DurableCharacterDeletions::kMaxAwaitingPumps + 1; ++i)
+            deletions.Pump(spy.Make());
+
+    LIVING_CHECK(deletions.IsQuarantined(7052));
+    LIVING_CHECK(spy.quarantined == std::vector<uint32_t>{ 7052 });
+    LIVING_CHECK(spy.verifyRequests.size() == DurableCharacterDeletions::kMaxVerifyAttempts);
+    LIVING_CHECK(spy.metadataClears.empty()); // nothing cleared on an unproven deletion
+    LIVING_CHECK(spy.confirmed.empty());
+    LIVING_CHECK(deletions.Owns(7052));       // login stays blocked
+    LIVING_CHECK(deletions.RecordCount() == 0); // but no record capacity is held
+
+    // Quarantined guids do no further work.
+    size_t const requests = spy.verifyRequests.size();
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(spy.verifyRequests.size() == requests);
+}
+
+LIVING_TEST(durable_deletion_callback_within_the_deadline_still_completes)
+{
+    // The watchdog must not fire on a merely slow callback: the pump budget is
+    // reset by the outcome, not by wall time.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7051, 42, "Slow", true, spy.Make());
+    deletions.Pump(spy.Make());
+    for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxAwaitingPumps - 1; ++i)
+        deletions.Pump(spy.Make());
+
+    deletions.OnAbsenceVerify(7051, spy.LastGeneration(), RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make()); // consumes the outcome
+    deletions.Pump(spy.Make()); // clears metadata + confirms
+    LIVING_CHECK(spy.metadataClears == std::vector<uint32_t>{ 7051 });
+    LIVING_CHECK(spy.confirmed.size() == 1 && spy.confirmed[0].first == 7051);
+    LIVING_CHECK(!deletions.Owns(7051));
+    LIVING_CHECK(spy.quarantined.empty());
 }
 
 LIVING_TEST(reload_adopt_quarantined_never_downgrades_a_proven_deletion)
@@ -447,11 +512,11 @@ LIVING_TEST(reload_adopt_quarantined_never_downgrades_a_proven_deletion)
     deletions.Adopt(7100, 42, "Live", true, spy.Make());
     deletions.Pump(spy.Make()); // verify requested; deletion still executing
 
-    deletions.AdoptQuarantined(7100, 42, "Live", spy.Make()); // reload re-scan
+    deletions.AdoptQuarantined(7100, spy.Make()); // reload re-scan
     LIVING_CHECK(!deletions.IsQuarantined(7100));             // NOT downgraded
 
     // The original owner completes normally.
-    deletions.OnAbsenceVerify(7100, deletions.CurrentGeneration(7100), RowVerifyOutcome::Absent);
+    deletions.OnAbsenceVerify(7100, spy.LastGeneration(), RowVerifyOutcome::Absent);
     deletions.Pump(spy.Make());
     deletions.Pump(spy.Make());
     LIVING_CHECK(!deletions.Owns(7100));
@@ -549,14 +614,14 @@ LIVING_TEST(durable_deletion_recovery_present_rows_quarantine_not_redelete)
     // The pre-quarantined recovery adoption for scan-discovered present rows.
     DurableCharacterDeletions preQuarantined;
     DeletionSpyOps preSpy;
-    preQuarantined.AdoptQuarantined(7071, 42, "Reused", preSpy.Make());
+    preQuarantined.AdoptQuarantined(7071, preSpy.Make());
     LIVING_CHECK(preQuarantined.IsQuarantined(7071));
     LIVING_CHECK(preSpy.revokedLogins == std::vector<uint32_t>{ 7071 });
     LIVING_CHECK(preSpy.quarantined == std::vector<uint32_t>{ 7071 });
     preQuarantined.Pump(preSpy.Make());
     LIVING_CHECK(preSpy.verifyRequests.empty()); // no work: manual resolution only
 
-    // A stale callback from the prior identity's generation is ignored.
+    // A late callback for the quarantined record is ignored.
     preQuarantined.OnAbsenceVerify(7071, 1, RowVerifyOutcome::Absent);
     preQuarantined.Pump(preSpy.Make());
     LIVING_CHECK(preSpy.metadataClears.empty());

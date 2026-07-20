@@ -183,7 +183,7 @@ public:
         // rejected before persistence, so a discarded transient character
         // leaves no cache entry behind (load state included - the next read
         // reloads from durable truth).
-        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); oneShotMarkers.erase(bot); durableOneShotMarkers.erase(bot); }
+        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); oneShotMarkers.erase(bot); }
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
@@ -368,19 +368,13 @@ public:
         std::map<uint32, std::set<std::string> > dirtyEvents;
         // Per-(bot, marker) one-shot completion ledger for the post-create
         // markers (create gear/levelup/test): the runtime effect runs EXACTLY
-        // ONCE and only the durable clear is retried, so an always-online bot
-        // no longer replays the mutation (e.g. gear=empty destroying items)
-        // every manager pass. In-memory only; a confirmed clear removes the
-        // durable marker, and ForgetEventCache drops the ledger on guid reuse.
-        std::map<uint32, std::map<std::string, living::OneShotMarker> > oneShotMarkers;
-        // Per-(bot, marker) ledger for the DESTRUCTIVE post-create markers
-        // (create gear / create levelup): the effect runs first, the phase-2
-        // record (with PRE/POST equipment fingerprints) is execution-confirmed
-        // after it, and the durable intent is cleared only once an
-        // execution-ordered fingerprint readback PROVES the intended
-        // postcondition landed. Ambiguity quarantines with an error instead of
-        // clearing. ForgetEventCache drops the ledger on guid reuse.
-        std::map<uint32, std::map<std::string, living::DurableOneShotMarker> > durableOneShotMarkers;
+        // ONCE per process and only the durable clear is retried (unbounded,
+        // self-healing, disclosed once when stuck), so an always-online bot
+        // never replays the mutation (e.g. gear=empty destroying items). The
+        // consume protocol that owns this ledger's lifecycle is
+        // living::ConsumeOneShotMarker; ForgetEventCache drops the ledger on
+        // guid reuse.
+        living::OneShotLedgers oneShotMarkers;
         // Transient post-create scheduler owners, SEPARATE from the
         // always-online freeAltBots membership: registered at creation
         // finalization, reconstructed from durable markers on reload, and
@@ -399,36 +393,6 @@ public:
         bool postCreateScanFailed = false;
         uint32 postCreateScanRetryPasses = 0;
         static constexpr uint32 kOwnerScanRetryPasses = 600; // ~seconds of passes between retries
-        // Save-verification bookkeeping: token -> (bot, marker, expected
-        // fingerprint, request generation) for the async equipment readback
-        // queued BEHIND the effect's SaveToDB on the same FIFO thread. Results
-        // are only enqueued by the SQL callback and drained from LoginFreeBots
-        // on the world thread; stale generations (a late callback after a
-        // watchdog re-arm) are dropped there.
-        struct PostCreateSaveVerify
-        {
-            uint32 botGuid = 0;
-            std::string marker;
-            uint64 expectedHash = 0;
-            uint32 generation = 0;
-        };
-        std::map<uint64, PostCreateSaveVerify> saveVerifyTokens;
-        uint64 nextSaveVerifyToken = 1;
-        struct PostCreateSaveVerifyResult
-        {
-            uint64 token = 0;
-            bool queryOk = false;
-            uint64 actualHash = 0;
-        };
-        std::vector<PostCreateSaveVerifyResult> saveVerifyResults;
-        // Enqueues the execution-ordered equipment readback for (bot, marker);
-        // returns whether it was actually enqueued.
-        bool RequestPostCreateSaveVerify(uint32 botGuid, std::string const& marker,
-            uint64 expectedHash, uint32 generation);
-        // SQL result callback: parse + enqueue only (deadlock contract).
-        void HandlePostCreateSaveVerify(QueryResult* result, uint64 verifyToken);
-        // Applies drained verification results to the durable marker ledgers.
-        void DrainPostCreateSaveVerifies();
         // True after an activation pair (add/logout) whose durable state could
         // not be established: GetBots must reconcile from durable truth before
         // trusting the in-memory vector again.

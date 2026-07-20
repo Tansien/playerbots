@@ -36,6 +36,12 @@ namespace living
     // consumes its own bounded transient budget - never the semantic
     // replacement budget, and never a terminal record until that budget is
     // exhausted.
+    //
+    // ponytail: outstanding members of OLDER batches are credited to a new
+    // request as a plain count folded into its preexisting baseline, not as
+    // tracked references. If a credited member later expires without joining,
+    // the group simply ends up undersized and the user re-runs the command -
+    // per-credit ownership/replacement tracking is not warranted here.
 
     enum class BatchMemberState
     {
@@ -87,17 +93,6 @@ namespace living
         uint8_t role = 0;
     };
 
-    // One credited predecessor dependency of a fresh batch: an outstanding
-    // member slot of an OLDER batch that the new request counted as effective
-    // membership. Tracked by reference (token + index), never as a bare
-    // number: the predecessor can expire while the new batch is still active,
-    // and a vanished credit must be replaced or reported - not silently kept.
-    struct CreditedDependency
-    {
-        uint64_t batchToken = 0;
-        size_t memberIndex = 0;
-    };
-
     class CreationBatchRegistry
     {
     public:
@@ -107,7 +102,16 @@ namespace living
             std::string initiatorName; // master name or test identity
             uint32_t initiatorGuid = 0; // 0 for console/test batches
             uint32_t desiredSize = 0;
-            uint32_t preexistingMembers = 0; // LIVE members when the batch began
+            // LIVE members observed at the last sizing decision. Refreshed by
+            // every extension from that extension's own observation.
+            uint32_t preexistingMembers = 0;
+            // Outstanding members of OLDER batches that were credited as
+            // effective membership when this batch began (a plain count; see
+            // the ponytail note above). Held SEPARATELY from the live count
+            // because extensions recompute the live count from scratch and
+            // would otherwise discard the credit - which reports a genuinely
+            // full group as undersized.
+            uint32_t creditedMembers = 0;
             std::vector<CreationBatchMember> members;
             uint32_t replacementBudget = 0;
             std::vector<std::string> failures;
@@ -122,18 +126,11 @@ namespace living
             bool useRandomAccounts = false;
             // Set once the completion summary has been surfaced.
             bool completionReported = false;
-            // Unresolved credited predecessor dependencies (see
-            // CreditedDependency). A CONFIRMED credit (the member joined)
-            // moves into preexistingMembers; a LOST credit (predecessor
-            // expired/failed) is replaced within the budget or reported.
-            std::vector<CreditedDependency> creditedDependencies;
 
-            // The completion baseline: live members at the last sizing
-            // decision PLUS still-credited (unresolved) dependencies.
-            uint32_t EffectivePreexisting() const
-            {
-                return preexistingMembers + static_cast<uint32_t>(creditedDependencies.size());
-            }
+            // The ONE definition of "members counted toward desiredSize that
+            // this batch did not create". Every sizing/undersize decision must
+            // go through this rather than reading either half.
+            uint32_t EffectivePreexisting() const { return preexistingMembers + creditedMembers; }
         };
 
         static constexpr size_t kMaxBatches = 16;
@@ -199,12 +196,18 @@ namespace living
         // desiredSize (one replacement per requested slot) instead of leaving
         // the added slots to share the original run's budget.
         //
-        // The live-membership baseline is refreshed from the extension's OWN
-        // observation: unrelated members who joined since Begin used to stay
-        // uncounted (the stale baseline made completion report a false
-        // undersize). The batch's own already-joined finalized members are
-        // subtracted so they are never counted both as preexisting AND as
-        // finalized in the completion invariant.
+        // BOTH baseline halves are refreshed from the extension's OWN
+        // observation. The live half: unrelated members who joined since
+        // Begin used to stay uncounted (the stale baseline made completion
+        // report a false undersize); the batch's own already-joined finalized
+        // members are subtracted so they are never counted both as
+        // preexisting AND as finalized. The credited half is RETIRED against
+        // the same observation - recomputed from the OTHER batches' currently
+        // outstanding-unjoined slots. A credited member who joined is inside
+        // liveMembers now (keeping the old count would double-count it, and a
+        // genuinely short group would report full-size); one whose batch
+        // expired is no longer presumed (the group then honestly completes
+        // undersized - the documented fallback).
         template <typename JoinedFn>
         bool ExtendDesiredSize(uint64_t batchToken, uint32_t desiredSize, uint32_t liveMembers,
             JoinedFn&& isJoined)
@@ -220,6 +223,17 @@ namespace living
                 if (member.state == BatchMemberState::Finalized && isJoined(member.finalizedGuid))
                     ++ownJoined;
             batch.preexistingMembers = liveMembers > ownJoined ? liveMembers - ownJoined : 0;
+
+            uint32_t credited = 0;
+            for (auto const& [otherToken, other] : batches)
+            {
+                if (otherToken == batchToken || other.initiatorGuid != batch.initiatorGuid)
+                    continue;
+                for (CreationBatchMember const& member : other.members)
+                    if (MemberOutstanding(member, isJoined))
+                        ++credited;
+            }
+            batch.creditedMembers = credited;
 
             if (desiredSize > batch.desiredSize)
             {
@@ -376,12 +390,7 @@ namespace living
                 return result;
 
             Batch const& batch = it->second;
-            // Unresolved credited dependencies BLOCK final completion: a
-            // request must never report final success while a referenced
-            // credit could still vanish - the per-pump re-evaluation resolves
-            // every credit (confirm, replace, or report) in bounded time, and
-            // only then may the batch complete, notify, and expire.
-            bool anyOutstanding = !batch.creditedDependencies.empty();
+            bool anyOutstanding = false;
             for (CreationBatchMember const& member : batch.members)
             {
                 if (member.state == BatchMemberState::AwaitingAttempt
@@ -423,6 +432,18 @@ namespace living
             return true;
         }
 
+        // The ONE outstanding-slot predicate: a planned/pending creation, or a
+        // finalized member that has not yet joined the group. Every traversal
+        // that credits, counts, or gates on outstanding slots goes through
+        // this.
+        template <typename JoinedFn>
+        static bool MemberOutstanding(CreationBatchMember const& member, JoinedFn&& isJoined)
+        {
+            return member.state == BatchMemberState::AwaitingAttempt
+                || member.state == BatchMemberState::PendingPersistence
+                || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid));
+        }
+
         // Outstanding group slots already owned by this initiator's batches:
         // planned/pending creations PLUS finalized members that have not yet
         // joined the group (`isJoined(guid)` decides). A repeated group
@@ -434,32 +455,6 @@ namespace living
             uint32_t outstanding = 0;
             ForEachOutstandingMember(initiatorGuid, isJoined,
                 [&outstanding](CreationBatchMember const&) { ++outstanding; });
-
-            // Unresolved credited dependencies whose SOURCE slot no longer
-            // exists (predecessor pruned) or failed terminally are not seen by
-            // the member walk above, yet they still represent one owed slot:
-            // the next re-evaluation will replace them within the budget. Not
-            // counting them let a repeated request in the prune->reevaluate
-            // window recreate the deficit, fanning ONE lost slot into TWO
-            // replacements. Live outstanding sources are already counted by
-            // the walk, so only source-gone credits are added here.
-            for (auto const& [token, batch] : batches)
-            {
-                if (batch.initiatorGuid != initiatorGuid)
-                    continue;
-
-                for (CreditedDependency const& credit : batch.creditedDependencies)
-                {
-                    CreationBatchMember const* source = nullptr;
-                    if (auto predecessor = batches.find(credit.batchToken);
-                        predecessor != batches.end() && credit.memberIndex < predecessor->second.members.size())
-                        source = &predecessor->second.members[credit.memberIndex];
-
-                    if (!source || source->state == BatchMemberState::TerminalFailure
-                        || (source->state == BatchMemberState::Finalized && isJoined(source->finalizedGuid)))
-                        ++outstanding;
-                }
-            }
             return outstanding;
         }
 
@@ -479,116 +474,8 @@ namespace living
                     continue;
 
                 for (CreationBatchMember const& member : batch.members)
-                {
-                    switch (member.state)
-                    {
-                        case BatchMemberState::AwaitingAttempt:
-                        case BatchMemberState::PendingPersistence:
-                            fn(member);
-                            break;
-                        case BatchMemberState::Finalized:
-                            if (!isJoined(member.finalizedGuid))
-                                fn(member);
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
-        }
-
-        // The outstanding member slots (planned, pending, or finalized-but-
-        // unjoined) of ALL of the initiator's batches, by reference - the
-        // trackable form of OutstandingSlotsForInitiator for a fresh batch's
-        // credited dependencies.
-        // Whether some batch already OWNS this slot as a credited dependency.
-        bool IsCreditOwned(uint64_t batchToken, size_t memberIndex) const
-        {
-            for (auto const& [token, batch] : batches)
-                for (CreditedDependency const& credit : batch.creditedDependencies)
-                    if (credit.batchToken == batchToken && credit.memberIndex == memberIndex)
-                        return true;
-            return false;
-        }
-
-        template <typename JoinedFn>
-        std::vector<CreditedDependency> CollectOutstandingMemberRefs(uint32_t initiatorGuid,
-            JoinedFn&& isJoined) const
-        {
-            std::vector<CreditedDependency> refs;
-            if (initiatorGuid == 0)
-                return refs;
-
-            for (auto const& [token, batch] : batches)
-            {
-                if (batch.initiatorGuid != initiatorGuid)
-                    continue;
-
-                for (size_t i = 0; i < batch.members.size(); ++i)
-                {
-                    CreationBatchMember const& member = batch.members[i];
-                    bool const outstanding = member.state == BatchMemberState::AwaitingAttempt
-                        || member.state == BatchMemberState::PendingPersistence
-                        || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid));
-                    // Exactly ONE replacement owner per credited slot: a slot
-                    // already credited elsewhere is not collectable again, so
-                    // predecessor expiry produces at most one replacement.
-                    if (outstanding && !IsCreditOwned(token, i))
-                        refs.push_back(CreditedDependency{ token, i });
-                }
-            }
-            return refs;
-        }
-
-        // Re-evaluates every batch's credited dependencies against the LIVE
-        // registry and group state (run once per pump, before completion is
-        // surfaced). `isJoinedFor(initiatorGuid, memberGuid)` resolves live
-        // membership. A credit whose member JOINED is confirmed into the
-        // preexisting baseline; a credit whose predecessor batch was pruned
-        // (expired) or whose slot failed terminally is LOST - it is replaced
-        // within the existing bounded replacement budget, or recorded as a
-        // failure so completion reports the batch undersized instead of
-        // claiming a full-size success on vanished credit.
-        template <typename JoinedForFn>
-        void ReevaluateCredits(uint64_t pumpCount, JoinedForFn&& isJoinedFor)
-        {
-            for (auto& [token, batch] : batches)
-            {
-                for (auto it = batch.creditedDependencies.begin(); it != batch.creditedDependencies.end();)
-                {
-                    CreationBatchMember const* member = nullptr;
-                    if (auto predecessor = batches.find(it->batchToken);
-                        predecessor != batches.end() && it->memberIndex < predecessor->second.members.size())
-                        member = &predecessor->second.members[it->memberIndex];
-
-                    if (member && member->state == BatchMemberState::Finalized
-                        && isJoinedFor(batch.initiatorGuid, member->finalizedGuid))
-                    {
-                        ++batch.preexistingMembers; // credit confirmed permanently
-                        it = batch.creditedDependencies.erase(it);
-                        continue;
-                    }
-
-                    if (!member || member->state == BatchMemberState::TerminalFailure)
-                    {
-                        if (batch.replacementBudget > 0)
-                        {
-                            --batch.replacementBudget;
-                            CreationBatchMember slot;
-                            slot.state = BatchMemberState::AwaitingAttempt;
-                            slot.nextAttemptTick = pumpCount + 1;
-                            batch.members.push_back(slot);
-                        }
-                        else
-                            batch.failures.push_back(
-                                "a credited member from a previous group creation expired without joining; "
-                                "the replacement budget is exhausted");
-                        it = batch.creditedDependencies.erase(it);
-                        continue;
-                    }
-
-                    ++it; // still owned by a live predecessor, unjoined: wait
-                }
+                    if (MemberOutstanding(member, isJoined))
+                        fn(member);
             }
         }
 
@@ -609,18 +496,13 @@ namespace living
                 if (batch.initiatorGuid != initiatorGuid)
                     continue;
 
-                // Unresolved credits count as outstanding dependencies for
-                // option compatibility, exactly like unjoined members.
-                bool outstanding = !batch.creditedDependencies.empty();
+                bool outstanding = false;
                 for (CreationBatchMember const& member : batch.members)
-                {
-                    if (outstanding)
-                        break;
-                    if (member.state == BatchMemberState::AwaitingAttempt
-                        || member.state == BatchMemberState::PendingPersistence
-                        || (member.state == BatchMemberState::Finalized && !isJoined(member.finalizedGuid)))
+                    if (MemberOutstanding(member, isJoined))
+                    {
                         outstanding = true;
-                }
+                        break;
+                    }
 
                 if (outstanding)
                     fn(batch);
@@ -649,12 +531,7 @@ namespace living
                 if (batch.initiatorGuid != initiatorGuid || token <= newest)
                     continue;
 
-                // Unresolved credited dependencies make a batch ACTIVE: it is
-                // the single owner of that coverage, and a repeated request
-                // must extend it - never spawn an independent tracker whose
-                // duplicate credit would fan one lost slot into many
-                // replacements.
-                bool active = !batch.creditedDependencies.empty();
+                bool active = false;
                 for (CreationBatchMember const& member : batch.members)
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence)
@@ -678,7 +555,7 @@ namespace living
             std::vector<Batch const*> completed;
             for (auto& [token, batch] : batches)
             {
-                bool anyOutstanding = !batch.creditedDependencies.empty();
+                bool anyOutstanding = false;
                 for (CreationBatchMember const& member : batch.members)
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence)
@@ -700,7 +577,7 @@ namespace living
             for (auto it = batches.begin(); it != batches.end();)
             {
                 Batch& batch = it->second;
-                bool anyOutstanding = !batch.creditedDependencies.empty();
+                bool anyOutstanding = false;
                 for (CreationBatchMember const& member : batch.members)
                     if (member.state == BatchMemberState::AwaitingAttempt
                         || member.state == BatchMemberState::PendingPersistence)
@@ -759,10 +636,10 @@ namespace living
         // No active batch, and live membership plus credited outstanding
         // dependencies already reach the requested size.
         AlreadyCovered,
-        // No active batch: begin a fresh batch whose baseline explicitly
-        // credits the outstanding dependencies (creditedPreexisting), so its
-        // completion invariant cannot report a false undersize for slots an
-        // older batch still owns.
+        // No active batch: begin a fresh batch whose baseline credits the
+        // outstanding dependencies as a plain count (outstandingSlots), so
+        // its completion invariant does not report a false undersize for
+        // slots an older batch still owns.
         BeginNew,
     };
 
@@ -770,13 +647,8 @@ namespace living
     {
         GroupBatchRequestAction action = GroupBatchRequestAction::BeginNew;
         uint64_t existingToken = 0;      // nonzero only for ExtendExisting
-        uint32_t outstandingSlots = 0;   // credited dependencies across ALL batches
+        uint32_t outstandingSlots = 0;   // outstanding members across ALL batches
         uint32_t effectiveMembers = 0;   // live + outstanding
-        uint32_t creditedPreexisting = 0;// live + outstanding (message baseline)
-        // The exact predecessor slots credited: BeginNew stores these in the
-        // fresh batch so a vanished credit is replaced or reported instead of
-        // silently counting forever.
-        std::vector<CreditedDependency> creditedDependencies;
     };
 
     // The ONE ownership/accounting rule for a repeated group request. The
@@ -794,7 +666,6 @@ namespace living
         GroupBatchRequestPlan plan;
         plan.outstandingSlots = registry.OutstandingSlotsForInitiator(initiatorGuid, isJoined);
         plan.effectiveMembers = liveMembers + plan.outstandingSlots;
-        plan.creditedPreexisting = plan.effectiveMembers;
 
         bool incompatible = false;
         registry.ForEachBatchWithOutstanding(initiatorGuid, isJoined,
@@ -820,10 +691,6 @@ namespace living
             return plan;
         }
 
-        // Both AlreadyCovered and BeginNew reference the credited slots BY
-        // dependency: AlreadyCovered must retain ownership of the credits it
-        // reported as coverage (a tracking batch), never an untracked number.
-        plan.creditedDependencies = registry.CollectOutstandingMemberRefs(initiatorGuid, isJoined);
         plan.action = plan.effectiveMembers >= requestedSize
             ? GroupBatchRequestAction::AlreadyCovered
             : GroupBatchRequestAction::BeginNew;

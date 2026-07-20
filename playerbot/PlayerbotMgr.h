@@ -208,14 +208,9 @@ public:
     // amplification.
     static living::SlotReservationOutcome TryReserveCharacterSlot(uint32 accountId);
     static living::SlotReservationOutcome TryReserveCharacterSlot(uint32 accountId, uint32 durableCount);
-    // Releases one reservation that never queued a save (pre-save failure).
+    // Releases one reservation that never queued a save (pre-save failure),
+    // or one bulk-fill reservation once its save is queued.
     static void ReleaseCharacterSlot(uint32 accountId);
-    // Registers one GENERATION-scoped execution-ordered bulk-reservation
-    // readback (issued after that generation's saves were queued on the same
-    // FIFO thread); the pump releases exactly that generation's reservations
-    // when its own barrier returns, keeps them on bounded failure. Never
-    // merges with earlier in-flight generations.
-    static void BeginBulkReservationVerify(uint32 accountId, uint32 reservedSlots);
     // Typed account-existence lookup by name (COUNT + MIN aggregate: a
     // missing account is distinguishable from a failed query; the name is
     // escaped here, once).

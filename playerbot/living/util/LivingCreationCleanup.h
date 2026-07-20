@@ -168,7 +168,7 @@ namespace living
         std::function<void(uint32_t /*guid*/, uint32_t /*accountId*/)> deleteCharacter;
         // Enqueues the execution-ordered absence readback (COUNT + identity by
         // guid) bound to `generation` - a late callback from a superseded
-        // generation must be distinguishable. Returns whether the query was
+        // request must be distinguishable. Returns whether the query was
         // actually ENQUEUED.
         std::function<bool(uint32_t /*guid*/, uint32_t /*generation*/)> requestAbsenceVerify;
         // Execution-confirmed removal of the character's event rows/markers.
@@ -281,31 +281,39 @@ namespace living
     // the guid was reused (the deletion succeeded) and clears only the intent;
     // failed queries retry. All bounded; exhaustion quarantines the record
     // (fail closed: durable rows stay, so a restart's startup sweep retries).
-    // Every request carries a generation and a lost callback is recovered by
-    // the deadline watchdog: the wait is abandoned (consuming one bounded
-    // attempt), a NEW generation re-requests, and stale results are ignored.
+    //
+    // Each record has at most one outstanding readback, stamped with a
+    // GENERATION so a result from a superseded request is distinguishable. A
+    // callback that never arrives (DB thread torn down, result queue dropped,
+    // or simply a very deep write backlog) is recovered by the pump watchdog:
+    // the wait is abandoned - consuming one bounded attempt - and a NEW
+    // generation re-requests; stale results are ignored. Only attempt
+    // exhaustion quarantines, and quarantine DEMOTES the record to an inert
+    // owned guid: login and guid reuse stay blocked, the durable rows stay
+    // for the next restart's scan, and active-record capacity is never
+    // consumed by dead weight.
     class DurableCharacterDeletions
     {
     public:
         static constexpr size_t kMaxRecords = 256;
         static constexpr uint32_t kMaxVerifyAttempts = 5;
         static constexpr uint32_t kMaxClearAttempts = 5;
-        // Pumps a verification may stay outstanding before its callback is
-        // considered lost (the relocation watchdog pattern; one pump per tick).
-        static constexpr uint32_t kMaxAwaitingPumps = 128;
-        // Bounded deferral set for adoptions arriving while the registry is
-        // full; far above any realistic burst, and still fail-closed beyond it
-        // (the durable intent rows remain for the next restart).
-        static constexpr size_t kMaxOverflow = 4096;
+        // Pumps a readback may stay outstanding before its callback is
+        // considered lost and the wait is re-armed. Denominated in world
+        // ticks (>= 50ms each, so >= ~60 seconds per wait): the module treats
+        // a 10-second character-DB backlog as routine (the GetDatabaseDelay
+        // gates), and the readback is queued BEHIND the deletion on exactly
+        // that backlog, so the margin is deliberately wide - and expiry
+        // re-arms rather than terminating, bounded by kMaxVerifyAttempts
+        // overall.
+        static constexpr uint32_t kMaxAwaitingPumps = 1200;
 
         // Adopts ownership of one ALREADY-QUEUED character deletion, with the
         // recorded identity (name; may be empty when the character row was
         // already absent at intent time - a PRESENT row then always fails
         // closed). Login eligibility is revoked immediately, even for
         // duplicate or over-capacity adoptions - an abandoned auto-added
-        // character must never race a login. Over-capacity adoptions are
-        // otherwise dropped (fail closed: rows stay, the next restart
-        // retries).
+        // character must never race a login.
         // `identityProvenInProcess`: true only when the caller verified the
         // present identity in THIS process (the typed deletion preflight) -
         // a Verified readback may then re-issue the idempotent deletion.
@@ -313,31 +321,27 @@ namespace living
         // readback fails closed, because the recorded identity cannot prove
         // the row was not reused since the original process died.
         //
-        // Capacity overflow is FAIL-CLOSED: the adoption is deferred into a
-        // bounded overflow set that still counts as owned (Owns -> login and
-        // metadata mutation stay blocked) and is promoted into an active
-        // record as capacity frees - never silently dropped.
+        // Over-capacity adoptions get no confirmation record - that work is
+        // deferred to the next restart's scan, which the durable intent rows
+        // survive for. The guid still quarantines as OWNED (fail closed):
+        // Owns() gates IsDeletionPending, which is what blocks login and
+        // refuses the guid to a new creation while its DeleteFromDB is queued.
+        // Forgetting it here would let a character with a queued deletion log
+        // back in, or a fresh creation land on its guid. Because quarantined
+        // guids do not occupy record capacity, the registry can only be full
+        // of genuinely in-flight confirmations - the ceiling never wedges.
         void Adopt(uint32_t guid, uint32_t accountId, std::string expectedName,
             bool identityProvenInProcess, CharacterDeletionOps const& ops)
         {
             if (ops.revokeLogin)
                 ops.revokeLogin(guid);
 
-            if (records.find(guid) != records.end())
-                return; // already owned
+            if (records.find(guid) != records.end() || quarantined.count(guid))
+                return; // already owned (live or inert)
 
             if (records.size() >= kMaxRecords)
             {
-                if (overflow.find(guid) == overflow.end() && overflow.size() < kMaxOverflow)
-                {
-                    Deferred deferred;
-                    deferred.accountId = accountId;
-                    deferred.expectedName = std::move(expectedName);
-                    deferred.identityProvenInProcess = identityProvenInProcess;
-                    overflow[guid] = std::move(deferred);
-                    if (ops.onQuarantined)
-                        ops.onQuarantined(guid); // disclosed: deferred, still blocking
-                }
+                Quarantine(guid, ops); // owned, inert, disclosed; restart retries
                 return;
             }
 
@@ -349,19 +353,18 @@ namespace living
 
         // Adopts a recovery-time PRESENT row directly into quarantine: login
         // stays blocked and everything is retained for manual resolution.
-        // NEVER downgrades an existing record: a config reload re-scanning a
+        // NEVER downgrades a live record: a config reload re-scanning a
         // deletion this process already owns with a PROVEN identity must not
         // strand it in quarantine - the live record keeps confirming.
-        void AdoptQuarantined(uint32_t guid, uint32_t accountId, std::string expectedName,
-            CharacterDeletionOps const& ops)
+        void AdoptQuarantined(uint32_t guid, CharacterDeletionOps const& ops)
         {
-            if (records.find(guid) != records.end() || overflow.find(guid) != overflow.end())
+            if (ops.revokeLogin)
+                ops.revokeLogin(guid);
+
+            if (records.find(guid) != records.end())
                 return; // already owned (possibly mid-confirmation): keep it
 
-            Adopt(guid, accountId, std::move(expectedName), false, ops);
-            auto it = records.find(guid);
-            if (it != records.end() && !it->second.quarantined)
-                Quarantine(guid, it->second, ops);
+            Quarantine(guid, ops);
         }
 
         // SQL-callback entry: copies the outcome into the record's mailbox and
@@ -370,11 +373,12 @@ namespace living
         // match); IdentityMismatch = present but the identity is unproven
         // (renamed, account-moved, reused, or never recorded) - fails closed.
         // Results from superseded generations (a late callback after a
-        // watchdog re-arm) are ignored.
+        // watchdog re-arm) are ignored, as are results for completed or
+        // quarantined guids (no record).
         void OnAbsenceVerify(uint32_t guid, uint32_t generation, RowVerifyOutcome outcome)
         {
             auto it = records.find(guid);
-            if (it == records.end() || it->second.quarantined)
+            if (it == records.end())
                 return;
             if (!it->second.verifyRequested || generation != it->second.generation)
                 return; // stale generation
@@ -400,11 +404,9 @@ namespace living
         void Pump(CharacterDeletionOps const& ops)
         {
             std::vector<uint32_t> completed;
+            std::vector<uint32_t> quarantinedNow;
             for (auto& [guid, record] : records)
             {
-                if (record.quarantined)
-                    continue;
-
                 if (record.absenceConfirmed)
                 {
                     // Absence is proven; only the metadata clear is retried.
@@ -415,7 +417,7 @@ namespace living
                         completed.push_back(guid);
                     }
                     else if (++record.clearAttempts >= kMaxClearAttempts)
-                        Quarantine(guid, record, ops);
+                        quarantinedNow.push_back(guid);
                     continue;
                 }
 
@@ -437,13 +439,13 @@ namespace living
                         // (rename and reuse are indistinguishable here): fail
                         // closed - never delete, never clear the intent, keep
                         // everything for manual resolution.
-                        Quarantine(guid, record, ops);
+                        quarantinedNow.push_back(guid);
                         continue;
                     }
 
                     if (++record.attempts >= kMaxVerifyAttempts)
                     {
-                        Quarantine(guid, record, ops);
+                        quarantinedNow.push_back(guid);
                         continue;
                     }
 
@@ -455,28 +457,25 @@ namespace living
                     {
                         if (!record.identityProvenInProcess)
                         {
-                            Quarantine(guid, record, ops);
+                            quarantinedNow.push_back(guid);
                             continue;
                         }
                         if (ops.deleteCharacter)
                             ops.deleteCharacter(guid, record.accountId);
                     }
                 }
-                else if (record.verifyRequested)
+                else if (record.verifyRequested && ++record.awaitingPumps > kMaxAwaitingPumps)
                 {
-                    // Lost-callback watchdog: abandon the wait after the
-                    // bounded pump budget (one attempt consumed); the request
-                    // below re-arms under a NEW generation, and the stale
-                    // result - should it straggle in - no longer matches.
-                    if (++record.awaitingPumps > kMaxAwaitingPumps)
+                    // Lost-callback watchdog: abandon the wait (consuming one
+                    // bounded attempt) and re-arm below under a NEW
+                    // generation; the stale result - should it straggle in -
+                    // no longer matches.
+                    record.verifyRequested = false;
+                    record.awaitingPumps = 0;
+                    if (++record.attempts >= kMaxVerifyAttempts)
                     {
-                        record.verifyRequested = false;
-                        record.awaitingPumps = 0;
-                        if (++record.attempts >= kMaxVerifyAttempts)
-                        {
-                            Quarantine(guid, record, ops);
-                            continue;
-                        }
+                        quarantinedNow.push_back(guid);
+                        continue;
                     }
                 }
 
@@ -498,38 +497,19 @@ namespace living
 
             for (uint32_t guid : completed)
                 records.erase(guid);
-
-            // Promote deferred (overflow) adoptions as capacity frees; they
-            // stayed owned (login-blocked) the whole time.
-            while (!overflow.empty() && records.size() < kMaxRecords)
+            for (uint32_t guid : quarantinedNow)
             {
-                auto deferred = overflow.begin();
-                Record& record = records[deferred->first];
-                record.accountId = deferred->second.accountId;
-                record.expectedName = std::move(deferred->second.expectedName);
-                record.identityProvenInProcess = deferred->second.identityProvenInProcess;
-                overflow.erase(deferred);
+                records.erase(guid);
+                Quarantine(guid, ops);
             }
         }
 
         bool Owns(uint32_t guid) const
         {
-            return records.find(guid) != records.end() || overflow.find(guid) != overflow.end();
+            return records.find(guid) != records.end() || quarantined.count(guid) != 0;
         }
 
-        bool IsQuarantined(uint32_t guid) const
-        {
-            auto it = records.find(guid);
-            return it != records.end() && it->second.quarantined;
-        }
-
-        // The generation of the outstanding request (0 when none) - test and
-        // diagnostics surface.
-        uint32_t CurrentGeneration(uint32_t guid) const
-        {
-            auto it = records.find(guid);
-            return it == records.end() ? 0 : it->second.generation;
-        }
+        bool IsQuarantined(uint32_t guid) const { return quarantined.count(guid) != 0; }
 
         size_t RecordCount() const { return records.size(); }
 
@@ -545,27 +525,25 @@ namespace living
             uint32_t awaitingPumps = 0; // watchdog while a request is outstanding
             bool verifyRequested = false;
             bool absenceConfirmed = false;
-            bool quarantined = false;
             bool hasPendingOutcome = false;
             RowVerifyOutcome pendingOutcome = RowVerifyOutcome::QueryFailed;
         };
 
-        void Quarantine(uint32_t guid, Record& record, CharacterDeletionOps const& ops)
+        // Discloses once per guid; repeated adoption of an already-quarantined
+        // guid is silent (it is already owned and already reported).
+        void Quarantine(uint32_t guid, CharacterDeletionOps const& ops)
         {
-            record.quarantined = true;
-            if (ops.onQuarantined)
+            if (quarantined.insert(guid).second && ops.onQuarantined)
                 ops.onQuarantined(guid);
         }
 
-        struct Deferred
-        {
-            uint32_t accountId = 0;
-            std::string expectedName;
-            bool identityProvenInProcess = false;
-        };
-
         std::map<uint32_t, Record> records;
-        // Bounded fail-closed deferral for adoptions beyond kMaxRecords.
-        std::map<uint32_t, Deferred> overflow;
+        // Failed-closed guids: quarantined outcomes and over-capacity
+        // adoptions. Inert (no pump work, ~a set node each) but still OWNED,
+        // so login and guid reuse stay blocked; the durable rows carry the
+        // retry across the next restart. Terminal for the process lifetime by
+        // design - in-process retry of an unprovable or exhausted deletion is
+        // exactly what fail-closed forbids.
+        std::set<uint32_t> quarantined;
     };
 }

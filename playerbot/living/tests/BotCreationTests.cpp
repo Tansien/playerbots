@@ -926,26 +926,18 @@ LIVING_TEST(gear_values_are_whitelisted_before_any_mutation)
         LIVING_CHECK(IsSupportedGearValue(value));
 
     // ...and everything else is rejected BEFORE any account/character
-    // mutation - including payloads that would have applied an effect and
-    // then failed to persist once the ~43-byte phase-2 record metadata was
-    // appended to the 255-byte envelope (boundaries 212/213/255).
+    // mutation.
     LIVING_CHECK(!IsSupportedGearValue("legendary"));
     LIVING_CHECK(!IsSupportedGearValue("Epic"));      // case-sensitive, like the effect switch
     LIVING_CHECK(!IsSupportedGearValue("sync@70"));   // internal stamped form is not user input
-    LIVING_CHECK(!IsSupportedGearValue(std::string(212, 'x')));
-    LIVING_CHECK(!IsSupportedGearValue(std::string(213, 'x')));
     LIVING_CHECK(!IsSupportedGearValue(std::string(255, 'x')));
 
-    // Every ACCEPTED value still fits the durable envelope with the phase-2
-    // record metadata appended: accepted input can never become impossible
-    // to persist.
+    // Every ACCEPTED value still fits the durable envelope with the
+    // worst-case captured-level suffix stamped on: accepted input can never
+    // become impossible to persist.
     for (char const* value : { "", "default", "empty", "green", "uncommon", "blue",
         "rare", "purple", "epic", "upgrade", "sync", "best", "partial" })
-    {
-        std::string const stamped = StampGearTarget(value, 4294967295u); // worst-case level suffix
-        LIVING_CHECK(EventValueFitsSchema("create gear",
-            EncodeDurableMarkerData(stamped, ~0ull, ~0ull)));
-    }
+        LIVING_CHECK(EventValueFitsSchema("create gear", StampGearTarget(value, 4294967295u)));
 }
 
 LIVING_TEST(gear_target_capture_survives_group_marker_clear)
