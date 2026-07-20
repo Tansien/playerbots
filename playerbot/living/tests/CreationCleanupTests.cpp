@@ -73,7 +73,7 @@ LIVING_TEST(cleanup_single_reset_before_finalize_deletes_exactly_once)
     CreationCleanupOps ops;
     ops.pollSingle = [&](uint64_t t, bool ack) { return finalizer.Poll(t, ack); };
     ops.pollBatch = [&](uint64_t t, bool ack) { return registry.Poll(t, ack); };
-    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); };
+    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); return true; };
 
     uint64_t const token = finalizer.Begin(MakeRecord(701, 1, "Temp"), HappyOps());
     cleanup.AdoptSingle(token);
@@ -110,7 +110,7 @@ LIVING_TEST(cleanup_partial_batch_never_deletes_under_a_live_batch)
     CreationCleanupOps ops;
     ops.pollSingle = [&](uint64_t t, bool ack) { return finalizer.Poll(t, ack); };
     ops.pollBatch = [&](uint64_t t, bool ack) { return registry.Poll(t, ack); };
-    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); };
+    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); return true; };
 
     CreationBatchRegistry::Batch batch;
     batch.initiatorGuid = 60;
@@ -164,7 +164,7 @@ LIVING_TEST(cleanup_quarantined_single_is_dropped_without_delete)
     CreationCleanupOps ops;
     ops.pollSingle = [&](uint64_t t, bool ack) { return finalizer.Poll(t, ack); };
     ops.pollBatch = [&](uint64_t t, bool ack) { return registry.Poll(t, ack); };
-    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); };
+    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); return true; };
 
     uint64_t const token = finalizer.Begin(MakeRecord(703, 1, "Quar"), HappyOps());
     cleanup.AdoptSingle(token);
@@ -227,7 +227,7 @@ LIVING_TEST(durable_deletion_confirmed_absence_clears_metadata_then_completes)
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
-    deletions.Adopt(7001, 42, "Botname", spy.Make());
+    deletions.Adopt(7001, 42, "Botname", true, spy.Make());
     LIVING_CHECK(spy.revokedLogins == std::vector<uint32_t>{ 7001 }); // immediately login-ineligible
     LIVING_CHECK(deletions.Owns(7001));
     std::string expectedName;
@@ -249,8 +249,8 @@ LIVING_TEST(durable_deletion_confirmed_absence_clears_metadata_then_completes)
 
     // Duplicate adoption merges: re-adopting an owned guid re-revokes login
     // but never duplicates the record.
-    deletions.Adopt(7002, 42, "Other", spy.Make());
-    deletions.Adopt(7002, 42, "Other", spy.Make());
+    deletions.Adopt(7002, 42, "Other", true, spy.Make());
+    deletions.Adopt(7002, 42, "Other", true, spy.Make());
     LIVING_CHECK(deletions.RecordCount() == 1);
 }
 
@@ -263,7 +263,7 @@ LIVING_TEST(durable_deletion_still_present_reissues_then_fails_closed)
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
-    deletions.Adopt(7010, 42, "Stuck", spy.Make());
+    deletions.Adopt(7010, 42, "Stuck", true, spy.Make());
     for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxVerifyAttempts + 2; ++i)
     {
         deletions.Pump(spy.Make());
@@ -292,7 +292,7 @@ LIVING_TEST(durable_deletion_query_failures_are_bounded_and_fail_closed)
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
-    deletions.Adopt(7020, 42, "Outage", spy.Make());
+    deletions.Adopt(7020, 42, "Outage", true, spy.Make());
     for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxVerifyAttempts + 2; ++i)
     {
         deletions.Pump(spy.Make());
@@ -306,7 +306,7 @@ LIVING_TEST(durable_deletion_query_failures_are_bounded_and_fail_closed)
     DurableCharacterDeletions enqueueFailures;
     DeletionSpyOps enqueueSpy;
     enqueueSpy.verifyEnqueueSucceeds = false;
-    enqueueFailures.Adopt(7021, 42, "NoQueue", enqueueSpy.Make());
+    enqueueFailures.Adopt(7021, 42, "NoQueue", true, enqueueSpy.Make());
     for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxVerifyAttempts + 2; ++i)
         enqueueFailures.Pump(enqueueSpy.Make());
     LIVING_CHECK(enqueueFailures.IsQuarantined(7021));
@@ -321,7 +321,7 @@ LIVING_TEST(durable_deletion_failed_metadata_clear_retries_then_fails_closed)
     DeletionSpyOps spy;
     spy.clearSucceeds = false;
 
-    deletions.Adopt(7030, 42, "ClearFail", spy.Make());
+    deletions.Adopt(7030, 42, "ClearFail", true, spy.Make());
     deletions.Pump(spy.Make());
     deletions.OnAbsenceVerify(7030, spy.LastGeneration(), RowVerifyOutcome::Absent);
     deletions.Pump(spy.Make());
@@ -346,7 +346,7 @@ LIVING_TEST(durable_deletion_unproven_identity_fails_closed)
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
-    deletions.Adopt(7040, 42, "OldBot", spy.Make());
+    deletions.Adopt(7040, 42, "OldBot", true, spy.Make());
     deletions.Pump(spy.Make());
     deletions.OnAbsenceVerify(7040, spy.LastGeneration(), RowVerifyOutcome::IdentityMismatch);
     deletions.Pump(spy.Make()); // consume the outcome -> quarantine
@@ -368,7 +368,7 @@ LIVING_TEST(durable_deletion_lost_callback_watchdog_rearms_and_ignores_stale)
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
-    deletions.Adopt(7050, 42, "Lost", spy.Make());
+    deletions.Adopt(7050, 42, "Lost", true, spy.Make());
     deletions.Pump(spy.Make());
     LIVING_CHECK(spy.verifyRequests.size() == 1);
     uint32_t const staleGeneration = spy.LastGeneration();
@@ -403,10 +403,10 @@ LIVING_TEST(durable_deletion_capacity_pressure_revokes_but_fails_closed)
     DeletionSpyOps spy;
 
     for (uint32_t i = 0; i < DurableCharacterDeletions::kMaxRecords; ++i)
-        deletions.Adopt(10000 + i, 1, "Bulk", spy.Make());
+        deletions.Adopt(10000 + i, 1, "Bulk", true, spy.Make());
     LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
 
-    deletions.Adopt(99999, 1, "Overflow", spy.Make());
+    deletions.Adopt(99999, 1, "Overflow", true, spy.Make());
     LIVING_CHECK(spy.revokedLogins.back() == 99999);          // revoked regardless
     LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
     LIVING_CHECK(!deletions.Owns(99999));
@@ -415,22 +415,14 @@ LIVING_TEST(durable_deletion_capacity_pressure_revokes_but_fails_closed)
 
 LIVING_TEST(durable_deletion_restart_recovery_follows_the_intent_plan)
 {
-    // Crash before the queued deletion executed: the intent row survives, and
-    // the startup scan's recovery plan re-runs the full deletion ONLY for a
-    // character present under its FULL recorded identity (name AND account).
-    // Absent rows adopt for confirmation (cleanup uses the recorded account);
-    // renamed, account-moved, reused, or unrecorded identities adopt and fail
-    // closed in the readback.
-    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", 42, "OldBot", 42)
-        == DeletionIntentRecovery::RequeueDeletion);
-    LIVING_CHECK(PlanDeletionIntentRecovery(false, "", 0, "OldBot", 42)
-        == DeletionIntentRecovery::AdoptForConfirmation);
-    LIVING_CHECK(PlanDeletionIntentRecovery(true, "NewOwner", 42, "OldBot", 42)
-        == DeletionIntentRecovery::AdoptForConfirmation); // renamed/reused
-    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", 77, "OldBot", 42)
-        == DeletionIntentRecovery::AdoptForConfirmation); // account moved
-    LIVING_CHECK(PlanDeletionIntentRecovery(true, "OldBot", 42, "", 0)
-        == DeletionIntentRecovery::AdoptForConfirmation); // identity never recorded
+    // Crash before the queued deletion executed: the intent row survives. A
+    // PRESENT character is NEVER automatically re-deleted after a restart -
+    // (guid, name, account) is not immutable (same-guid reuse under the same
+    // name and account is representable in the schema, and no creation nonce
+    // exists), so present rows quarantine for manual resolution while absent
+    // rows adopt for confirmation/cleanup with the RECORDED account.
+    LIVING_CHECK(PlanDeletionIntentRecovery(true) == DeletionIntentRecovery::QuarantinePresent);
+    LIVING_CHECK(PlanDeletionIntentRecovery(false) == DeletionIntentRecovery::AdoptForCleanup);
 
     // The durable intent payload round-trips name and ORIGINAL account (the
     // account makes empty-account cleanup possible when the row is already
@@ -447,7 +439,7 @@ LIVING_TEST(durable_deletion_restart_recovery_follows_the_intent_plan)
     // The re-adopted owner in a FRESH process completes normally.
     DurableCharacterDeletions restarted;
     DeletionSpyOps spy;
-    restarted.Adopt(7060, 42, "OldBot", spy.Make());
+    restarted.Adopt(7060, 42, "OldBot", true, spy.Make());
     LIVING_CHECK(spy.revokedLogins == std::vector<uint32_t>{ 7060 });
     restarted.Pump(spy.Make());
     restarted.OnAbsenceVerify(7060, spy.LastGeneration(), RowVerifyOutcome::Absent);
@@ -476,4 +468,126 @@ LIVING_TEST(post_create_owner_reconciliation_keeps_owners_on_failed_scans)
 
     // Successful EMPTY scan: everything settled - the set clears.
     LIVING_CHECK(ReconcilePostCreateOwners(existing, true, {}).empty());
+}
+
+LIVING_TEST(deletion_preflight_classifies_identity_before_anything_destructive)
+{
+    // One typed query decides the whole deletion boundary. A failed lookup
+    // (null count) or an incomplete present row (empty name / account 0) is
+    // UNKNOWN: no intent may be written and no deletion queued.
+    LIVING_CHECK(ClassifyDeletionPreflight(std::nullopt, "", 0) == DeletionPreflight::Unknown);
+    LIVING_CHECK(ClassifyDeletionPreflight(std::nullopt, "Bot", 42) == DeletionPreflight::Unknown);
+    LIVING_CHECK(ClassifyDeletionPreflight(uint64_t(0), "", 0) == DeletionPreflight::ConfirmedAbsent);
+    LIVING_CHECK(ClassifyDeletionPreflight(uint64_t(1), "Bot", 42) == DeletionPreflight::VerifiedPresent);
+    LIVING_CHECK(ClassifyDeletionPreflight(uint64_t(1), "", 42) == DeletionPreflight::Unknown);  // no name
+    LIVING_CHECK(ClassifyDeletionPreflight(uint64_t(1), "Bot", 0) == DeletionPreflight::Unknown); // account 0
+}
+
+LIVING_TEST(durable_deletion_recovery_present_rows_quarantine_not_redelete)
+{
+    // Restart boundary: a recovery adoption can never prove the present row
+    // was not reused (identityProvenInProcess = false), so ANY present
+    // readback - even a full (name, account) match - fails closed instead of
+    // re-issuing the deletion at what may be a replacement character.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7070, 42, "SameName", false, spy.Make());
+    deletions.Pump(spy.Make());
+    deletions.OnAbsenceVerify(7070, spy.LastGeneration(), RowVerifyOutcome::Verified); // present, identity matches
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(deletions.IsQuarantined(7070));
+    LIVING_CHECK(spy.deletes.empty());        // NEVER re-deleted after restart
+    LIVING_CHECK(spy.metadataClears.empty());
+    LIVING_CHECK(deletions.Owns(7070));       // login stays blocked
+
+    // The pre-quarantined recovery adoption for scan-discovered present rows.
+    DurableCharacterDeletions preQuarantined;
+    DeletionSpyOps preSpy;
+    preQuarantined.AdoptQuarantined(7071, 42, "Reused", preSpy.Make());
+    LIVING_CHECK(preQuarantined.IsQuarantined(7071));
+    LIVING_CHECK(preSpy.revokedLogins == std::vector<uint32_t>{ 7071 });
+    LIVING_CHECK(preSpy.quarantined == std::vector<uint32_t>{ 7071 });
+    preQuarantined.Pump(preSpy.Make());
+    LIVING_CHECK(preSpy.verifyRequests.empty()); // no work: manual resolution only
+
+    // A stale callback from the prior identity's generation is ignored.
+    preQuarantined.OnAbsenceVerify(7071, 1, RowVerifyOutcome::Absent);
+    preQuarantined.Pump(preSpy.Make());
+    LIVING_CHECK(preSpy.metadataClears.empty());
+    LIVING_CHECK(preQuarantined.Owns(7071));
+
+    // In-process adoptions (identity proven by the typed preflight THIS
+    // process) still re-issue the idempotent deletion on a present readback.
+    DurableCharacterDeletions inProcess;
+    DeletionSpyOps inSpy;
+    inProcess.Adopt(7072, 42, "Live", true, inSpy.Make());
+    inProcess.Pump(inSpy.Make());
+    inProcess.OnAbsenceVerify(7072, inSpy.LastGeneration(), RowVerifyOutcome::Verified);
+    inProcess.Pump(inSpy.Make());
+    LIVING_CHECK(inSpy.deletes == std::vector<uint32_t>{ 7072 });
+    LIVING_CHECK(!inProcess.IsQuarantined(7072));
+}
+
+LIVING_TEST(abandoned_cleanup_retains_tokens_until_deletion_ownership_secured)
+{
+    // Fail-closed DeleteBot can refuse (intent write failure): the cleanup
+    // owner must keep its token and retry - acknowledging would orphan the
+    // temporary character with no owner anywhere.
+    CreationFinalizer finalizer;
+    CreationBatchRegistry registry;
+    AbandonedCreationCleanup cleanup;
+    std::vector<uint32_t> deleted;
+    bool ownershipSecured = false;
+
+    CreationCleanupOps ops;
+    ops.pollSingle = [&](uint64_t t, bool ack) { return finalizer.Poll(t, ack); };
+    ops.pollBatch = [&](uint64_t t, bool ack) { return registry.Poll(t, ack); };
+    ops.deleteCharacter = [&](uint32_t guid) { deleted.push_back(guid); return ownershipSecured; };
+
+    // --- single token
+    uint64_t const token = finalizer.Begin(MakeRecord(721, 1, "Temp"), HappyOps());
+    cleanup.AdoptSingle(token);
+    finalizer.OnCallbackResult(721, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
+    finalizer.Pump(HappyOps());
+
+    cleanup.Pump(ops); // deletion refused: token retained
+    LIVING_CHECK(deleted == std::vector<uint32_t>{ 721 });
+    LIVING_CHECK(cleanup.PendingSingles() == 1);
+    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Created); // NOT acknowledged
+
+    ownershipSecured = true;
+    cleanup.Pump(ops); // retry succeeds: token acknowledged and dropped
+    LIVING_CHECK(cleanup.PendingSingles() == 0);
+    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Unknown);
+
+    // --- batch with PARTIAL success: the secured member is never re-processed
+    CreationBatchRegistry::Batch batch;
+    batch.initiatorGuid = 9;
+    batch.desiredSize = 2;
+    batch.members = { PendingMember(31, 1, 1), PendingMember(32, 2, 2) };
+    uint64_t const batchToken = registry.Begin(std::move(batch));
+    cleanup.AdoptBatch(batchToken);
+    registry.OnCreationTerminal(MakeCompletion(31, CreationPollStatus::Created, 731), 1);
+    registry.OnCreationTerminal(MakeCompletion(32, CreationPollStatus::Created, 732), 2);
+
+    deleted.clear();
+    ownershipSecured = true;
+    bool refuse732 = true;
+    ops.deleteCharacter = [&](uint32_t guid)
+    {
+        deleted.push_back(guid);
+        return !(guid == 732 && refuse732);
+    };
+
+    cleanup.Pump(ops); // 731 secured, 732 refused -> batch token retained
+    LIVING_CHECK(cleanup.PendingBatches() == 1);
+    LIVING_CHECK(registry.Poll(batchToken, false).status == BatchPollStatus::Complete); // not acknowledged
+
+    deleted.clear();
+    refuse732 = false;
+    cleanup.Pump(ops); // retry processes ONLY the unsecured member
+    LIVING_CHECK(deleted == std::vector<uint32_t>{ 732 }); // 731 never re-deleted
+    LIVING_CHECK(cleanup.PendingBatches() == 0);
+    LIVING_CHECK(registry.Poll(batchToken, false).status == BatchPollStatus::Unknown); // acknowledged now
 }

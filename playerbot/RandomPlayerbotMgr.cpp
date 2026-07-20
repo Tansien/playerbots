@@ -907,10 +907,13 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
     // via the in-memory confirmer (a deletion-pending bot must never regain
     // a lifecycle owner that could log it in or mutate it).
     static char const* kScanCondition =
-        "ai_playerbot_random_bots.owner = 0 AND ai_playerbot_random_bots.event IN "
+        "ai_playerbot_random_bots.owner = 0 AND (ai_playerbot_random_bots.event IN "
         "('create levelup', 'create gear', 'create group', 'test') "
+        "OR (ai_playerbot_random_bots.event = 'create pending' AND ai_playerbot_random_bots.value >= 2)) "
         "AND ai_playerbot_random_bots.bot NOT IN "
-        "(SELECT d.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'delete') d)";
+        "(SELECT d.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'delete') d) "
+        "AND ai_playerbot_random_bots.bot NOT IN "
+        "(SELECT p.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value < 2) p)";
 
     std::map<uint32, PostCreateOwner> scanned;
     bool scanSucceeded = false;
@@ -932,14 +935,50 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
                     continue; // in-memory adoption not yet durably visible
 
                 // Lifecycle ownership is reconstructed INDEPENDENTLY of login
-                // authorization: only the always-online membership authorizes
-                // an automatic login, so login=0 survives the restart - the
-                // obligations wait for the bot's next authorized login.
+                // authorization; the durable intent overlay below restores the
+                // creation's own login authorization (login=1 survives a
+                // restart even without always-online membership; login=0 stays
+                // unauthorized).
                 scanned[guid] = PostCreateOwner{ fields[1].GetUInt32(),
                     sPlayerbotAIConfig.IsFreeAltBot(guid) };
             } while (rows->NextRow());
             scanSucceeded = true;
         }
+    }
+
+    // Authorization overlay from the durable creation intents (COUNT-first so
+    // "no intents" is distinguishable from "could not ask" - a failed overlay
+    // fails the whole scan, keeping existing owners with their authorization).
+    if (scanSucceeded)
+    {
+        if (auto intentCount = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value >= 2"))
+        {
+            if (intentCount->Fetch()[0].GetUInt32() > 0)
+            {
+                if (auto intents = CharacterDatabase.Query(
+                        "SELECT bot, data FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value >= 2"))
+                {
+                    do
+                    {
+                        Field* fields = intents->Fetch();
+                        auto owner = scanned.find(fields[0].GetUInt32());
+                        if (owner == scanned.end())
+                            continue;
+
+                        uint32 level = 0;
+                        bool autoAdd = false;
+                        bool hasObligations = false;
+                        living::DecodeCreationIntent(fields[1].GetCppString(), level, autoAdd, hasObligations);
+                        owner->second.mayAutoLogin = owner->second.mayAutoLogin || autoAdd;
+                    } while (intents->NextRow());
+                }
+                else
+                    scanSucceeded = false;
+            }
+        }
+        else
+            scanSucceeded = false;
     }
 
     if (!scanSucceeded)
@@ -1145,12 +1184,29 @@ void RandomPlayerbotMgr::LoginFreeBots()
                             std::string const data = sRandomPlayerbotMgr.GetData(botGuid, marker);
                             uint64 const pre = commitStateHash();
                             applyEffect();
-                            // The one-copper commit token: guarantees the post
-                            // state differs from pre, so a rolled-back save is
-                            // always detectable (readback == pre) and pre==post
-                            // ambiguity cannot arise.
-                            bot->ModifyMoney(1);
+                            // The one-copper commit token, DIRECTION-AWARE: a
+                            // positive grant is a silent no-op at
+                            // MAX_MONEY_AMOUNT in every pinned core, so a
+                            // saturated purse toggles DOWN instead - the token
+                            // must change state at both money boundaries, or a
+                            // rolled-back save could match the recorded post
+                            // and silently clear lost non-equipment changes.
+                            bot->ModifyMoney(living::CommitTokenDelta(bot->GetMoney(), MAX_MONEY_AMOUNT));
                             ledger.OnEffectApplied(pre, commitStateHash(), data);
+
+                            // Asserted invariant before ANY phase-2 record: the
+                            // proof is meaningless unless pre and post provably
+                            // differ. This cannot happen (the token always
+                            // moves money); if it ever does, fail safe -
+                            // quarantine instead of recording an unprovable
+                            // postcondition.
+                            if (ledger.preHash == ledger.postHash)
+                            {
+                                ledger.MarkQuarantined();
+                                sLog.outError("Bot %u: post-create marker '%s' produced identical pre/post commit "
+                                    "state despite the token; retained quarantined - inspect manually", botGuid, marker);
+                                return true;
+                            }
                             return recordThenSaveAndVerify();
                         }
                         case living::DurableMarkerStep::RecordApplied:
@@ -1498,6 +1554,20 @@ void RandomPlayerbotMgr::LoginFreeBots()
 
                 if (master)
                     bot->TeleportTo(WorldPosition(master));
+
+                // The finalized creation intent (value 2) is itself a
+                // settlement obligation: it carries the restart login
+                // authorization, so it is cleared (confirmed) only once every
+                // OTHER obligation settled; a pre-persistence intent means
+                // finalization still owns the bot.
+                uint32 creationIntent = 0;
+                if (!sRandomPlayerbotMgr.TryGetEventValue(botGuid, "create pending", creationIntent))
+                    postCreateSettled = false;
+                else if (creationIntent == living::kCreationIntentPrePersistence)
+                    postCreateSettled = false;
+                else if (creationIntent >= living::kCreationIntentFinalized && postCreateSettled
+                    && !sRandomPlayerbotMgr.SetValue(botGuid, "create pending", 0))
+                    postCreateSettled = false;
 
                 // Release from the schedule only from a KNOWN, valid always
                 // state AND with every transient post-create obligation
@@ -6101,7 +6171,7 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleReset(std::string param)
     // cleared and reads would then claim confirmed absence over live rows.
     if (!CharacterDatabase.DirectPExecute(
             "DELETE FROM ai_playerbot_random_bots WHERE event NOT IN "
-            "('temporary', 'delete', 'create levelup', 'create gear', 'create group', 'test')"))
+            "('temporary', 'delete', 'create pending', 'create levelup', 'create gear', 'create group', 'test')"))
     {
         messages.push_back("Random bot reset FAILED: the delete did not execute; no cache state was changed.");
         return messages;

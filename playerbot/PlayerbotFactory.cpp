@@ -302,8 +302,13 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
         InitInventory();
     }
 
-    if (isRandomBot)
+    if (isRandomBot && !deferSave)
     {
+        // Guild and arena membership write their OWN tables outside any
+        // character-save transaction and are not idempotent to replay (a
+        // re-run may join a different random guild). Under deferSave (the
+        // durable post-create marker consume) they are skipped entirely:
+        // phase 1 must perform no independent, non-idempotent durable writes.
         auto pmo_guild_teams = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Guilds & ArenaTeams");
         sLog.outDetail("Initializing guilds & ArenaTeams");
         InitGuild();

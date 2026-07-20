@@ -1009,3 +1009,73 @@ LIVING_TEST(owner_reconciliation_preserves_login_authorization)
     LIVING_CHECK(ReconcilePostCreateOwners(existing, false, empty) == existing);
     LIVING_CHECK(ReconcilePostCreateOwners(existing, true, empty).empty());
 }
+
+LIVING_TEST(creation_intent_codec_and_recovery_boundaries)
+{
+    // The intent codec carries {level, login authorization, has-obligations}
+    // in a small fixed envelope.
+    uint32_t level = 0;
+    bool autoAdd = false;
+    bool hasObligations = false;
+
+    DecodeCreationIntent(EncodeCreationIntent(70, true, true), level, autoAdd, hasObligations);
+    LIVING_CHECK(level == 70 && autoAdd && hasObligations);
+    DecodeCreationIntent(EncodeCreationIntent(1, false, false), level, autoAdd, hasObligations);
+    LIVING_CHECK(level == 1 && !autoAdd && !hasObligations);
+    LIVING_CHECK(EventValueFitsSchema("create pending", EncodeCreationIntent(4294967295u, true, true)));
+    DecodeCreationIntent("garbage", level, autoAdd, hasObligations);
+    LIVING_CHECK(level == 0 && !autoAdd && !hasObligations); // never throws, never invents
+
+    // Crash-boundary recovery over the durable intent:
+    // - before the character save committed (or after a rollback): residue;
+    LIVING_CHECK(PlanCreationIntentRecovery(false, kCreationIntentPrePersistence)
+        == CreationIntentRecovery::DiscardResidue);
+    LIVING_CHECK(PlanCreationIntentRecovery(false, kCreationIntentFinalized)
+        == CreationIntentRecovery::DiscardResidue);
+    // - committed but the finalizer was never registered (the exact
+    //   commit-before-Begin window) OR crashed during metadata: resume;
+    LIVING_CHECK(PlanCreationIntentRecovery(true, kCreationIntentPrePersistence)
+        == CreationIntentRecovery::ResumeFinalization);
+    // - finalized with outstanding post-create work: rebuild the owner with
+    //   the intent's persisted login authorization.
+    LIVING_CHECK(PlanCreationIntentRecovery(true, kCreationIntentFinalized)
+        == CreationIntentRecovery::ReconstructOwner);
+}
+
+LIVING_TEST(creation_login_authorization_survives_restart_via_intent)
+{
+    // login=1 without always-online membership: the durable intent restores
+    // the authorization on reconstruction; login=0 stays unauthorized in
+    // every mode - lifecycle ownership never authorizes a login by itself.
+    uint32_t level = 0;
+    bool autoAdd = false;
+    bool hasObligations = false;
+
+    DecodeCreationIntent(EncodeCreationIntent(60, true, true), level, autoAdd, hasObligations);
+    bool const alwaysMember = false; // ordinary creation never persists `always`
+    bool const mayAutoLogin = alwaysMember || autoAdd;
+    LIVING_CHECK(mayAutoLogin);                                          // login=1 restored
+    LIVING_CHECK(MayAutoLoginPostCreateOwner(true, mayAutoLogin, false));
+    LIVING_CHECK(!MayAutoLoginPostCreateOwner(false, mayAutoLogin, false)); // LOGIN_ONLY_ALWAYS_ACTIVE
+
+    DecodeCreationIntent(EncodeCreationIntent(60, false, true), level, autoAdd, hasObligations);
+    LIVING_CHECK(!(alwaysMember || autoAdd)); // login=0 preserved across restart
+}
+
+LIVING_TEST(markerless_creations_register_no_scheduler_owner)
+{
+    // A level-1 login=0 creation with no group/test/temporary markers has no
+    // durable obligations: its intent encodes obligations=false, finalization
+    // clears the intent instead of holding it, no owner is registered, and
+    // recovery of a stray finalized markerless intent clears rather than
+    // reconstructs.
+    uint32_t level = 0;
+    bool autoAdd = false;
+    bool hasObligations = false;
+    DecodeCreationIntent(EncodeCreationIntent(1, false, false), level, autoAdd, hasObligations);
+    LIVING_CHECK(!hasObligations); // -> writeMetadata clears; onCreated skips the owner
+
+    // Marker-bearing creations DO retain ownership.
+    DecodeCreationIntent(EncodeCreationIntent(60, false, true), level, autoAdd, hasObligations);
+    LIVING_CHECK(hasObligations);
+}

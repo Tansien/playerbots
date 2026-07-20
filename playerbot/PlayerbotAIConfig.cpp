@@ -803,6 +803,7 @@ bool PlayerbotAIConfig::Initialize()
     // their scheduler owner back (loadFreeAltBotAccounts above rebuilds only
     // the always-online membership, which is a different concern).
     PlayerbotHolder::ReadoptPendingDeletions();
+    PlayerbotHolder::ReadoptPendingCreations();
     sRandomPlayerbotMgr.ReconstructPostCreateOwners();
 
     targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f);
