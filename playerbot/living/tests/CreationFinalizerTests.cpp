@@ -1332,3 +1332,60 @@ LIVING_TEST(group_batch_credits_have_exactly_one_owner)
     LIVING_CHECK(joins.Find(tokenJ)->members.empty());          // no replacement
     LIVING_CHECK(joins.Poll(tokenJ, false).status == BatchPollStatus::Complete);
 }
+
+LIVING_TEST(group_batch_prune_request_reevaluate_creates_one_replacement)
+{
+    // The production ordering that used to double-replace one lost slot:
+    // the credited predecessor is PRUNED, a repeated request arrives BEFORE
+    // the next credit re-evaluation, and only then does the re-evaluation
+    // run. Source-gone credits now count as outstanding, so the repeated
+    // request sees the deficit covered and enqueues nothing; the
+    // re-evaluation then produces exactly ONE replacement.
+    CreationBatchRegistry registry;
+    auto nobodyJoined = [](uint32_t) { return false; };
+    auto nobodyJoinedFor = [](uint32_t, uint32_t) { return false; };
+
+    CreationBatchRegistry::Batch a;
+    a.initiatorGuid = 97;
+    a.desiredSize = 2;
+    a.preexistingMembers = 1;
+    a.memberGear = "epic";
+    a.members.push_back(PendingMember(61, 1, 1));
+    uint64_t const tokenA = registry.Begin(std::move(a));
+    registry.OnCreationTerminal(MakeCompletion(61, CreationPollStatus::Created, 9601), 1);
+
+    GroupBatchRequestPlan const plan1 = PlanGroupBatchRequest(registry, 97, nobodyJoined, 1, 2, Options("epic"));
+    CreationBatchRegistry::Batch tracker;
+    tracker.initiatorGuid = 97;
+    tracker.desiredSize = 2;
+    tracker.preexistingMembers = 1;
+    tracker.creditedDependencies = plan1.creditedDependencies;
+    tracker.replacementBudget = 2;
+    tracker.memberGear = "epic";
+    uint64_t const trackerToken = registry.Begin(std::move(tracker));
+
+    // Predecessor expires; the repeated request lands BEFORE re-evaluation.
+    registry.PruneExpired(10);
+    registry.PruneExpired(10 + CreationBatchRegistry::kRetentionPumps);
+    LIVING_CHECK(registry.Find(tokenA) == nullptr);
+
+    // The source-gone credit still counts as one outstanding slot, so the
+    // repeated request is COVERED (1 live + 1 owed = 2) - it must not
+    // recreate the deficit that the coming re-evaluation will also replace.
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(97, nobodyJoined) == 1);
+    GroupBatchRequestPlan const plan2 = PlanGroupBatchRequest(registry, 97, nobodyJoined, 1, 2, Options("epic"));
+    LIVING_CHECK(plan2.action == GroupBatchRequestAction::ExtendExisting);
+    LIVING_CHECK(plan2.existingToken == trackerToken);
+    LIVING_CHECK(plan2.effectiveMembers >= 2); // covered: the handler enqueues nothing
+
+    // Re-evaluation: exactly one replacement for the one lost slot.
+    registry.ReevaluateCredits(20000, nobodyJoinedFor);
+    uint32_t replacements = 0;
+    for (living::CreationBatchMember const& member : registry.Find(trackerToken)->members)
+        if (member.state == BatchMemberState::AwaitingAttempt)
+            ++replacements;
+    LIVING_CHECK(replacements == 1);
+    LIVING_CHECK(registry.Find(trackerToken)->creditedDependencies.empty());
+    // And afterwards the deficit is carried by the concrete member, still 1.
+    LIVING_CHECK(registry.OutstandingSlotsForInitiator(97, nobodyJoined) == 1);
+}

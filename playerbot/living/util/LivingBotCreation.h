@@ -346,21 +346,50 @@ namespace living
     inline constexpr uint32_t kCreationIntentPrePersistence = 1;
     inline constexpr uint32_t kCreationIntentFinalized = 2;
 
-    // Small fixed-size payload: {level, login authorization, has-obligations}.
-    // The heavyweight creation metadata (markers, spec events) is persisted as
-    // its own rows pre-save, so this always fits the durable envelope.
-    inline std::string EncodeCreationIntent(uint32_t level, bool autoAdd, bool hasObligations)
+    // Payload: {identity name, original account, level, login authorization,
+    // has-obligations}. The recorded identity is what anchors recovery to the
+    // CHARACTER TRANSACTION this intent was written for: resumption feeds it
+    // into the finalizer's identity verification instead of copying the
+    // current row (which made verification tautological and could claim a
+    // reused GUID). The heavyweight creation metadata (markers, spec events)
+    // is persisted as its own rows pre-save; character names are <=12 chars,
+    // so this always fits the durable envelope.
+    inline std::string EncodeCreationIntent(std::string const& name, uint32_t accountId,
+        uint32_t level, bool autoAdd, bool hasObligations)
     {
-        return "level:" + std::to_string(level) + "|login:" + (autoAdd ? "1" : "0")
+        return "name:" + name + "|account:" + std::to_string(accountId)
+            + "|level:" + std::to_string(level) + "|login:" + (autoAdd ? "1" : "0")
             + "|obligations:" + (hasObligations ? "1" : "0");
     }
 
-    inline void DecodeCreationIntent(std::string const& data, uint32_t& level, bool& autoAdd,
-        bool& hasObligations)
+    inline void DecodeCreationIntent(std::string const& data, std::string& name, uint32_t& accountId,
+        uint32_t& level, bool& autoAdd, bool& hasObligations)
     {
+        name.clear();
+        accountId = 0;
         level = 0;
         autoAdd = false;
         hasObligations = false;
+
+        size_t const namePos = data.find("name:");
+        if (namePos == 0)
+        {
+            size_t const nameEnd = data.find("|account:", 5);
+            if (nameEnd != std::string::npos)
+                name = data.substr(5, nameEnd - 5);
+        }
+        size_t const accountPos = data.find("|account:");
+        if (accountPos != std::string::npos)
+        {
+            uint64_t parsed = 0;
+            for (size_t i = accountPos + 9; i < data.size() && data[i] >= '0' && data[i] <= '9'; ++i)
+            {
+                if (parsed > 0xFFFFFFFFull)
+                    break;
+                parsed = parsed * 10 + static_cast<uint64_t>(data[i] - '0');
+            }
+            accountId = static_cast<uint32_t>(parsed);
+        }
 
         size_t const levelPos = data.find("level:");
         if (levelPos != std::string::npos)

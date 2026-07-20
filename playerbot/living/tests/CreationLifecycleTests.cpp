@@ -157,11 +157,25 @@ namespace
 
         uint32_t lastRequestedGeneration = 0;
         uint64_t lastExpectedHash = 0;
+        // Staged auxiliary writes (spec events, pet save): persisted only
+        // once the player save is PROVEN, gating the clear exactly like
+        // production's clearProven.
+        int stagedAuxPending = 0;
+        bool auxWriteSucceeds = true;
+        int auxWrites = 0;
 
         bool Pass()
         {
             auto clearProven = [&]() -> bool
             {
+                while (stagedAuxPending > 0)
+                {
+                    ++auxWrites;
+                    if (!auxWriteSucceeds)
+                        return false; // aux not persisted: the marker stays
+                    --stagedAuxPending;
+                }
+
                 if (ledger.OnClearResult(clearWriteConfirmed ? EventWriteResult::DesiredStateConfirmed
                                                              : EventWriteResult::StateUnknown))
                 {
@@ -482,10 +496,25 @@ namespace
         uint64_t LiveHash() const { return Hash(liveEquip, liveMoney); }
         uint64_t DurableHash() const { return Hash(durableEquip, durableMoney); }
 
+        // Staged auxiliary writes (spec events, pet save): persisted only
+        // once the player save is PROVEN, gating the clear exactly like
+        // production's clearProven.
+        int stagedAuxPending = 0;
+        bool auxWriteSucceeds = true;
+        int auxWrites = 0;
+
         bool Pass()
         {
             auto clearProven = [&]() -> bool
             {
+                while (stagedAuxPending > 0)
+                {
+                    ++auxWrites;
+                    if (!auxWriteSucceeds)
+                        return false; // aux not persisted: the marker stays
+                    --stagedAuxPending;
+                }
+
                 if (ledger.OnClearResult(EventWriteResult::DesiredStateConfirmed))
                 {
                     durablePhase = 0;
@@ -739,6 +768,45 @@ LIVING_TEST(durable_marker_commit_token_changes_state_at_both_money_boundaries)
     crashed.savesCommit = true;
     LIVING_CHECK(!crashed.Pass()); // pre-match -> rewind to phase 1
     LIVING_CHECK(crashed.durablePhase == kMarkerPhasePending);
+    LIVING_CHECK(!crashed.Pass()); // fresh application
+    LIVING_CHECK(crashed.DeliverVerify() == MarkerVerifyAction::Proven);
+    LIVING_CHECK(crashed.Pass());
+}
+
+LIVING_TEST(durable_marker_staged_aux_writes_gate_the_clear)
+{
+    // Phase 1 performs no independent durable writes: spec events and the
+    // hunter pet save are STAGED and land only after the player save is
+    // proven. A failed aux write blocks the clear (retried next pass); the
+    // marker never clears while a required auxiliary outcome is unpersisted.
+    TupleMarkerHarness h;
+    h.stagedAuxPending = 2; // spec events + pet save
+
+    LIVING_CHECK(!h.Pass()); // apply; aux NOT written at phase 1
+    LIVING_CHECK(h.auxWrites == 0);
+    LIVING_CHECK(h.DeliverVerify() == MarkerVerifyAction::Proven);
+
+    h.auxWriteSucceeds = false;
+    LIVING_CHECK(!h.Pass()); // proven, but the aux write fails -> clear blocked
+    LIVING_CHECK(h.durablePhase == kMarkerPhaseApplied);
+    LIVING_CHECK(h.stagedAuxPending == 2);
+
+    h.auxWriteSucceeds = true;
+    LIVING_CHECK(h.Pass()); // aux lands, then the confirmed clear
+    LIVING_CHECK(h.stagedAuxPending == 0);
+    LIVING_CHECK(h.durablePhase == 0);
+
+    // Crash before phase 2: nothing auxiliary was ever persisted (staging is
+    // post-proof only), so recovery re-applies cleanly with zero partial
+    // durable aux state - the exact independent-write leak being fixed.
+    TupleMarkerHarness crashed;
+    crashed.stagedAuxPending = 1;
+    crashed.savesCommit = false;
+    LIVING_CHECK(!crashed.Pass());
+    LIVING_CHECK(crashed.auxWrites == 0); // NO independent durable writes at phase 1
+    crashed.Restart();
+    crashed.savesCommit = true;
+    LIVING_CHECK(!crashed.Pass()); // pre-match -> rewind
     LIVING_CHECK(!crashed.Pass()); // fresh application
     LIVING_CHECK(crashed.DeliverVerify() == MarkerVerifyAction::Proven);
     LIVING_CHECK(crashed.Pass());

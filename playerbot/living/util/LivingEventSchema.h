@@ -27,6 +27,19 @@ namespace living
             || event == "create levelup" || event == "create gear" || event == "create group";
     }
 
+    // Events whose cached value must NEVER be zeroed by validIn expiry: the
+    // long-lived configuration/spec rows the production reader already
+    // exempted, plus every lifecycle-CONTROL row - an unsettled creation or
+    // deletion obligation must stay authoritative until it is explicitly and
+    // successfully cleared, no matter how long the server was down or how
+    // late a login=0 bot first logs in.
+    inline bool IsNonExpiringEvent(std::string const& event)
+    {
+        return event == "specNo" || event == "specLink" || event == "init"
+            || event == "current_time" || event == "always" || event == "selfbot"
+            || IsLifecycleControlEvent(event);
+    }
+
     inline bool EventValueFitsSchema(std::string const& event, std::string const& data)
     {
         return !event.empty()

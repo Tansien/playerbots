@@ -607,3 +607,19 @@ LIVING_TEST(lifecycle_control_events_survive_console_reset)
         "bot_count", "teleport", "specNo" })
         LIVING_CHECK(!living::IsLifecycleControlEvent(event));
 }
+
+LIVING_TEST(lifecycle_control_events_never_expire)
+{
+    // The typed-read expiry consults exactly this predicate: an unsettled
+    // creation/deletion obligation must stay authoritative however long the
+    // server was down or however late a login=0 bot first logs in (the
+    // 15-day default validIn used to zero it silently).
+    for (char const* event : { "create pending", "create levelup", "create gear",
+        "create group", "test", "delete", "temporary",
+        "specNo", "specLink", "init", "current_time", "always", "selfbot" })
+        LIVING_CHECK(living::IsNonExpiringEvent(event));
+
+    // Scheduling events still expire as before.
+    for (char const* event : { "add", "logout", "login", "update", "teleport", "bot_count" })
+        LIVING_CHECK(!living::IsNonExpiringEvent(event));
+}
