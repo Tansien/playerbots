@@ -2282,16 +2282,15 @@ namespace ai
 
                 // All heavyweight metadata (markers, spec events) was
                 // execution-confirmed BEFORE the character save; only the
-                // durable intent transitions here. Obligation-bearing
-                // creations keep the row at Finalized - it carries the
-                // restart login authorization until settlement clears it -
-                // while markerless creations clear it now (no scheduler
-                // owner is ever registered for them).
+                // durable intent transitions here - and EVERY creation
+                // transitions to Finalized, markerless ones included: the
+                // durable login authorization must outlive the crash window
+                // between this transition and the memory-only exposure in
+                // onCreated. Markerless intents are cleared AFTER exposure
+                // (idempotent), never before.
                 CreationPayload const& payload = it->second;
-                if (payload.hasObligations)
-                    return sRandomPlayerbotMgr.SetValue(guid, "create pending",
-                        living::kCreationIntentFinalized, payload.intentData);
-                return sRandomPlayerbotMgr.SetValue(guid, "create pending", 0);
+                return sRandomPlayerbotMgr.SetValue(guid, "create pending",
+                    living::kCreationIntentFinalized, payload.intentData);
             };
             ops.deleteEventRows = [](uint32 guid)
             {
@@ -2317,9 +2316,19 @@ namespace ai
                 // level-1 creation must not leak a permanent scheduler owner.
                 // Login authorization (autoAdd, i.e. login=1) travels with the
                 // owner AND the durable intent row, so it survives restarts.
+                //
+                // A markerless creation clears its (finalized) intent only
+                // NOW, after the idempotent exposure above: a crash between
+                // the finalized transition and this point recovers by
+                // REPLAYING the exposure from the intent, then clearing. An
+                // unconfirmed clear leaves the row for that same recovery.
                 auto payloadIt = payloads.find(guid);
-                if (payloadIt != payloads.end() && payloadIt->second.hasObligations)
+                bool const hasObligations = payloadIt != payloads.end() && payloadIt->second.hasObligations;
+                if (hasObligations)
                     sRandomPlayerbotMgr.RegisterPostCreateOwner(guid, accountId, autoAdd);
+                else if (!sRandomPlayerbotMgr.SetValue(guid, "create pending", 0))
+                    sLog.outError("Bot creation for guid %u: markerless intent clear unconfirmed; "
+                        "the next startup replays the exposure and clears it", guid);
 
                 sLog.outDetail("Bot creation finalized: '%s' (guid %u)", name.c_str(), guid);
             };
@@ -2417,8 +2426,15 @@ namespace ai
             };
             ops.clearMetadata = [](uint32 guid) -> bool
             {
+                // Absence is re-proven BY THE STATEMENT ITSELF: the predicate
+                // makes this a no-op if a replacement character claimed the
+                // guid between the absence readback and this clear - a stale
+                // absence observation can then never erase the replacement's
+                // fresh creation metadata. (No rows deleted still executes
+                // successfully: the pending deletion completes either way.)
                 bool const cleared = CharacterDatabase.DirectPExecute(
-                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid);
+                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u' "
+                    "AND '%u' NOT IN (SELECT guid FROM characters WHERE guid = '%u')", guid, guid, guid);
                 sRandomPlayerbotMgr.ForgetEventCache(guid);
                 return cleared;
             };
@@ -2611,26 +2627,54 @@ bool PlayerbotHolder::ReadoptPendingCreations()
         Field* fields = result->Fetch();
         uint32 const guid = fields[0].GetUInt32();
         uint32 const value = fields[1].GetUInt32();
+        std::string recordedName;
+        uint32 recordedAccount = 0;
         uint32 level = 0;
         bool autoAdd = false;
         bool hasObligations = false;
-        living::DecodeCreationIntent(fields[2].GetCppString(), level, autoAdd, hasObligations);
+        living::DecodeCreationIntent(fields[2].GetCppString(), recordedName, recordedAccount,
+            level, autoAdd, hasObligations);
         bool const present = !fields[4].IsNULL();
-        uint32 const accountId = present ? fields[3].GetUInt32() : 0;
-        std::string const characterName = present ? fields[4].GetCppString() : std::string();
+        std::string const currentName = present ? fields[4].GetCppString() : std::string();
+
+        // The RECORDED identity is the anchor: a present row whose identity
+        // does not match the intent belongs to a reused GUID (the original
+        // save rolled back and a legacy/normal character took the id). Such a
+        // row is NEVER finalized, exposed, mutated, or auto-logged-in - the
+        // intent row is retained quarantined for manual resolution.
+        bool const identityMatches = present && !recordedName.empty() && currentName == recordedName;
 
         switch (living::PlanCreationIntentRecovery(present, value))
         {
             case living::CreationIntentRecovery::DiscardResidue:
                 // Absence proven by this scan; nothing else can own the rows.
-                CharacterDatabase.DirectPExecute(
-                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid);
-                sRandomPlayerbotMgr.ForgetEventCache(guid);
+                // The discard must be CONFIRMED - an unconfirmed delete keeps
+                // the intent as the durable owner and re-arms the retry, so
+                // residue can never linger silently into GUID reuse.
+                if (CharacterDatabase.DirectPExecute(
+                        "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid))
+                    sRandomPlayerbotMgr.ForgetEventCache(guid);
+                else
+                    ai::creationIntentScanFailed = true;
                 break;
             case living::CreationIntentRecovery::ResumeFinalization:
             {
+                if (!identityMatches)
+                {
+                    sLog.outError("ReadoptPendingCreations: guid %u holds a pre-persistence intent for '%s' but the "
+                        "present character is '%s' (reused id); intent retained QUARANTINED - resolve manually",
+                        guid, recordedName.c_str(), currentName.c_str());
+                    break; // never mutate the unrelated row; intent stays inert
+                }
                 if (IsDeletionPending(guid))
-                    break; // fail closed while deletion state is unknown/owned
+                {
+                    // Fail closed while deletion state is unknown/owned - and
+                    // RE-ARM this scan so the skipped intent is retried once
+                    // the deletion scan recovers, instead of being stranded
+                    // until a manual reload.
+                    ai::creationIntentScanFailed = true;
+                    break;
+                }
                 bool alreadyOwned = ai::botCreationFinalizer.core.WithRecord(guid,
                     [](living::CreationFinalizer::Record const&) {});
                 if (alreadyOwned)
@@ -2642,11 +2686,15 @@ bool PlayerbotHolder::ReadoptPendingCreations()
                     break;
                 }
 
-                sLog.outDetail("Resuming interrupted creation finalization for guid %u ('%s')", guid, characterName.c_str());
+                sLog.outDetail("Resuming interrupted creation finalization for guid %u ('%s')", guid, recordedName.c_str());
                 living::CreationFinalizer::Record record;
                 record.guid = guid;
-                record.accountId = accountId;
-                record.name = characterName;
+                // The RECORDED identity, never the current row: the
+                // finalizer's identity verification then re-proves the row
+                // against the intent (a mismatch quarantines) instead of
+                // tautologically confirming whatever occupies the id now.
+                record.accountId = recordedAccount;
+                record.name = recordedName;
                 record.autoAdd = autoAdd;
                 record.holdsAccountReservation = false; // reservations are process-local
                 ai::BotCreationFinalizer::CreationPayload payload;
@@ -2656,17 +2704,36 @@ bool PlayerbotHolder::ReadoptPendingCreations()
                 break;
             }
             case living::CreationIntentRecovery::ReconstructOwner:
+                if (!identityMatches)
+                {
+                    sLog.outError("ReadoptPendingCreations: guid %u holds a finalized intent for '%s' but the present "
+                        "character is '%s'; intent retained QUARANTINED - resolve manually",
+                        guid, recordedName.c_str(), currentName.c_str());
+                    break;
+                }
                 if (hasObligations)
-                    sRandomPlayerbotMgr.RegisterPostCreateOwner(guid, accountId, autoAdd);
+                    sRandomPlayerbotMgr.RegisterPostCreateOwner(guid, recordedAccount, autoAdd);
                 else
-                    // A finalized markerless intent should not exist; clear it
-                    // (confirmed) instead of leaking a permanent row.
-                    sRandomPlayerbotMgr.SetValue(guid, "create pending", 0);
+                {
+                    // Markerless finalized intent: the crash hit between the
+                    // finalized transition and exposure. REPLAY the idempotent
+                    // exposure first (restoring login=1 where authorized),
+                    // then clear with confirmation.
+                    if (autoAdd && !sPlayerbotAIConfig.IsFreeAltBot(guid))
+                        sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(recordedAccount, guid));
+                    if (!sRandomPlayerbotMgr.SetValue(guid, "create pending", 0))
+                        ai::creationIntentScanFailed = true; // retried; exposure replay is idempotent
+                }
                 break;
         }
     } while (result->NextRow());
 
     return true;
+}
+
+bool PlayerbotHolder::DeletionStateKnown()
+{
+    return !ai::deletionIntentScanFailed;
 }
 
 bool PlayerbotHolder::IsDeletionPending(uint32 guid)
@@ -2970,7 +3037,16 @@ namespace ai
         // database blip. Deletion first - creation resumption defers to
         // deletion-pending state.
         if (deletionIntentScanFailed && ++deletionIntentScanRetryPasses >= kDeletionScanRetryPasses)
-            PlayerbotHolder::ReadoptPendingDeletions();
+        {
+            if (PlayerbotHolder::ReadoptPendingDeletions())
+            {
+                // Deletion state just became KNOWN: the dependent scans ran
+                // (or skipped rows) under the fail-closed assumption and must
+                // rerun against real deletion ownership.
+                PlayerbotHolder::ReadoptPendingCreations();
+                sRandomPlayerbotMgr.ReconstructPostCreateOwners();
+            }
+        }
         if (creationIntentScanFailed && ++creationIntentScanRetryPasses >= kDeletionScanRetryPasses)
             PlayerbotHolder::ReadoptPendingCreations();
     }
@@ -3304,59 +3380,91 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             newBot->SetPosition(master->GetPositionX(), master->GetPositionY(), master->GetPositionZ(), master->GetOrientation());
         }
 
-        // Stage 3.5: the COMPLETE creation metadata - markers, spec events,
-        // and the durable creation intent - is execution-confirmed BEFORE the
-        // character transaction is queued. A crash between the character
-        // commit and finalizer registration therefore always leaves a
-        // reconstructable owner: startup re-adopts the intent, resumes
-        // finalization for a committed row, and discards residue for an
-        // uncommitted one. FAIL CLOSED: any unconfirmed write tears the
-        // transient character down before anything was queued.
-        bool metadataOk = true;
-        if (talents.evaluated)
-            metadataOk = ai::ChangeTalentsAction::PersistTalentSpec(botGuid, talents);
-
-        bool hasObligations = false;
-        if (options.level > 1)
+        // Stage 3.4: the allocated GUID must be provably CLEAN before any
+        // metadata is written. A GUID still owned by the deletion confirmer
+        // (or unknown while the deletion scan has not succeeded) is refused
+        // outright - its metadata would race the pending blanket clear. Any
+        // lifecycle residue rows from an earlier failed cleanup are removed
+        // with a CONFIRMED delete first, or the creation is refused: writing
+        // fresh metadata over residue would let this character inherit an
+        // older creation's gear/group/test/spec work.
+        auto tearDownTransient = [&](living::BotCreateStatus status, char const* message)
         {
-            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 1) && metadataOk;
-            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, options.gear) && metadataOk;
-            hasObligations = true;
-        }
-        if (wantsGroupEvent && !groupTargetData.empty())
-        {
-            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, groupTargetData) && metadataOk;
-            hasObligations = true;
-        }
-        if (!options.testName.empty())
-        {
-            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, options.testName) && metadataOk;
-            hasObligations = true;
-        }
-        if (options.temporary)
-        {
-            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "temporary", 1, name) && metadataOk;
-            hasObligations = true;
-        }
-
-        std::string const intentData = living::EncodeCreationIntent(options.level, options.autoAdd, hasObligations);
-        metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create pending",
-            living::kCreationIntentPrePersistence, intentData) && metadataOk;
-
-        if (!metadataOk)
-        {
-            // Best-effort row cleanup; any residue is purged by the startup
-            // intent scan (absent character -> discard).
-            CharacterDatabase.DirectPExecute("DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid);
             sObjectAccessor.RemoveObject(newBot);
             delete newBot;
             delete botSession;
             sRandomPlayerbotMgr.ForgetEventCache(botGuid);
             ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
             result.guid = ObjectGuid();
-            result.status = living::BotCreateStatus::RetryableFailure;
-            result.messages.push_back("Creation metadata could not be persisted; nothing was created");
+            result.status = status;
+            result.messages.push_back(message);
             return result;
+        };
+
+        if (IsDeletionPending(botGuid))
+            return tearDownTransient(living::BotCreateStatus::TransientFailure,
+                "Allocated character id is owned by a pending deletion (or deletion state is not yet known); "
+                "creation refused and retried with pacing");
+
+        {
+            auto residue = CharacterDatabase.PQuery(
+                "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid);
+            if (!residue)
+                return tearDownTransient(living::BotCreateStatus::TransientFailure,
+                    "Lifecycle residue for the allocated character id could not be checked; creation refused");
+            if (residue->Fetch()[0].GetUInt32() > 0
+                && !CharacterDatabase.DirectPExecute(
+                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid))
+                return tearDownTransient(living::BotCreateStatus::TransientFailure,
+                    "Lifecycle residue for the allocated character id could not be removed; creation refused");
+        }
+
+        // Stage 3.5: the durable creation INTENT is written FIRST - it is the
+        // restart-discoverable owner of everything that follows, so a failure
+        // in any later metadata write can never leave ownerless residue (the
+        // startup intent scan finds the intent, sees no character, and
+        // discards with a confirmed delete). The intent records the IDENTITY
+        // (name, account) this creation is bound to: recovery verifies the
+        // present row against exactly these values, never against itself.
+        // FAIL CLOSED: any unconfirmed write tears the transient character
+        // down before anything was queued.
+        bool const hasObligations = options.level > 1
+            || (wantsGroupEvent && !groupTargetData.empty())
+            || !options.testName.empty()
+            || options.temporary;
+
+        std::string const intentData = living::EncodeCreationIntent(name, accountId,
+            options.level, options.autoAdd, hasObligations);
+        bool metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create pending",
+            living::kCreationIntentPrePersistence, intentData);
+
+        if (metadataOk && talents.evaluated)
+            metadataOk = ai::ChangeTalentsAction::PersistTalentSpec(botGuid, talents);
+
+        if (metadataOk && options.level > 1)
+        {
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create levelup", 1);
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create gear", 1, options.gear) && metadataOk;
+        }
+        if (metadataOk && wantsGroupEvent && !groupTargetData.empty())
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "create group", 1, groupTargetData);
+        if (metadataOk && !options.testName.empty())
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "test", 1, options.testName);
+        if (metadataOk && options.temporary)
+            metadataOk = sRandomPlayerbotMgr.SetValue(botGuid, "temporary", 1, name);
+
+        if (!metadataOk)
+        {
+            // Confirmed cleanup, or the INTENT stays as the durable owner of
+            // the residue: the startup/retry scan discards it once the
+            // absent character proves nothing committed. Never an unchecked
+            // blanket delete with released ownership.
+            if (!CharacterDatabase.DirectPExecute(
+                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid))
+                sLog.outError("CreateBot: metadata cleanup for guid %u could not be confirmed; "
+                    "the creation intent remains as the durable owner until the intent scan discards it", botGuid);
+            return tearDownTransient(living::BotCreateStatus::RetryableFailure,
+                "Creation metadata could not be persisted; nothing was created");
         }
 
         // Stage 4: the character itself. SaveToDB commits through the async

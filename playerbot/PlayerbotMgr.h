@@ -180,6 +180,10 @@ public:
     // deletion-pending character may never log in or receive post-create
     // mutations.
     static bool IsDeletionPending(uint32 guid);
+    // Whether the durable deletion-intent scan has SUCCEEDED at least once
+    // this process. Dependent scans (creation readoption, owner
+    // reconstruction) are non-authoritative while this is false.
+    static bool DeletionStateKnown();
     // Internal surface for the deletion confirmer: fires the OnBotDeleted
     // account-cleanup hook once absence is CONFIRMED (only then is the
     // durable character count truthful about the deletion).

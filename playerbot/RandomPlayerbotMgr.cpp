@@ -9,6 +9,7 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "Maps/MapManager.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/strategy/actions/ChangeTalentsAction.h"
 #include "strategy/values/LastMovementValue.h"
 #include "Accounts/AccountMgr.h"
 #include "Globals/ObjectMgr.h"
@@ -909,11 +910,23 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
     static char const* kScanCondition =
         "ai_playerbot_random_bots.owner = 0 AND (ai_playerbot_random_bots.event IN "
         "('create levelup', 'create gear', 'create group', 'test') "
-        "OR (ai_playerbot_random_bots.event = 'create pending' AND ai_playerbot_random_bots.value >= 2)) "
+        "OR (ai_playerbot_random_bots.event = 'create pending' AND ai_playerbot_random_bots.value >= 2 "
+        "AND ai_playerbot_random_bots.data LIKE '%%|obligations:1')) "
         "AND ai_playerbot_random_bots.bot NOT IN "
         "(SELECT d.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'delete') d) "
         "AND ai_playerbot_random_bots.bot NOT IN "
         "(SELECT p.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value < 2) p)";
+
+    // While deletion state is UNKNOWN, this scan cannot be authoritative: it
+    // would replace the owner map having skipped rows it could not classify.
+    // Keep existing owners and let the deletion-scan recovery rerun us.
+    if (!PlayerbotHolder::DeletionStateKnown())
+    {
+        postCreateScanFailed = true;
+        postCreateScanRetryPasses = 0;
+        sLog.outDetail("ReconstructPostCreateOwners deferred: deletion-intent state is not yet known");
+        return;
+    }
 
     std::map<uint32, PostCreateOwner> scanned;
     bool scanSucceeded = false;
@@ -966,10 +979,13 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
                         if (owner == scanned.end())
                             continue;
 
+                        std::string recordedName;
+                        uint32 recordedAccount = 0;
                         uint32 level = 0;
                         bool autoAdd = false;
                         bool hasObligations = false;
-                        living::DecodeCreationIntent(fields[1].GetCppString(), level, autoAdd, hasObligations);
+                        living::DecodeCreationIntent(fields[1].GetCppString(), recordedName, recordedAccount,
+                            level, autoAdd, hasObligations);
                         owner->second.mayAutoLogin = owner->second.mayAutoLogin || autoAdd;
                     } while (intents->NextRow());
                 }
@@ -989,6 +1005,23 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
     postCreateScanFailed = !scanSucceeded;
     postCreateScanRetryPasses = 0;
     postCreateOwners = living::ReconcilePostCreateOwners(postCreateOwners, scanSucceeded, scanned);
+}
+
+namespace
+{
+    // Auxiliary writes captured by the level-up effect under deferSave (spec
+    // events, hunter pet save): STAGED here and persisted only after the
+    // player save is proven durable, gating the marker clear. Process-local
+    // by design - a crash before staging-out loses only module metadata that
+    // the proven character save does not depend on (the talents/pet
+    // THEMSELVES rode the proven transaction), which is disclosed below.
+    struct StagedLevelupAux
+    {
+        bool hasTalents = false;
+        ai::ChangeTalentsAction::TalentSelectionResult talents;
+        bool petPending = false;
+    };
+    std::map<uint32, StagedLevelupAux> stagedLevelupAux;
 }
 
 void RandomPlayerbotMgr::LoginFreeBots()
@@ -1139,9 +1172,29 @@ void RandomPlayerbotMgr::LoginFreeBots()
 
                     living::DurableOneShotMarker& ledger = durableOneShotMarkers[botGuid][marker];
 
-                    // Confirmed clear of a proven marker; retried alone.
+                    // Confirmed clear of a proven marker; retried alone. The
+                    // STAGED auxiliary writes (spec events, pet save) must
+                    // land first - the marker may not clear while a required
+                    // auxiliary outcome is still unpersisted; a failed aux
+                    // write keeps the marker and retries next pass.
                     auto clearProven = [&]() -> bool
                     {
+                        if (auto staged = stagedLevelupAux.find(botGuid); staged != stagedLevelupAux.end())
+                        {
+                            if (staged->second.hasTalents)
+                            {
+                                if (!ai::ChangeTalentsAction::PersistTalentSpec(botGuid, staged->second.talents))
+                                    return false; // execution-confirmed or retried
+                                staged->second.hasTalents = false;
+                            }
+                            if (staged->second.petPending)
+                            {
+                                PlayerbotFactory::SavePetForOwner(bot); // keyed, idempotent
+                                staged->second.petPending = false;
+                            }
+                            stagedLevelupAux.erase(staged);
+                        }
+
                         bool const cleared = sRandomPlayerbotMgr.SetValue(botGuid, marker, 0);
                         if (ledger.OnClearResult(cleared ? living::EventWriteResult::DesiredStateConfirmed
                                                          : living::EventWriteResult::StateUnknown))
@@ -1281,9 +1334,22 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     // No-save application path: the consume owns the ONE save,
                     // queued only after the phase-2 record is confirmed - a
                     // nested save here could commit the effect while the
-                    // marker still claims it unapplied.
+                    // marker still claims it unapplied. Independent durable
+                    // writes (spec events, pet save) are captured and STAGED:
+                    // they land only once the player save is proven, gating
+                    // the marker clear.
                     factory.deferSave = true;
                     factory.Randomize(true, false);
+
+                    // Memory-only talent application (SelectTalents performs
+                    // no persistence of any kind); the spec-event writes and
+                    // the pet save are STAGED and land only after the player
+                    // save is proven.
+                    StagedLevelupAux& staged = stagedLevelupAux[botGuid];
+                    staged.talents = ai::ChangeTalentsAction::SelectTalents(bot, nullptr);
+                    staged.hasTalents = staged.talents.evaluated;
+                    if (bot->GetPet())
+                        staged.petPending = true;
                 });
                 postCreateSettled &= levelupSettled;
 
@@ -4623,7 +4689,10 @@ bool RandomPlayerbotMgr::TryGetEventValue(uint32 bot, std::string const& event, 
         }
     }
 
-    if ((time(0) - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink" && event != "init" && event != "current_time" && event != "always" && event != "selfbot")
+    // Expiry interpretation is shared with the host tests: lifecycle-control
+    // rows (creation/deletion obligations) are non-expiring - a first login
+    // more than 15 days after creation must still see its owed markers.
+    if ((time(0) - e.lastChangeTime) >= e.validIn && !living::IsNonExpiringEvent(event))
         e.value = 0;
 
     value = e.value;

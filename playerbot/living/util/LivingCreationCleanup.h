@@ -293,6 +293,10 @@ namespace living
         // Pumps a verification may stay outstanding before its callback is
         // considered lost (the relocation watchdog pattern; one pump per tick).
         static constexpr uint32_t kMaxAwaitingPumps = 128;
+        // Bounded deferral set for adoptions arriving while the registry is
+        // full; far above any realistic burst, and still fail-closed beyond it
+        // (the durable intent rows remain for the next restart).
+        static constexpr size_t kMaxOverflow = 4096;
 
         // Adopts ownership of one ALREADY-QUEUED character deletion, with the
         // recorded identity (name; may be empty when the character row was
@@ -308,6 +312,11 @@ namespace living
         // Recovery adoptions (restart boundary) pass false: any PRESENT
         // readback fails closed, because the recorded identity cannot prove
         // the row was not reused since the original process died.
+        //
+        // Capacity overflow is FAIL-CLOSED: the adoption is deferred into a
+        // bounded overflow set that still counts as owned (Owns -> login and
+        // metadata mutation stay blocked) and is promoted into an active
+        // record as capacity frees - never silently dropped.
         void Adopt(uint32_t guid, uint32_t accountId, std::string expectedName,
             bool identityProvenInProcess, CharacterDeletionOps const& ops)
         {
@@ -319,8 +328,16 @@ namespace living
 
             if (records.size() >= kMaxRecords)
             {
-                if (ops.onQuarantined)
-                    ops.onQuarantined(guid);
+                if (overflow.find(guid) == overflow.end() && overflow.size() < kMaxOverflow)
+                {
+                    Deferred deferred;
+                    deferred.accountId = accountId;
+                    deferred.expectedName = std::move(expectedName);
+                    deferred.identityProvenInProcess = identityProvenInProcess;
+                    overflow[guid] = std::move(deferred);
+                    if (ops.onQuarantined)
+                        ops.onQuarantined(guid); // disclosed: deferred, still blocking
+                }
                 return;
             }
 
@@ -332,9 +349,15 @@ namespace living
 
         // Adopts a recovery-time PRESENT row directly into quarantine: login
         // stays blocked and everything is retained for manual resolution.
+        // NEVER downgrades an existing record: a config reload re-scanning a
+        // deletion this process already owns with a PROVEN identity must not
+        // strand it in quarantine - the live record keeps confirming.
         void AdoptQuarantined(uint32_t guid, uint32_t accountId, std::string expectedName,
             CharacterDeletionOps const& ops)
         {
+            if (records.find(guid) != records.end() || overflow.find(guid) != overflow.end())
+                return; // already owned (possibly mid-confirmation): keep it
+
             Adopt(guid, accountId, std::move(expectedName), false, ops);
             auto it = records.find(guid);
             if (it != records.end() && !it->second.quarantined)
@@ -475,9 +498,24 @@ namespace living
 
             for (uint32_t guid : completed)
                 records.erase(guid);
+
+            // Promote deferred (overflow) adoptions as capacity frees; they
+            // stayed owned (login-blocked) the whole time.
+            while (!overflow.empty() && records.size() < kMaxRecords)
+            {
+                auto deferred = overflow.begin();
+                Record& record = records[deferred->first];
+                record.accountId = deferred->second.accountId;
+                record.expectedName = std::move(deferred->second.expectedName);
+                record.identityProvenInProcess = deferred->second.identityProvenInProcess;
+                overflow.erase(deferred);
+            }
         }
 
-        bool Owns(uint32_t guid) const { return records.find(guid) != records.end(); }
+        bool Owns(uint32_t guid) const
+        {
+            return records.find(guid) != records.end() || overflow.find(guid) != overflow.end();
+        }
 
         bool IsQuarantined(uint32_t guid) const
         {
@@ -519,6 +557,15 @@ namespace living
                 ops.onQuarantined(guid);
         }
 
+        struct Deferred
+        {
+            uint32_t accountId = 0;
+            std::string expectedName;
+            bool identityProvenInProcess = false;
+        };
+
         std::map<uint32_t, Record> records;
+        // Bounded fail-closed deferral for adoptions beyond kMaxRecords.
+        std::map<uint32_t, Deferred> overflow;
     };
 }

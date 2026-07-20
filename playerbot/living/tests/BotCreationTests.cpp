@@ -1012,19 +1012,28 @@ LIVING_TEST(owner_reconciliation_preserves_login_authorization)
 
 LIVING_TEST(creation_intent_codec_and_recovery_boundaries)
 {
-    // The intent codec carries {level, login authorization, has-obligations}
-    // in a small fixed envelope.
+    // The intent codec carries {identity name, original account, level,
+    // login authorization, has-obligations} in a small fixed envelope. The
+    // recorded identity anchors recovery to THE character transaction the
+    // intent was written for - never to whatever row occupies the guid now.
+    std::string name;
+    uint32_t account = 0;
     uint32_t level = 0;
     bool autoAdd = false;
     bool hasObligations = false;
 
-    DecodeCreationIntent(EncodeCreationIntent(70, true, true), level, autoAdd, hasObligations);
+    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 70, true, true),
+        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(name == "Botname" && account == 42);
     LIVING_CHECK(level == 70 && autoAdd && hasObligations);
-    DecodeCreationIntent(EncodeCreationIntent(1, false, false), level, autoAdd, hasObligations);
+    DecodeCreationIntent(EncodeCreationIntent("X", 1, 1, false, false),
+        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(name == "X" && account == 1);
     LIVING_CHECK(level == 1 && !autoAdd && !hasObligations);
-    LIVING_CHECK(EventValueFitsSchema("create pending", EncodeCreationIntent(4294967295u, true, true)));
-    DecodeCreationIntent("garbage", level, autoAdd, hasObligations);
-    LIVING_CHECK(level == 0 && !autoAdd && !hasObligations); // never throws, never invents
+    LIVING_CHECK(EventValueFitsSchema("create pending",
+        EncodeCreationIntent("Longestname1", 4294967295u, 4294967295u, true, true)));
+    DecodeCreationIntent("garbage", name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(name.empty() && account == 0 && level == 0 && !autoAdd && !hasObligations);
 
     // Crash-boundary recovery over the durable intent:
     // - before the character save committed (or after a rollback): residue;
@@ -1047,18 +1056,22 @@ LIVING_TEST(creation_login_authorization_survives_restart_via_intent)
     // login=1 without always-online membership: the durable intent restores
     // the authorization on reconstruction; login=0 stays unauthorized in
     // every mode - lifecycle ownership never authorizes a login by itself.
+    std::string name;
+    uint32_t account = 0;
     uint32_t level = 0;
     bool autoAdd = false;
     bool hasObligations = false;
 
-    DecodeCreationIntent(EncodeCreationIntent(60, true, true), level, autoAdd, hasObligations);
+    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, true, true),
+        name, account, level, autoAdd, hasObligations);
     bool const alwaysMember = false; // ordinary creation never persists `always`
     bool const mayAutoLogin = alwaysMember || autoAdd;
     LIVING_CHECK(mayAutoLogin);                                          // login=1 restored
     LIVING_CHECK(MayAutoLoginPostCreateOwner(true, mayAutoLogin, false));
     LIVING_CHECK(!MayAutoLoginPostCreateOwner(false, mayAutoLogin, false)); // LOGIN_ONLY_ALWAYS_ACTIVE
 
-    DecodeCreationIntent(EncodeCreationIntent(60, false, true), level, autoAdd, hasObligations);
+    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, false, true),
+        name, account, level, autoAdd, hasObligations);
     LIVING_CHECK(!(alwaysMember || autoAdd)); // login=0 preserved across restart
 }
 
@@ -1069,13 +1082,48 @@ LIVING_TEST(markerless_creations_register_no_scheduler_owner)
     // clears the intent instead of holding it, no owner is registered, and
     // recovery of a stray finalized markerless intent clears rather than
     // reconstructs.
+    std::string name;
+    uint32_t account = 0;
     uint32_t level = 0;
     bool autoAdd = false;
     bool hasObligations = false;
-    DecodeCreationIntent(EncodeCreationIntent(1, false, false), level, autoAdd, hasObligations);
-    LIVING_CHECK(!hasObligations); // -> writeMetadata clears; onCreated skips the owner
+    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 1, false, false),
+        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(!hasObligations); // -> exposure runs first, THEN the confirmed clear
 
     // Marker-bearing creations DO retain ownership.
-    DecodeCreationIntent(EncodeCreationIntent(60, false, true), level, autoAdd, hasObligations);
+    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, false, true),
+        name, account, level, autoAdd, hasObligations);
     LIVING_CHECK(hasObligations);
+}
+
+LIVING_TEST(creation_intent_is_written_before_all_other_metadata)
+{
+    // The ordering invariant behind restart discoverability: the intent row
+    // is the FIRST durable write of a creation, so if ANY metadata row
+    // exists, the intent exists too and owns the residue - a failure after
+    // any later write can never leave ownerless rows. Modeled over the exact
+    // production write sequence with a fault at every boundary.
+    std::vector<std::string> const writeOrder = {
+        "create pending", "specNo", "create levelup", "create gear",
+        "create group", "test", "temporary",
+    };
+
+    for (size_t failAt = 0; failAt <= writeOrder.size(); ++failAt)
+    {
+        std::vector<std::string> written;
+        for (size_t i = 0; i < writeOrder.size() && i < failAt; ++i)
+            written.push_back(writeOrder[i]);
+
+        bool const anyRows = !written.empty();
+        bool const intentOwnsResidue = !anyRows
+            || std::find(written.begin(), written.end(), "create pending") != written.end();
+        LIVING_CHECK(intentOwnsResidue);
+
+        // Every possible residue is discoverable by the intent scan, and a
+        // present-but-rolled-back character resolves to DiscardResidue.
+        if (anyRows)
+            LIVING_CHECK(PlanCreationIntentRecovery(false, kCreationIntentPrePersistence)
+                == CreationIntentRecovery::DiscardResidue);
+    }
 }

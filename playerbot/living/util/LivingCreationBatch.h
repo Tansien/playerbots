@@ -434,6 +434,32 @@ namespace living
             uint32_t outstanding = 0;
             ForEachOutstandingMember(initiatorGuid, isJoined,
                 [&outstanding](CreationBatchMember const&) { ++outstanding; });
+
+            // Unresolved credited dependencies whose SOURCE slot no longer
+            // exists (predecessor pruned) or failed terminally are not seen by
+            // the member walk above, yet they still represent one owed slot:
+            // the next re-evaluation will replace them within the budget. Not
+            // counting them let a repeated request in the prune->reevaluate
+            // window recreate the deficit, fanning ONE lost slot into TWO
+            // replacements. Live outstanding sources are already counted by
+            // the walk, so only source-gone credits are added here.
+            for (auto const& [token, batch] : batches)
+            {
+                if (batch.initiatorGuid != initiatorGuid)
+                    continue;
+
+                for (CreditedDependency const& credit : batch.creditedDependencies)
+                {
+                    CreationBatchMember const* source = nullptr;
+                    if (auto predecessor = batches.find(credit.batchToken);
+                        predecessor != batches.end() && credit.memberIndex < predecessor->second.members.size())
+                        source = &predecessor->second.members[credit.memberIndex];
+
+                    if (!source || source->state == BatchMemberState::TerminalFailure
+                        || (source->state == BatchMemberState::Finalized && isJoined(source->finalizedGuid)))
+                        ++outstanding;
+                }
+            }
             return outstanding;
         }
 

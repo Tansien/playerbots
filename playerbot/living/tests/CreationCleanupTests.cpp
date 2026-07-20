@@ -394,11 +394,13 @@ LIVING_TEST(durable_deletion_lost_callback_watchdog_rearms_and_ignores_stale)
     LIVING_CHECK(!deletions.Owns(7050));
 }
 
-LIVING_TEST(durable_deletion_capacity_pressure_revokes_but_fails_closed)
+LIVING_TEST(durable_deletion_capacity_overflow_is_retained_and_promoted)
 {
-    // Over-capacity adoptions still revoke login eligibility immediately, but
-    // the record is dropped fail-closed (rows stay; the next restart's intent
-    // scan retries) and disclosed through onQuarantined.
+    // Over-capacity adoptions are FAIL-CLOSED: login eligibility is revoked,
+    // the guid is DEFERRED (not dropped) into a bounded overflow set that
+    // still counts as owned - so IsDeletionPending keeps blocking logins and
+    // metadata mutation - and it is promoted into an active record as
+    // capacity frees, eventually confirming like any other deletion.
     DurableCharacterDeletions deletions;
     DeletionSpyOps spy;
 
@@ -407,10 +409,53 @@ LIVING_TEST(durable_deletion_capacity_pressure_revokes_but_fails_closed)
     LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
 
     deletions.Adopt(99999, 1, "Overflow", true, spy.Make());
-    LIVING_CHECK(spy.revokedLogins.back() == 99999);          // revoked regardless
+    LIVING_CHECK(spy.revokedLogins.back() == 99999); // revoked regardless
     LIVING_CHECK(deletions.RecordCount() == DurableCharacterDeletions::kMaxRecords);
-    LIVING_CHECK(!deletions.Owns(99999));
-    LIVING_CHECK(spy.quarantined.back() == 99999);            // disclosed
+    LIVING_CHECK(deletions.Owns(99999));             // STILL OWNED: login stays blocked
+    LIVING_CHECK(spy.quarantined.back() == 99999);   // deferral disclosed
+
+    // One active record completes -> the deferred guid is promoted and runs
+    // the normal confirmation flow to completion.
+    deletions.Pump(spy.Make());
+    deletions.OnAbsenceVerify(10000, deletions.CurrentGeneration(10000), RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make()); // consume outcome
+    deletions.Pump(spy.Make()); // clear + confirm 10000; capacity frees; 99999 promoted
+    LIVING_CHECK(!deletions.Owns(10000));
+    LIVING_CHECK(deletions.Owns(99999));
+
+    deletions.Pump(spy.Make()); // promoted record requests its verify
+    deletions.OnAbsenceVerify(99999, deletions.CurrentGeneration(99999), RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make());
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(!deletions.Owns(99999)); // eventually adopted AND completed
+    bool confirmed99999 = false;
+    for (auto const& entry : spy.confirmed)
+        confirmed99999 = confirmed99999 || entry.first == 99999;
+    LIVING_CHECK(confirmed99999);
+}
+
+LIVING_TEST(reload_adopt_quarantined_never_downgrades_a_proven_deletion)
+{
+    // A config reload re-scans durable intents while an in-process deletion
+    // (identity proven by THIS process's typed preflight) is mid-
+    // confirmation and its character still present: the reload-style
+    // AdoptQuarantined must be a no-op - downgrading would strand a valid
+    // deletion in quarantine forever.
+    DurableCharacterDeletions deletions;
+    DeletionSpyOps spy;
+
+    deletions.Adopt(7100, 42, "Live", true, spy.Make());
+    deletions.Pump(spy.Make()); // verify requested; deletion still executing
+
+    deletions.AdoptQuarantined(7100, 42, "Live", spy.Make()); // reload re-scan
+    LIVING_CHECK(!deletions.IsQuarantined(7100));             // NOT downgraded
+
+    // The original owner completes normally.
+    deletions.OnAbsenceVerify(7100, deletions.CurrentGeneration(7100), RowVerifyOutcome::Absent);
+    deletions.Pump(spy.Make());
+    deletions.Pump(spy.Make());
+    LIVING_CHECK(!deletions.Owns(7100));
+    LIVING_CHECK(spy.confirmed.size() == 1 && spy.confirmed[0].first == 7100);
 }
 
 LIVING_TEST(durable_deletion_restart_recovery_follows_the_intent_plan)
