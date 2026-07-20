@@ -163,9 +163,16 @@ public:
     static void AdoptCharacterDeletion(uint32 guid, uint32 accountId, std::string const& expectedName);
     // Re-adopts every durable deletion intent ('delete' event rows) at
     // startup/config reload: a lost queued deletion is re-run, an absent or
-    // guid-reused character is adopted for confirmation/cleanup only. A
-    // failed scan leaves the intent rows untouched.
-    static void ReadoptPendingDeletions();
+    // identity-unproven character is adopted for confirmation/cleanup only.
+    // A failed scan leaves the intent rows untouched, reports false, and is
+    // retried with bounded backoff from the creation pump.
+    static bool ReadoptPendingDeletions();
+    // Whether a character deletion is currently owned (adopted, quarantined,
+    // or freshly re-adopted from a durable intent). Every login/add-bot path
+    // and the post-create owner reconstruction must exclude such guids: a
+    // deletion-pending character may never log in or receive post-create
+    // mutations.
+    static bool IsDeletionPending(uint32 guid);
     // Internal surface for the deletion confirmer: fires the OnBotDeleted
     // account-cleanup hook once absence is CONFIRMED (only then is the
     // durable character count truthful about the deletion).

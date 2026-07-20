@@ -1040,6 +1040,15 @@ LIVING_TEST(group_batch_request_plan_credits_dependencies_without_false_undersiz
     registry.OnCreationTerminal(MakeCompletion(62, CreationPollStatus::Created, 8002), 2);
     registry.OnCreationTerminal(MakeCompletion(63, CreationPollStatus::Created, 8003), 3);
 
+    // Own members are done, but the referenced credit is UNRESOLVED: the
+    // batch must NOT report final success yet - the credited member could
+    // still vanish. (This used to poll Complete prematurely.)
+    LIVING_CHECK(registry.Poll(tokenB, false).status == BatchPollStatus::Pending);
+
+    // The credited member joins: the per-pump re-evaluation confirms the
+    // credit, and only now is completion final and genuinely full-size.
+    auto joined8001For = [](uint32_t, uint32_t guid) { return guid == 8001; };
+    registry.ReevaluateCredits(10, joined8001For);
     BatchPollResult const result = registry.Poll(tokenB, false);
     LIVING_CHECK(result.status == BatchPollStatus::Complete);
     LIVING_CHECK(!result.undersized); // pre-fix: 1 + 2 < 4 -> false undersize

@@ -917,3 +917,95 @@ LIVING_TEST(group_side_effects_gate_on_verified_membership)
     // Non-master gear (e.g. "epic") is never deferred by the join.
     LIVING_CHECK(MayApplyMasterDerivedGear(false, false, false));
 }
+
+LIVING_TEST(gear_values_are_whitelisted_before_any_mutation)
+{
+    // The finite supported set is accepted...
+    for (char const* value : { "", "default", "empty", "green", "uncommon", "blue",
+        "rare", "purple", "epic", "upgrade", "sync", "best", "partial" })
+        LIVING_CHECK(IsSupportedGearValue(value));
+
+    // ...and everything else is rejected BEFORE any account/character
+    // mutation - including payloads that would have applied an effect and
+    // then failed to persist once the ~43-byte phase-2 record metadata was
+    // appended to the 255-byte envelope (boundaries 212/213/255).
+    LIVING_CHECK(!IsSupportedGearValue("legendary"));
+    LIVING_CHECK(!IsSupportedGearValue("Epic"));      // case-sensitive, like the effect switch
+    LIVING_CHECK(!IsSupportedGearValue("sync@70"));   // internal stamped form is not user input
+    LIVING_CHECK(!IsSupportedGearValue(std::string(212, 'x')));
+    LIVING_CHECK(!IsSupportedGearValue(std::string(213, 'x')));
+    LIVING_CHECK(!IsSupportedGearValue(std::string(255, 'x')));
+
+    // Every ACCEPTED value still fits the durable envelope with the phase-2
+    // record metadata appended: accepted input can never become impossible
+    // to persist.
+    for (char const* value : { "", "default", "empty", "green", "uncommon", "blue",
+        "rare", "purple", "epic", "upgrade", "sync", "best", "partial" })
+    {
+        std::string const stamped = StampGearTarget(value, 4294967295u); // worst-case level suffix
+        LIVING_CHECK(EventValueFitsSchema("create gear",
+            EncodeDurableMarkerData(stamped, ~0ull, ~0ull)));
+    }
+}
+
+LIVING_TEST(gear_target_capture_survives_group_marker_clear)
+{
+    // The verified group target's level is stamped into a dependent
+    // sync/upgrade gear payload BEFORE the (only) durable group marker is
+    // cleared; recovery after a crash between those steps therefore gears
+    // against the original verified target, never the bot's own level.
+    std::string base;
+    uint32_t level = 0;
+
+    SplitGearTarget(StampGearTarget("sync", 70), base, level);
+    LIVING_CHECK(base == "sync" && level == 70);
+    SplitGearTarget(StampGearTarget("upgrade", 1), base, level);
+    LIVING_CHECK(base == "upgrade" && level == 1);
+
+    // Un-stamped payloads keep level 0 (the master/own-level runtime path).
+    SplitGearTarget("sync", base, level);
+    LIVING_CHECK(base == "sync" && level == 0);
+
+    // Malformed suffixes never mis-split: the whole payload stays the base.
+    SplitGearTarget("sync@", base, level);
+    LIVING_CHECK(base == "sync@" && level == 0);
+    SplitGearTarget("sync@7x", base, level);
+    LIVING_CHECK(base == "sync@7x" && level == 0);
+
+    // The capture gate: an uncaptured sync payload still needs the join to
+    // settle or a verified master; a CAPTURED one applies regardless - the
+    // crash-recovery pass has no master and no group marker left.
+    SplitGearTarget(StampGearTarget("sync", 70), base, level);
+    bool const capturedNeedsMaster = (base == "sync" || base == "upgrade") && level == 0;
+    LIVING_CHECK(!capturedNeedsMaster);
+    LIVING_CHECK(MayApplyMasterDerivedGear(capturedNeedsMaster, /*joinSettled*/ false, /*master*/ false));
+}
+
+LIVING_TEST(post_create_owner_login_policy)
+{
+    // Lifecycle ownership never authorizes a login by itself.
+    // login=0 (not authorized) stays excluded in every mode...
+    LIVING_CHECK(!MayAutoLoginPostCreateOwner(true, false, false));
+    // ...deletion-pending characters never log in...
+    LIVING_CHECK(!MayAutoLoginPostCreateOwner(true, true, true));
+    // ...LOGIN_ONLY_ALWAYS_ACTIVE suppresses sweep logins entirely...
+    LIVING_CHECK(!MayAutoLoginPostCreateOwner(false, true, false));
+    // ...and an authorized entry logs in under normal autologin.
+    LIVING_CHECK(MayAutoLoginPostCreateOwner(true, true, false));
+}
+
+LIVING_TEST(owner_reconciliation_preserves_login_authorization)
+{
+    // The owner map now carries login authorization; a failed scan keeps the
+    // EXISTING owners with their authorization untouched, and a successful
+    // scan is wholesale-authoritative.
+    struct Owner { uint32_t account; bool mayAutoLogin;
+        bool operator==(Owner const& o) const { return account == o.account && mayAutoLogin == o.mayAutoLogin; } };
+    std::map<uint32_t, Owner> existing{ { 1, { 10, true } }, { 2, { 20, false } } };
+    std::map<uint32_t, Owner> scanned{ { 2, { 20, false } }, { 3, { 30, true } } };
+    std::map<uint32_t, Owner> const empty;
+
+    LIVING_CHECK(ReconcilePostCreateOwners(existing, true, scanned) == scanned);
+    LIVING_CHECK(ReconcilePostCreateOwners(existing, false, empty) == existing);
+    LIVING_CHECK(ReconcilePostCreateOwners(existing, true, empty).empty());
+}

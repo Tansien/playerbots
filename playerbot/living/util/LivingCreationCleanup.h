@@ -138,11 +138,6 @@ namespace living
         // Execution-confirmed removal of the character's event rows/markers.
         // Returns whether the delete statement actually executed.
         std::function<bool(uint32_t /*guid*/)> clearMetadata;
-        // Execution-confirmed removal of ONLY the durable deletion-intent row.
-        // Used when the guid was verifiably REUSED by a different character:
-        // the original deletion succeeded, but the other event rows may belong
-        // to the new identity and are never touched.
-        std::function<bool(uint32_t /*guid*/)> clearIntent;
         // Revokes login eligibility immediately (freeAltBots etc.).
         std::function<void(uint32_t /*guid*/)> revokeLogin;
         // Observes a CONFIRMED-absent, metadata-cleared deletion (account
@@ -153,12 +148,46 @@ namespace living
         std::function<void(uint32_t /*guid*/)> onQuarantined;
     };
 
+    // Durable deletion-intent payload: the character's name AND ORIGINAL
+    // ACCOUNT. The account makes empty-account cleanup possible when the
+    // character row is already absent at recovery, and (name, account)
+    // together are the strongest identity the schema can represent - a
+    // mismatch on either fails closed (quarantine), never deletes.
+    inline std::string EncodeDeletionIntent(std::string const& name, uint32_t accountId)
+    {
+        return name + "|account:" + std::to_string(accountId);
+    }
+
+    inline void DecodeDeletionIntent(std::string const& data, std::string& name, uint32_t& accountId)
+    {
+        name = data;
+        accountId = 0;
+        size_t const tag = data.rfind("|account:");
+        if (tag == std::string::npos)
+            return; // legacy name-only intent: account unknown (0)
+
+        uint64_t parsed = 0;
+        for (size_t i = tag + 9; i < data.size(); ++i)
+        {
+            char const c = data[i];
+            if (c < '0' || c > '9' || parsed > 0xFFFFFFFFull)
+                return; // malformed: keep name-only interpretation
+            parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+        }
+        if (tag + 9 == data.size())
+            return;
+
+        name = data.substr(0, tag);
+        accountId = static_cast<uint32_t>(parsed);
+    }
+
     // Startup/reload recovery decision for one durable deletion-intent row.
-    // A character present under its RECORDED name means the queued deletion
-    // was lost: re-run the full deletion path. An absent character - or one
-    // whose name differs (the guid was reused by a new identity) - only needs
-    // adoption for confirmation/cleanup; the verify readback then classifies
-    // absent vs reused and never re-issues a deletion at a reused guid.
+    // Only a character present under BOTH its recorded name and recorded
+    // account is provably the intended one: re-run the full deletion path.
+    // Anything else - absent, renamed, account-moved, or reused - is adopted
+    // for confirmation only; the identity-aware verify readback then confirms
+    // absence (cleanup with the RECORDED account) or fails closed
+    // (quarantine). A deletion is never re-issued at an unproven identity.
     enum class DeletionIntentRecovery
     {
         RequeueDeletion,
@@ -166,11 +195,14 @@ namespace living
     };
 
     inline DeletionIntentRecovery PlanDeletionIntentRecovery(bool characterPresent,
-        std::string const& currentName, std::string const& recordedName)
+        std::string const& currentName, uint32_t currentAccount,
+        std::string const& recordedName, uint32_t recordedAccount)
     {
-        return characterPresent && currentName == recordedName
-            ? DeletionIntentRecovery::RequeueDeletion
-            : DeletionIntentRecovery::AdoptForConfirmation;
+        bool const identityProven = characterPresent
+            && !recordedName.empty() && currentName == recordedName
+            && recordedAccount != 0 && currentAccount == recordedAccount;
+        return identityProven ? DeletionIntentRecovery::RequeueDeletion
+                              : DeletionIntentRecovery::AdoptForConfirmation;
     }
 
     // Durable per-GUID ownership of queued character deletions. In every
@@ -204,12 +236,13 @@ namespace living
         static constexpr uint32_t kMaxAwaitingPumps = 128;
 
         // Adopts ownership of one ALREADY-QUEUED character deletion, with the
-        // identity name recorded in the durable intent (may be empty when the
-        // name lookup failed; identity checks then degrade to presence-only).
-        // Login eligibility is revoked immediately, even for duplicate or
-        // over-capacity adoptions - an abandoned auto-added character must
-        // never race a login. Over-capacity adoptions are otherwise dropped
-        // (fail closed: rows stay, the next restart retries).
+        // recorded identity (name; may be empty when the character row was
+        // already absent at intent time - a PRESENT row then always fails
+        // closed). Login eligibility is revoked immediately, even for
+        // duplicate or over-capacity adoptions - an abandoned auto-added
+        // character must never race a login. Over-capacity adoptions are
+        // otherwise dropped (fail closed: rows stay, the next restart
+        // retries).
         void Adopt(uint32_t guid, uint32_t accountId, std::string expectedName,
             CharacterDeletionOps const& ops)
         {
@@ -233,8 +266,9 @@ namespace living
 
         // SQL-callback entry: copies the outcome into the record's mailbox and
         // returns. Absent = the row is verifiably gone; Verified = still
-        // present under the recorded identity; IdentityMismatch = present
-        // under a DIFFERENT name (guid reused); QueryFailed = unknown.
+        // present under the PROVEN recorded identity (name and account both
+        // match); IdentityMismatch = present but the identity is unproven
+        // (renamed, account-moved, reused, or never recorded) - fails closed.
         // Results from superseded generations (a late callback after a
         // watchdog re-arm) are ignored.
         void OnAbsenceVerify(uint32_t guid, uint32_t generation, RowVerifyOutcome outcome)
@@ -249,12 +283,18 @@ namespace living
             it->second.pendingOutcome = outcome;
         }
 
-        // The identity recorded for a guid ("" when unknown/not owned): the
-        // production callback compares the queried name against exactly this.
-        std::string ExpectedNameFor(uint32_t guid) const
+        // The identity recorded for a guid: the production callback compares
+        // the queried (name, account) against exactly this. False when the
+        // guid is not owned.
+        bool TryGetExpectedIdentity(uint32_t guid, std::string& name, uint32_t& accountId) const
         {
             auto it = records.find(guid);
-            return it == records.end() ? std::string() : it->second.expectedName;
+            if (it == records.end())
+                return false;
+
+            name = it->second.expectedName;
+            accountId = it->second.accountId;
+            return true;
         }
 
         void Pump(CharacterDeletionOps const& ops)
@@ -279,22 +319,6 @@ namespace living
                     continue;
                 }
 
-                if (record.identityMismatch)
-                {
-                    // The guid is occupied by a NEW identity: the original
-                    // deletion verifiably succeeded. Clear ONLY the intent row
-                    // (the other event rows may belong to the new character).
-                    if (ops.clearIntent && ops.clearIntent(guid))
-                    {
-                        if (ops.onConfirmedDeleted)
-                            ops.onConfirmedDeleted(guid, record.accountId);
-                        completed.push_back(guid);
-                    }
-                    else if (++record.clearAttempts >= kMaxClearAttempts)
-                        Quarantine(guid, record, ops);
-                    continue;
-                }
-
                 if (record.hasPendingOutcome)
                 {
                     record.hasPendingOutcome = false;
@@ -309,8 +333,12 @@ namespace living
 
                     if (record.pendingOutcome == RowVerifyOutcome::IdentityMismatch)
                     {
-                        record.identityMismatch = true;
-                        continue; // intent clears on the next pump
+                        // The guid is occupied but the identity is UNPROVEN
+                        // (rename and reuse are indistinguishable here): fail
+                        // closed - never delete, never clear the intent, keep
+                        // everything for manual resolution.
+                        Quarantine(guid, record, ops);
+                        continue;
                     }
 
                     if (++record.attempts >= kMaxVerifyAttempts)
@@ -392,7 +420,6 @@ namespace living
             uint32_t awaitingPumps = 0; // watchdog while a request is outstanding
             bool verifyRequested = false;
             bool absenceConfirmed = false;
-            bool identityMismatch = false;
             bool quarantined = false;
             bool hasPendingOutcome = false;
             RowVerifyOutcome pendingOutcome = RowVerifyOutcome::QueryFailed;

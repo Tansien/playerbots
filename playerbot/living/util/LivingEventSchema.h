@@ -15,6 +15,17 @@ namespace living
     inline constexpr size_t EVENT_NAME_MAX_BYTES = 45;
     inline constexpr size_t EVENT_DATA_MAX_BYTES = 255;
 
+    // Events carrying lifecycle CONTROL state: unfinished creation
+    // obligations, deletion intents, and temporary identity. A console reset
+    // (and any other bulk event wipe) must never delete these - they are the
+    // only durable record their crash-safe owners recover from. The reset's
+    // SQL exclusion list mirrors exactly this predicate.
+    inline bool IsLifecycleControlEvent(std::string const& event)
+    {
+        return event == "temporary" || event == "delete" || event == "test"
+            || event == "create levelup" || event == "create gear" || event == "create group";
+    }
+
     inline bool EventValueFitsSchema(std::string const& event, std::string const& data)
     {
         return !event.empty()

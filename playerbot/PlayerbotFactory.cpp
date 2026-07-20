@@ -349,7 +349,10 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 
     pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Save");
     sLog.outDetail("Saving to DB...");
-    if (sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
+    // deferSave: the durable-marker consume owns the ONE save (queued only
+    // after its phase-2 record is execution-confirmed); a nested save here
+    // could commit the effect while the marker still claims it unapplied.
+    if (!deferSave && sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
         bot->SaveToDB();
     sLog.outDetail("Done.");
     pmo.reset();
@@ -366,7 +369,7 @@ void PlayerbotFactory::Refresh()
     InitPotions();
     InitReagents();
     AddConsumables();
-    if(sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
+    if (!deferSave && sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS)
         bot->SaveToDB();
 }
 

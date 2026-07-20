@@ -592,3 +592,18 @@ LIVING_TEST(event_dirty_typed_read_untrusted_until_reconciled)
     LIVING_CHECK(!dirty);
     LIVING_CHECK(living::EventValueTrusted(loaded, true, dirty));
 }
+
+LIVING_TEST(lifecycle_control_events_survive_console_reset)
+{
+    // The console reset's SQL exclusion list mirrors exactly this predicate:
+    // active deletion intents and unfinished creation obligations are the
+    // ONLY durable record their crash-safe owners recover from, so a reset
+    // must never delete them.
+    for (char const* event : { "temporary", "delete", "test",
+        "create levelup", "create gear", "create group" })
+        LIVING_CHECK(living::IsLifecycleControlEvent(event));
+
+    for (char const* event : { "add", "logout", "login", "update", "always",
+        "bot_count", "teleport", "specNo" })
+        LIVING_CHECK(!living::IsLifecycleControlEvent(event));
+}
