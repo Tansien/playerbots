@@ -691,16 +691,8 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     if (!playersLevel)
         playersLevel = sPlayerbotAIConfig.syncLevelNoPlayer;
 
-    ScaleBotActivity();
-    if (sPlayerbotAIConfig.asyncBotLogin)
-    {
-        auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "AsyncBotLogin");
-        sPlayerBotLoginMgr.Update(players);
-        pmo.reset();
-    }
-
     // Typed read: an unknown bot_count must not be rewritten (the failed
-    // read is not an expired value) - the bot-count-driven cycle defers.
+    // read is not an expired value) - no population decision may start.
     uint32 maxAllowedBotCount = 0;
     if (!TryGetEventValue(0, "bot_count", maxAllowedBotCount))
     {
@@ -711,8 +703,23 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     if (!maxAllowedBotCount || ((uint32)maxAllowedBotCount < sPlayerbotAIConfig.minRandomBots || (uint32)maxAllowedBotCount > sPlayerbotAIConfig.maxRandomBots))
     {
         maxAllowedBotCount = urand(sPlayerbotAIConfig.minRandomBots, sPlayerbotAIConfig.maxRandomBots);
-        SetEventValue(0, "bot_count", maxAllowedBotCount,
-            urand(sPlayerbotAIConfig.randomBotCountChangeMinInterval, sPlayerbotAIConfig.randomBotCountChangeMaxInterval));
+        if (!SetEventValue(0, "bot_count", maxAllowedBotCount,
+                urand(sPlayerbotAIConfig.randomBotCountChangeMinInterval,
+                    sPlayerbotAIConfig.randomBotCountChangeMaxInterval)))
+        {
+            SetAIInternalUpdateDelay(sPlayerbotAIConfig.randomBotUpdateInterval);
+            return;
+        }
+    }
+
+    ScaleBotActivity();
+    if (sPlayerbotAIConfig.asyncBotLogin)
+    {
+        auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "AsyncBotLogin");
+        // The worker receives one trusted population snapshot. It never reads
+        // bot_count itself, so expiry/unknown cannot collapse into a zero queue.
+        sPlayerBotLoginMgr.Update(players, maxAllowedBotCount);
+        pmo.reset();
     }
 
     std::list<uint32> availableBots = GetBots();    
@@ -1732,6 +1739,13 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                     uint32 totaltime = fields[2].GetUInt32();
                     uint32 race = fields[3].GetUInt32();
                     uint32 cls = fields[4].GetUInt32();
+
+                    // Selection must use the same lifecycle eligibility as
+                    // every materialization path; otherwise a blocked GUID can
+                    // consume durable add state and population quota.
+                    if (PlayerbotHolder::IsDeletionPending(guid)
+                        || IsLifecycleLoginBlocked(guid))
+                        continue;
 
                     // Typed reads: unknown activation state neither skips nor
                     // activates this candidate - it ABORTS the whole batch.
@@ -2770,7 +2784,7 @@ bool RandomPlayerbotMgr::PrepareAsyncLogin(uint32 bot)
     return true;
 }
 
-bool RandomPlayerbotMgr::PrepareAsyncLogout(uint32 bot)
+bool RandomPlayerbotMgr::PrepareLogout(uint32 bot)
 {
     uint32 priorAdd = 0, priorLogout = 0;
     if (!TryGetEventValue(bot, "add", priorAdd)
@@ -2812,6 +2826,25 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         return false;
     }
 
+    // A successful login must retire its durable in-progress marker before
+    // any later deactivation. Unknown/unconfirmed state is handed to the
+    // existing retry owner, which keeps this GUID login-blocked meanwhile.
+    if (player)
+    {
+        uint32 loginFlag = 0;
+        if (!TryGetEventValue(bot, "login", loginFlag))
+        {
+            failedStaleLoginClears.insert(bot);
+            return false;
+        }
+        if (loginFlag && !SetEventValue(bot, "login", 0, 0))
+        {
+            failedStaleLoginClears.insert(bot);
+            return false;
+        }
+        failedStaleLoginClears.erase(bot);
+    }
+
     PlayerbotAI* ai = player ? player->GetPlayerbotAI() : NULL;
 
     bool botsAllowedInWorld = !sPlayerbotAIConfig.randomBotLoginWithPlayer || (!players.empty() && sWorld.GetActiveSessionCount() > 0);
@@ -2845,15 +2878,13 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         else
             sLog.outDetail("Bot #%d %s:%d <%s>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H", player->GetLevel(), player->GetName());
 
+        // Persist and confirm the COMPLETE offline transition before touching
+        // the scheduler list or the world. Failure is compensated and retried
+        // with the bot still online/current.
+        if (!PrepareLogout(bot))
+            return false;
+
         currentBots.remove(bot);
-        // Half of the activation pair: if the durable clear failed, the
-        // in-memory removal above diverged from durable truth - reconcile
-        // before the vector is trusted again.
-        if (!SetEventValue(bot, "add", 0, 0))
-        {
-            currentBotsDirty = true;
-            sLog.outError("ProcessBot: clearing 'add' for bot %u not confirmed; bot list marked dirty", bot);
-        }
 
         if (!player)
         {
@@ -2861,19 +2892,6 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         }
 
         LogoutPlayerBot(bot);
-
-        if (sPlayerbotAIConfig.randomBotTimedOffline)
-        {
-            // Typed read: an unknown logout state must not trigger the write
-            // (the failed read is not a confirmed "no logout scheduled").
-            uint32 logout = 0;
-            if (TryGetEventValue(bot, "logout", logout) && !logout
-                && !SetEventValue(bot, "logout", 1, urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)))
-            {
-                currentBotsDirty = true;
-                sLog.outError("ProcessBot: setting 'logout' for bot %u not confirmed; bot list marked dirty", bot);
-            }
-        }
 
         return false;
     }
@@ -2915,10 +2933,6 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 
     if (!player->IsInWorld() || player->IsBeingTeleported() || player->GetSession()->isLogingOut()) //Skip bots that are in limbo.
         return false;
-
-    uint32 loginFlag = 0;
-    if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
-        SetEventValue(bot, "login", 0, 0); //Bot is no longer loggin in.
 
     // Typed read: an unknown update state defers the AI update instead of
     // treating the failed read as "due now" and rewriting the schedule.
@@ -5160,7 +5174,12 @@ void RandomPlayerbotMgr::OnPlayerLogin(Player* player)
     {
         uint32 guid = player->GetGUIDLow();
         if (!sPlayerbotAIConfig.IsFreeAltBot(player))
-           SetEventValue(guid, "login", 0, 0);
+        {
+            if (!SetEventValue(guid, "login", 0, 0))
+                failedStaleLoginClears.insert(guid);
+            else
+                failedStaleLoginClears.erase(guid);
+        }
     }
     else
     {

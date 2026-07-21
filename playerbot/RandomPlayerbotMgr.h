@@ -253,7 +253,7 @@ public:
 
         bool AddRandomBot(uint32 bot);
         bool PrepareAsyncLogin(uint32 bot);
-        bool PrepareAsyncLogout(uint32 bot);
+        bool PrepareLogout(uint32 bot);
         bool CreateRandomBot(const std::string& name, uint8 race, uint8 cls, uint32 level);
         bool DeleteRandomBot(ObjectGuid guid);
         virtual void MovePlayerBot(uint32 guid, PlayerbotHolder* newHolder) override;

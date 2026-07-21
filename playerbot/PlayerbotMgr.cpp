@@ -2716,6 +2716,11 @@ bool PlayerbotHolder::ReadoptPendingCreations()
                         guid, recordedName.c_str(), currentName.c_str());
                     break;
                 }
+                // Deletion already revoked every exposure owner. A reload must
+                // not re-register one behind it; confirmed deletion clears the
+                // finalized intent with the rest of this GUID's metadata.
+                if (IsDeletionPending(guid))
+                    break;
                 if (hasObligations)
                     sRandomPlayerbotMgr.RegisterPostCreateOwner(guid, recordedAccount, autoAdd);
                 else
