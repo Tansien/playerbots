@@ -1071,6 +1071,13 @@ LIVING_TEST(creation_intent_codec_and_recovery_boundaries)
         == CreationIntentRecovery::ReconstructOwner);
     LIVING_CHECK(PlanCreationIntentRecovery(true, 0) == CreationIntentRecovery::Quarantine);
     LIVING_CHECK(PlanCreationIntentRecovery(true, 3) == CreationIntentRecovery::Quarantine);
+
+    // A trusted absent row is settled in the live post-create sweep. Only an
+    // unfinished or invalid nonzero phase keeps that owner scheduled.
+    LIVING_CHECK(!CreationIntentBlocksPostCreateSettlement(0));
+    LIVING_CHECK(CreationIntentBlocksPostCreateSettlement(kCreationIntentPrePersistence));
+    LIVING_CHECK(!CreationIntentBlocksPostCreateSettlement(kCreationIntentFinalized));
+    LIVING_CHECK(CreationIntentBlocksPostCreateSettlement(3));
 }
 
 LIVING_TEST(creation_login_authorization_survives_restart_via_intent)

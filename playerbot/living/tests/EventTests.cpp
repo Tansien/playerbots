@@ -632,3 +632,33 @@ LIVING_TEST(event_activity_uses_the_same_strict_expiry_boundary_as_durable_loadi
     LIVING_CHECK(!living::IsEventValueActive("add", 0, 100, 10, 101));
     LIVING_CHECK(living::IsEventValueActive("create pending", 1, 100, 10, 1000));
 }
+
+LIVING_TEST(talent_metadata_write_order_preserves_the_active_selector_on_failure)
+{
+    std::vector<std::string> writes;
+    auto persist = [&](int32_t specId, std::string const& specLink, size_t failAt)
+    {
+        writes.clear();
+        size_t attempt = 0;
+        return living::PersistTalentMetadata(specId, specLink,
+            [&](char const* event, uint32_t value, std::string const& data)
+            {
+                writes.push_back(std::string(event) + "=" + std::to_string(value) + ":" + data);
+                return ++attempt != failAt;
+            });
+    };
+
+    LIVING_CHECK(persist(-1, "new-link", 0));
+    LIVING_CHECK((writes == std::vector<std::string>{ "specLink=1:new-link", "specNo=0:" }));
+
+    LIVING_CHECK(persist(-1, "", 0));
+    LIVING_CHECK((writes == std::vector<std::string>{ "specLink=0:", "specNo=0:" }));
+
+    LIVING_CHECK(persist(4, "ignored", 0));
+    LIVING_CHECK((writes == std::vector<std::string>{ "specNo=5:", "specLink=0:" }));
+
+    LIVING_CHECK(!persist(-1, "new-link", 1));
+    LIVING_CHECK(writes.size() == 1);
+    LIVING_CHECK(!persist(-1, "new-link", 2));
+    LIVING_CHECK(writes.size() == 2);
+}

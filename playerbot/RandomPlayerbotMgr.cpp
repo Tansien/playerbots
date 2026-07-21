@@ -1475,7 +1475,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 else if (creationIntent == living::kCreationIntentFinalized && postCreateSettled
                     && !sRandomPlayerbotMgr.SetValue(botGuid, "create pending", 0))
                     postCreateSettled = false;
-                else if (creationIntent != living::kCreationIntentFinalized)
+                else if (living::CreationIntentBlocksPostCreateSettlement(creationIntent))
                     postCreateSettled = false;
 
                 // Release from the schedule only from a KNOWN, valid always

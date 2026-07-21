@@ -15,6 +15,7 @@ namespace ai
     {
     public:
         TestAction(PlayerbotAI* ai, std::string name = "test");
+        ~TestAction() override { ctx.Reset(); }
         virtual bool Execute(Event& event) override;
         virtual bool isUseful() override { return true; }
         virtual bool isPossible() override { return bot != nullptr; }
