@@ -834,6 +834,7 @@ bool PlayerbotAIConfig::Initialize()
         // The report is built and logged before any side-effectful bootstrap below
         // (in particular RandomPlayerbotFactory::CreateRandomBots).
         living::LegacyCompatibilityInputs legacyInputs;
+        legacyInputs.disableRandomLevels = disableRandomLevels;
         legacyInputs.instantRandomize = instantRandomize;
         legacyInputs.randomGearUpgradeEnabled = randomGearUpgradeEnabled;
         legacyInputs.rndBotCheatMask = rndBotCheatMask;

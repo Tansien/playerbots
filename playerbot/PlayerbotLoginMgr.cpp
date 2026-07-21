@@ -298,7 +298,8 @@ bool PlayerLoginInfo::LoginBot()
 
     // The character may have entered durable deletion after this holder was
     // queued or loaded. The final materialization boundary must fail closed.
-    if (PlayerbotHolder::IsDeletionPending(guid))
+    if (PlayerbotHolder::IsDeletionPending(guid)
+        || sRandomPlayerbotMgr.IsLifecycleLoginBlocked(guid))
     {
         delete holder;
         holder = nullptr;

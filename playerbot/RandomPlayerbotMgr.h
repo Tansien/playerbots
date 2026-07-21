@@ -101,11 +101,28 @@ public:
             postCreateOwners.erase(botGuid);
             postCreateQuarantined.insert(botGuid);
         }
+        void QuarantineTemporaryBot(uint32 botGuid)
+        {
+            postCreateOwners.erase(botGuid);
+            temporaryBotQuarantined.insert(botGuid);
+        }
+        bool IsPostCreateQuarantined(uint32 botGuid) const
+        {
+            return postCreateQuarantined.count(botGuid) != 0;
+        }
+        bool IsLifecycleLoginBlocked(uint32 botGuid) const
+        {
+            return IsPostCreateQuarantined(botGuid)
+                || temporaryBotQuarantined.count(botGuid) != 0
+                || failedLoginCleanups.count(botGuid) != 0;
+        }
+        bool IsLoginCleanupPending(uint32 botGuid) const { return failedLoginCleanups.count(botGuid) != 0; }
         // Drops a guid from the transient owner set (its deletion was adopted).
         void ForgetPostCreateOwner(uint32 botGuid)
         {
             postCreateOwners.erase(botGuid);
             postCreateQuarantined.erase(botGuid);
+            temporaryBotQuarantined.erase(botGuid);
         }
         static void DatabasePing(QueryResult* result, uint32 pingStart, std::string db);
         void SetDatabaseDelay(std::string db, uint32 delay) {databaseDelay[db] = delay;}
@@ -128,7 +145,7 @@ public:
         // (relocation finalization retries a failed write; other callers may
         // ignore the result as before).
         bool ScheduleTeleport(uint32 bot, uint32 time = 0);
-        void ScheduleChangeStrategy(uint32 bot, uint32 time = 0);
+        bool ScheduleChangeStrategy(uint32 bot, uint32 time = 0);
         void HandleCommand(uint32 type, const std::string& text, Player& fromPlayer, std::string channelName = "", Team team = TEAM_BOTH_ALLOWED, uint32 lang = LANG_UNIVERSAL);
         std::string HandleRemoteCommand(std::string request);
         void OnPlayerLogout(Player* player);
@@ -229,7 +246,7 @@ public:
         void CheckLfgQueue();
         void CheckPlayers();
         void SaveCurTime();
-        void SyncEventTimers();
+        bool SyncEventTimers();
         void AddOfflineGroupBots();
         static Item* CreateTempItem(uint32 item, uint32 count, Player const* player, uint32 randomPropertyId = 0);
         static InventoryResult CanEquipUnseenItem(Player* player, uint8 slot, uint16& dest, uint32 item);
@@ -313,7 +330,7 @@ public:
         time_t OfflineGroupBotsTimer;
         uint32 AddRandomBots();
         bool ProcessBot(uint32 bot);
-        void ScheduleRandomize(uint32 bot, uint32 time);
+        bool ScheduleRandomize(uint32 bot, uint32 time);
         living::RelocationOutcome RandomTeleport(Player* bot, bool reviveRecovery = false);
         living::RelocationOutcome RandomTeleport(Player* bot, std::vector<WorldLocation> &locs, living::PendingRelocation flags, bool activeOnly = false);
         living::RelocationTracker relocations;
@@ -402,6 +419,16 @@ public:
         // Identity-mismatched durable creation intents stay inert for this
         // process; a restart may re-evaluate them after manual repair.
         std::set<uint32> postCreateQuarantined;
+        // Restart-scanned present temporary markers have no immutable identity
+        // and stay login-inert for this process unless deletion or a newly
+        // verified creation proves safe reuse of the GUID.
+        std::set<uint32> temporaryBotQuarantined;
+        // Login failures whose durable add/login clears were not confirmed.
+        // Retried independently of currentBots so a partial clear cannot lose
+        // its cleanup owner during durable-list reconciliation.
+        std::set<uint32> failedLoginCleanups;
+        bool eventTimersSynchronized = false;
+        uint32 eventTimerSyncCutoff = 0;
         // Bounded-backoff retry for a failed owner-reconstruction scan.
         bool postCreateScanFailed = false;
         uint32 postCreateScanRetryPasses = 0;
@@ -414,6 +441,7 @@ public:
         // the `create group` event; in-memory only - a restart simply retries
         // sooner).
         std::map<uint32, time_t> groupJoinBackoffUntil;
+        void RetryFailedLoginCleanups();
         BarGoLink* loginProgressBar;
         std::list<uint32> currentBots;
         std::list<uint32> arenaTeamMembers;

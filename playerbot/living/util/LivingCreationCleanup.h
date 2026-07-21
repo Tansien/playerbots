@@ -27,9 +27,12 @@ namespace living
     //   - ownership is secured by Adopt* BEFORE any acknowledgement;
     //   - Pump PEEKS each token (acknowledge = false) and keeps owning it while
     //     it is still Pending;
-    //   - a finalized temporary character is deleted EXACTLY ONCE (a Created
-    //     single, or every finalized GUID of a COMPLETE batch), and only THEN is
-    //     the terminal result acknowledged and ownership dropped;
+    //   - once terminal, the finalized GUIDs are copied into this owner's own
+    //     ledger and the bounded poll result is acknowledged immediately, so a
+    //     prolonged deletion-intent outage cannot make token expiry lose them;
+    //   - a finalized temporary character is handed to the durable deletion
+    //     owner EXACTLY ONCE (a Created single, or every finalized GUID of a
+    //     COMPLETE batch), then dropped from this ledger;
     //   - a batch is never acted on while Pending, so a partial batch's
     //     finalized GUIDs are never deleted out from under the still-live batch;
     //   - quarantined / failed outcomes expose no GUID, so nothing is deleted
@@ -44,8 +47,7 @@ namespace living
         // Deletes one finalized temporary character by GUID (DeleteBot) and
         // returns whether DURABLE DELETION OWNERSHIP was secured (the
         // fail-closed deletion path refuses when its intent cannot be
-        // persisted). On false the caller must NOT acknowledge or drop its
-        // cleanup token - the character would be orphaned with no owner.
+        // persisted). On false the copied GUID stays in this cleanup ledger.
         std::function<bool(uint32_t /*guid*/)> deleteCharacter;
     };
 
@@ -60,7 +62,7 @@ namespace living
         void AdoptSingle(uint64_t token)
         {
             if (token && singles.size() < kMaxAdopted)
-                singles.push_back(token);
+                singles.push_back(SingleCleanup{ token, 0 });
         }
 
         void AdoptBatch(uint64_t token)
@@ -73,72 +75,77 @@ namespace living
         {
             for (auto it = singles.begin(); it != singles.end();)
             {
-                // Peek WITHOUT acknowledging: ownership is retained until the
-                // record reaches a terminal state and any finalized character
-                // has SECURED durable deletion ownership.
-                CreationPollResult const poll = ops.pollSingle ? ops.pollSingle(*it, false) : CreationPollResult{};
-                if (poll.status == CreationPollStatus::Pending)
+                if (it->token)
                 {
-                    ++it; // still being created: keep owning it
-                    continue;
+                    CreationPollResult const poll = ops.pollSingle
+                        ? ops.pollSingle(it->token, false) : CreationPollResult{};
+                    if (poll.status == CreationPollStatus::Pending)
+                    {
+                        ++it; // still being created: keep owning it
+                        continue;
+                    }
+
+                    if (poll.status != CreationPollStatus::Created || !poll.guid)
+                    {
+                        if (ops.pollSingle)
+                            ops.pollSingle(it->token, true);
+                        it = singles.erase(it);
+                        continue;
+                    }
+
+                    // Transfer terminal ownership out of the expiring poll
+                    // surface before retrying the durable deletion boundary.
+                    it->guid = poll.guid;
+                    if (ops.pollSingle)
+                        ops.pollSingle(it->token, true);
+                    it->token = 0;
                 }
 
-                // Only a confirmed-created record exposes a GUID. If durable
-                // deletion ownership could not be secured (fail-closed intent
-                // write refused), KEEP this token and retry next pump -
-                // acknowledging now would orphan the character forever.
-                if (poll.status == CreationPollStatus::Created && poll.guid && ops.deleteCharacter
-                    && !ops.deleteCharacter(poll.guid))
+                if (!ops.deleteCharacter || !ops.deleteCharacter(it->guid))
                 {
                     ++it;
                     continue;
                 }
 
-                // Acknowledge only now that cleanup is secured, then drop it.
-                if (ops.pollSingle)
-                    ops.pollSingle(*it, true);
                 it = singles.erase(it);
             }
 
             for (auto it = batches.begin(); it != batches.end();)
             {
-                BatchPollResult const poll = ops.pollBatch ? ops.pollBatch(it->token, false) : BatchPollResult{};
-                if (poll.status == BatchPollStatus::Pending)
+                if (it->token)
                 {
-                    ++it; // a live batch may still finalize/act on members: never touch its GUIDs
-                    continue;
-                }
-
-                // A COMPLETE batch is done acting on its finalized members.
-                // Each member must SECURE deletion ownership exactly once;
-                // members that already secured are never re-processed while a
-                // refused member keeps the whole token alive for a retry.
-                // Unknown = already acknowledged/expired: just drop it.
-                if (poll.status == BatchPollStatus::Complete)
-                {
-                    bool allSecured = true;
-                    for (uint32_t guid : poll.finalizedGuids)
+                    BatchPollResult const poll = ops.pollBatch
+                        ? ops.pollBatch(it->token, false) : BatchPollResult{};
+                    if (poll.status == BatchPollStatus::Pending)
                     {
-                        if (it->securedGuids.count(guid))
-                            continue;
-                        if (ops.deleteCharacter && !ops.deleteCharacter(guid))
-                        {
-                            allSecured = false;
-                            continue;
-                        }
-                        it->securedGuids.insert(guid);
-                    }
-
-                    if (!allSecured)
-                    {
-                        ++it; // retry ONLY the unsecured members next pump
+                        ++it; // a live batch may still finalize/act on members: never touch its GUIDs
                         continue;
                     }
 
+                    if (poll.status != BatchPollStatus::Complete)
+                    {
+                        it = batches.erase(it);
+                        continue;
+                    }
+
+                    it->pendingGuids.insert(poll.finalizedGuids.begin(), poll.finalizedGuids.end());
                     if (ops.pollBatch)
                         ops.pollBatch(it->token, true);
+                    it->token = 0;
                 }
-                it = batches.erase(it);
+
+                for (auto guid = it->pendingGuids.begin(); guid != it->pendingGuids.end();)
+                {
+                    if (ops.deleteCharacter && ops.deleteCharacter(*guid))
+                        guid = it->pendingGuids.erase(guid);
+                    else
+                        ++guid;
+                }
+
+                if (it->pendingGuids.empty())
+                    it = batches.erase(it);
+                else
+                    ++it;
             }
         }
 
@@ -147,15 +154,19 @@ namespace living
         bool Empty() const { return singles.empty() && batches.empty(); }
 
     private:
+        struct SingleCleanup
+        {
+            uint64_t token = 0;
+            uint32_t guid = 0;
+        };
+
         struct BatchCleanup
         {
             uint64_t token = 0;
-            // Finalized members whose durable deletion ownership is secured:
-            // never re-processed while failed members retry.
-            std::set<uint32_t> securedGuids;
+            std::set<uint32_t> pendingGuids;
         };
 
-        std::vector<uint64_t> singles;
+        std::vector<SingleCleanup> singles;
         std::vector<BatchCleanup> batches;
     };
 

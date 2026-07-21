@@ -69,7 +69,9 @@ namespace living
 
         bool IsRuntimeActive() const
         {
-            return enabledRaw == LivingRealmBool::True && profile == LivingRealmProfile::Organic;
+            return enabledRaw == LivingRealmBool::True
+                && strictRaw != LivingRealmBool::Malformed
+                && profile == LivingRealmProfile::Organic;
         }
     };
 }

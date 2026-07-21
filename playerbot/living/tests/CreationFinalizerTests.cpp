@@ -807,12 +807,14 @@ LIVING_TEST(creation_batch_outstanding_slots_hold_the_group_deficit)
 LIVING_TEST(creation_batch_registry_is_bounded_and_prunes_expired)
 {
     CreationBatchRegistry registry;
+    LIVING_CHECK(registry.CanAdmit());
     for (size_t i = 0; i < CreationBatchRegistry::kMaxBatches; ++i)
     {
         CreationBatchRegistry::Batch batch;
         batch.members = { PendingMember(static_cast<uint64_t>(i + 1), 1, 1) };
         LIVING_CHECK(registry.Begin(std::move(batch)) != 0);
     }
+    LIVING_CHECK(!registry.CanAdmit());
 
     // The bounded registry refuses the next batch (callers report the run as
     // unmonitored instead of silently dropping members).

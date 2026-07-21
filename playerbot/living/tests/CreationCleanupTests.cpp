@@ -639,11 +639,11 @@ LIVING_TEST(durable_deletion_recovery_present_rows_quarantine_not_redelete)
     LIVING_CHECK(!inProcess.IsQuarantined(7072));
 }
 
-LIVING_TEST(abandoned_cleanup_retains_tokens_until_deletion_ownership_secured)
+LIVING_TEST(abandoned_cleanup_copies_terminal_guids_until_deletion_ownership_secured)
 {
     // Fail-closed DeleteBot can refuse (intent write failure): the cleanup
-    // owner must keep its token and retry - acknowledging would orphan the
-    // temporary character with no owner anywhere.
+    // owner must copy the terminal GUID and retry independently of the bounded
+    // finalizer/batch poll-result retention.
     CreationFinalizer finalizer;
     CreationBatchRegistry registry;
     AbandonedCreationCleanup cleanup;
@@ -661,13 +661,17 @@ LIVING_TEST(abandoned_cleanup_retains_tokens_until_deletion_ownership_secured)
     finalizer.OnCallbackResult(721, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
     finalizer.Pump(HappyOps());
 
-    cleanup.Pump(ops); // deletion refused: token retained
+    cleanup.Pump(ops); // deletion refused: GUID retained, terminal token released
     LIVING_CHECK(deleted == std::vector<uint32_t>{ 721 });
     LIVING_CHECK(cleanup.PendingSingles() == 1);
-    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Created); // NOT acknowledged
+    LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Unknown);
+
+    // Retry remains owned after longer than the source token's retention.
+    for (uint64_t pump = 0; pump <= CreationFinalizer::kCompletionRetentionPumps; ++pump)
+        finalizer.Pump(HappyOps());
 
     ownershipSecured = true;
-    cleanup.Pump(ops); // retry succeeds: token acknowledged and dropped
+    cleanup.Pump(ops); // retry succeeds from the copied GUID
     LIVING_CHECK(cleanup.PendingSingles() == 0);
     LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Unknown);
 
@@ -690,13 +694,15 @@ LIVING_TEST(abandoned_cleanup_retains_tokens_until_deletion_ownership_secured)
         return !(guid == 732 && refuse732);
     };
 
-    cleanup.Pump(ops); // 731 secured, 732 refused -> batch token retained
+    cleanup.Pump(ops); // 731 secured, copied 732 remains -> batch token released
     LIVING_CHECK(cleanup.PendingBatches() == 1);
-    LIVING_CHECK(registry.Poll(batchToken, false).status == BatchPollStatus::Complete); // not acknowledged
+    LIVING_CHECK(registry.Poll(batchToken, false).status == BatchPollStatus::Unknown);
+
+    registry.PruneExpired(1 + CreationBatchRegistry::kRetentionPumps);
 
     deleted.clear();
     refuse732 = false;
-    cleanup.Pump(ops); // retry processes ONLY the unsecured member
+    cleanup.Pump(ops); // retry processes ONLY the copied unsecured member
     LIVING_CHECK(deleted == std::vector<uint32_t>{ 732 }); // 731 never re-deleted
     LIVING_CHECK(cleanup.PendingBatches() == 0);
     LIVING_CHECK(registry.Poll(batchToken, false).status == BatchPollStatus::Unknown); // acknowledged now
