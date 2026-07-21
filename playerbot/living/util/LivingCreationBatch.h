@@ -142,6 +142,8 @@ namespace living
         static constexpr uint32_t kMaxTransientAttempts = 60;
         static constexpr uint64_t kTransientBackoffPumps = 100; // ~5s of ticks
 
+        bool CanAdmit() const { return batches.size() < kMaxBatches; }
+
         // Registers a batch. Returns 0 when the bounded registry is full (the
         // caller reports the run as unmonitored rather than dropping members
         // silently).

@@ -1911,10 +1911,10 @@ std::string PlayerbotHolder::HandleBotAddLogin(Player* bot, Player* master, cons
     bool isMasterAccount = (masterAccountId == botAccount);
     bool isRandomAccount = sPlayerbotAIConfig.IsInRandomAccountList(botAccount);
 
-    // Every add/login path must recheck the deletion state: a
-    // deletion-pending character may never log in.
-    if (PlayerbotHolder::IsDeletionPending(guid.GetCounter()))
-        return "Add refused: a character deletion is pending for this guid";
+    // Every add/login path must recheck lifecycle quarantine and deletion.
+    if (PlayerbotHolder::IsDeletionPending(guid.GetCounter())
+        || sRandomPlayerbotMgr.IsLifecycleLoginBlocked(guid.GetCounter()))
+        return "Add refused: lifecycle state for this guid is quarantined or pending deletion";
 
     if (isRandomAccount)
         sRandomPlayerbotMgr.AddRandomBot(guid);
@@ -2297,6 +2297,11 @@ namespace ai
             };
             ops.onCreated = [this](uint32 guid, uint32 accountId, std::string const& name, bool autoAdd)
             {
+                // Finalizer identity verification proved this occupant belongs
+                // to the creation. Clear any older restart quarantine before
+                // exposing it; obligation-bearing records register below.
+                sRandomPlayerbotMgr.ForgetPostCreateOwner(guid);
+
                 // Only now is the GUID exposed and the creation complete.
                 // Deduplicated: a `.bot always` issued while the creation was
                 // pending may already have scheduled this guid.
@@ -2712,6 +2717,7 @@ bool PlayerbotHolder::ReadoptPendingCreations()
                     // finalized transition and exposure. REPLAY the idempotent
                     // exposure first (restoring login=1 where authorized),
                     // then clear with confirmation.
+                    sRandomPlayerbotMgr.ForgetPostCreateOwner(guid);
                     if (autoAdd && !sPlayerbotAIConfig.IsFreeAltBot(guid))
                         sPlayerbotAIConfig.freeAltBots.push_back(std::make_pair(recordedAccount, guid));
                     if (!sRandomPlayerbotMgr.SetValue(guid, "create pending", 0))
@@ -2862,9 +2868,13 @@ namespace ai
             {
                 case living::CreationPollStatus::Created:
                     break; // onCreated already logged
+                case living::CreationPollStatus::Quarantined:
+                    sRandomPlayerbotMgr.QuarantinePostCreateOwner(completion.guid);
+                    sLog.outError("Bot creation for '%s' (guid %u): %s",
+                        completion.name.c_str(), completion.guid, completion.message.c_str());
+                    break;
                 case living::CreationPollStatus::FailedRetryable:
                 case living::CreationPollStatus::FailedTerminal:
-                case living::CreationPollStatus::Quarantined:
                 default:
                     sLog.outError("Bot creation for '%s' (guid %u): %s",
                         completion.name.c_str(), completion.guid, completion.message.c_str());
@@ -3376,9 +3386,9 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             return result;
         };
 
-        if (IsDeletionPending(botGuid))
+        if (IsDeletionPending(botGuid) || sRandomPlayerbotMgr.IsLoginCleanupPending(botGuid))
             return tearDownTransient(living::BotCreateStatus::TransientFailure,
-                "Allocated character id is owned by a pending deletion (or deletion state is not yet known); "
+                "Allocated character id has pending deletion/login cleanup ownership; "
                 "creation refused and retried with pacing");
 
         {
@@ -3716,6 +3726,14 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
                 + std::to_string(outstandingSlots) + " outstanding member slot(s)); no additional members queued");
             return messages;
         }
+    }
+
+    // Confirm completion-ledger capacity before queueing any character saves.
+    // The world-thread preflight stays stable through this synchronous loop.
+    if (!existingToken && currentGroupSize < groupSize && !ai::botCreationBatches.CanAdmit())
+    {
+        messages.push_back("Group creation is busy; no members were queued (batch registry full)");
+        return messages;
     }
 
     living::GroupCreationLedger ledger;

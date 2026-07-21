@@ -13,6 +13,7 @@ namespace
     LegacyCompatibilityInputs CleanLegacyInputs()
     {
         LegacyCompatibilityInputs inputs;
+        inputs.disableRandomLevels = true;
         inputs.asyncBotLogin = true;
         inputs.populationInspection = PopulationInspection::Clean;
         inputs.livingSchemaPresent = true;
@@ -22,6 +23,7 @@ namespace
     LegacyCompatibilityInputs ConflictingLegacyInputs()
     {
         LegacyCompatibilityInputs inputs;
+        inputs.disableRandomLevels = false;
         inputs.instantRandomize = true;
         inputs.randomGearUpgradeEnabled = true;
         inputs.rndBotCheatMask = 0x25; // taxi|item|breath, the shipped default
@@ -138,6 +140,7 @@ LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
     LivingRealmConfig const badStrict = LivingRealmConfig::FromRawValues("1", "organic", "2");
     LIVING_CHECK(badStrict.strictRaw == LivingRealmBool::Malformed);
     LIVING_CHECK(badStrict.strict);
+    LIVING_CHECK(!badStrict.IsRuntimeActive());
     EffectiveConfigReport const strictReport = BuildEffectiveConfigReport(badStrict, CleanLegacyInputs());
     LIVING_CHECK(CountReason(strictReport, ConfigReasonCode::MalformedBoolean) == 1);
     LIVING_CHECK(strictReport.HasBlockingEntry());
@@ -208,7 +211,12 @@ LIVING_TEST(config_report_represents_every_required_conflict)
     EffectiveConfigReport const report = BuildEffectiveConfigReport(
         LivingRealmConfig::FromValues(true, "organic", true), ConflictingLegacyInputs());
 
-    LIVING_CHECK(CountReason(report, ConfigReasonCode::RandomizationConflict) == 2);
+    LIVING_CHECK(CountReason(report, ConfigReasonCode::RandomizationConflict) == 3);
+    bool disableRandomLevelsReported = false;
+    for (EffectiveConfigEntry const& entry : report.entries)
+        if (entry.key == "AiPlayerbot.DisableRandomLevels")
+            disableRandomLevelsReported = entry.configuredValue == "0" && entry.effectiveValue == "1";
+    LIVING_CHECK(disableRandomLevelsReported);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::CheatMaskConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::XpRateConflict) == 1);
     LIVING_CHECK(CountReason(report, ConfigReasonCode::QuestSyncConflict) == 2);

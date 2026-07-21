@@ -78,6 +78,7 @@ namespace living
     // reads no global configuration.
     struct LegacyCompatibilityInputs
     {
+        bool disableRandomLevels = false;        // AiPlayerbot.DisableRandomLevels
         bool instantRandomize = false;           // AiPlayerbot.InstantRandomize
         bool randomGearUpgradeEnabled = false;   // AiPlayerbot.RandomGearUpgradeEnabled
         uint32_t rndBotCheatMask = 0;            // parsed AiPlayerbot.RndBotCheats

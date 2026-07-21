@@ -111,6 +111,10 @@ namespace living
         // Legacy fabrication settings the Organic profile forces to their
         // fail-closed values (0002 section 3 mandatory outcomes). Enforcement
         // points quote the 0002A matrix column.
+        if (!legacy.disableRandomLevels)
+            AddConflict(report, config.strict, "AiPlayerbot.DisableRandomLevels", "0", "1",
+                "manager/factory entry", ConfigReasonCode::RandomizationConflict);
+
         if (legacy.instantRandomize)
             AddConflict(report, config.strict, "AiPlayerbot.InstantRandomize", "1", "0",
                 "manager/factory entry", ConfigReasonCode::RandomizationConflict);

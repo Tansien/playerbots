@@ -273,6 +273,10 @@ RandomPlayerbotMgr::RandomPlayerbotMgr()
 {
     if (sPlayerbotAIConfig.enabled && sPlayerbotAIConfig.randomBotAutologin)
     {
+        eventTimersSynchronized = SyncEventTimers();
+        if (!eventTimersSynchronized)
+            sLog.outError("RandomPlayerbotMgr: event timer synchronization failed; bot event loading deferred");
+
         sPlayerbotCommandServer.Start();
         PrepareTeleportCache();
 
@@ -305,15 +309,16 @@ RandomPlayerbotMgr::RandomPlayerbotMgr()
         guildsDeleted = false;
         arenaTeamsDeleted = false;
 
-        std::list<uint32> availableBots = GetBots();
-
-        for (auto& bot : availableBots)
+        if (eventTimersSynchronized)
         {
-            // Typed gate: only a KNOWN set login flag is swept; an unknown
-            // read must not trigger the write.
-            uint32 loginFlag = 0;
-            if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
-                SetEventValue(bot, "login", 0, 0);
+            for (uint32 bot : GetBots())
+            {
+                // Typed gate: only a KNOWN set login flag is swept; an unknown
+                // read must not trigger the write.
+                uint32 loginFlag = 0;
+                if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
+                    SetEventValue(bot, "login", 0, 0);
+            }
         }
 
 #ifndef MANGOSBOT_ZERO
@@ -330,9 +335,6 @@ RandomPlayerbotMgr::RandomPlayerbotMgr()
             } while (results->NextRow());
         }
 #endif
-        // sync event timers
-        SyncEventTimers();
-
         for (uint32 i = 0; i < sMapStore.GetNumRows(); ++i)
         {
             if (!sMapStore.LookupEntry(i))
@@ -658,6 +660,28 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
 
     if (!sPlayerbotAIConfig.randomBotAutologin || !sPlayerbotAIConfig.enabled)
         return;
+
+    // Timer rows must be shifted before any per-bot event cache is loaded.
+    // A failed confirmed write retries on a later update and admits no bot
+    // work from unsynchronized deadlines.
+    if (!eventTimersSynchronized)
+    {
+        if (!SyncEventTimers())
+        {
+            SetAIInternalUpdateDelay(sPlayerbotAIConfig.randomBotUpdateInterval);
+            return;
+        }
+
+        eventTimersSynchronized = true;
+        for (uint32 bot : GetBots())
+        {
+            uint32 loginFlag = 0;
+            if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
+                SetEventValue(bot, "login", 0, 0);
+        }
+    }
+
+    RetryFailedLoginCleanups();
 
 #ifdef GenerateBotTests
     if (sPlayerbotAIConfig.startupRunTestsPending)
@@ -1014,7 +1038,7 @@ void RandomPlayerbotMgr::LoginFreeBots()
 
         for (auto [accountId, botGuid, mayAutoLogin] : sweep)
         {
-            if (postCreateQuarantined.count(botGuid))
+            if (IsLifecycleLoginBlocked(botGuid))
                 continue;
 
             ObjectGuid guid(ObjectGuid(HIGHGUID_PLAYER, botGuid));
@@ -2436,7 +2460,8 @@ void RandomPlayerbotMgr::AddOfflineGroupBots()
                         if (bot.second == guid)
                         {
                             Player* player = GetPlayerBot(bot.second);
-                            if (!player && !PlayerbotHolder::IsDeletionPending(bot.second))
+                            if (!player && !PlayerbotHolder::IsDeletionPending(bot.second)
+                                && !IsLifecycleLoginBlocked(bot.second))
                             {
                                 AddPlayerBot(bot.second, bot.first);
                             }
@@ -2511,15 +2536,38 @@ void RandomPlayerbotMgr::SaveCurTime()
     SetValue(uint32(0), "current_time", uint32(time(nullptr)));
 }
 
-void RandomPlayerbotMgr::SyncEventTimers()
+bool RandomPlayerbotMgr::SyncEventTimers()
 {
-    uint32 oldTime = GetValue(uint32(0), "current_time");
-    if (oldTime)
-    {
-        uint32 curTime = time(nullptr);
-        uint32 timeDiff = curTime - oldTime;
-        CharacterDatabase.PExecute("UPDATE ai_playerbot_random_bots SET time = time + %u WHERE owner = 0 AND bot <> 0", timeDiff);
-    }
+    // Fixed across retries: bootstrap may continue after the first failed
+    // read/write and create fresh event rows. Those rows must never receive
+    // the preceding server-downtime shift on a later retry.
+    if (!eventTimerSyncCutoff)
+        eventTimerSyncCutoff = static_cast<uint32>(time(nullptr));
+
+    uint32 oldTime = 0;
+    if (!TryGetEventValue(0, "current_time", oldTime))
+        return false;
+
+    if (!oldTime || oldTime >= eventTimerSyncCutoff)
+        return true;
+
+    // Advance the restart sentinel in the SAME atomic statement as every
+    // shifted deadline. If execution is reported uncertain but actually
+    // landed, the retry reloads the new sentinel and cannot double-shift.
+    bool const synchronized = CharacterDatabase.DirectPExecute(
+        "UPDATE ai_playerbot_random_bots SET `time` = CASE "
+        "WHEN bot = 0 AND event = 'current_time' THEN %u ELSE `time` + %u END, "
+        "`value` = CASE WHEN bot = 0 AND event = 'current_time' THEN %u ELSE `value` END "
+        "WHERE owner = 0 AND ((bot <> 0 AND `time` < %u) OR (bot = 0 AND event = 'current_time'))",
+        eventTimerSyncCutoff, eventTimerSyncCutoff - oldTime,
+        eventTimerSyncCutoff, eventTimerSyncCutoff);
+
+    // Any cache loaded before this boundary describes pre-shift timestamps.
+    // Force the next typed read to reload durable truth on both success and
+    // an uncertain result (whose statement may still have landed).
+    eventCache.clear();
+    eventCacheLoadState.clear();
+    return synchronized;
 }
 
 void RandomPlayerbotMgr::CheckPlayers()
@@ -2555,9 +2603,9 @@ void RandomPlayerbotMgr::CheckPlayers()
     return;
 }
 
-void RandomPlayerbotMgr::ScheduleRandomize(uint32 bot, uint32 time)
+bool RandomPlayerbotMgr::ScheduleRandomize(uint32 bot, uint32 time)
 {
-    SetEventValue(bot, "randomize", 1, time);
+    return SetEventValue(bot, "randomize", 1, time);
 }
 
 bool RandomPlayerbotMgr::ScheduleTeleport(uint32 bot, uint32 time)
@@ -2567,15 +2615,18 @@ bool RandomPlayerbotMgr::ScheduleTeleport(uint32 bot, uint32 time)
     return SetEventValue(bot, "teleport", 1, time);
 }
 
-void RandomPlayerbotMgr::ScheduleChangeStrategy(uint32 bot, uint32 time)
+bool RandomPlayerbotMgr::ScheduleChangeStrategy(uint32 bot, uint32 time)
 {
     if (!time)
         time = urand(sPlayerbotAIConfig.minRandomBotChangeStrategyTime, sPlayerbotAIConfig.maxRandomBotChangeStrategyTime);
-    SetEventValue(bot, "change_strategy", 1, time);
+    return SetEventValue(bot, "change_strategy", 1, time);
 }
 
 bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
 {
+    if (IsLifecycleLoginBlocked(bot))
+        return false;
+
     Player* player = GetPlayerBot(bot);
     if (player)
         return true;
@@ -2614,9 +2665,9 @@ bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
           priorUpdate, RemainingValidity(bot, "update") },
     };
 
-    if (PlayerbotHolder::IsDeletionPending(bot))
+    if (PlayerbotHolder::IsDeletionPending(bot) || IsLifecycleLoginBlocked(bot))
     {
-        sLog.outDetail("AddRandomBot: refusing guid %u - a character deletion is pending", bot);
+        sLog.outDetail("AddRandomBot: refusing guid %u - lifecycle state is quarantined or deletion-pending", bot);
         return false;
     }
 
@@ -2644,6 +2695,9 @@ void RandomPlayerbotMgr::MovePlayerBot(uint32 guid, PlayerbotHolder* newHolder)
 
 bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 {
+    if (IsLifecycleLoginBlocked(bot))
+        return false;
+
     Player* player = GetPlayerBot(bot);
     if (player && sPlayerbotAIConfig.IsFreeAltBot(player))
     {
@@ -2741,8 +2795,8 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
               priorUpdate, RemainingValidity(bot, "update") },
         };
 
-        if (PlayerbotHolder::IsDeletionPending(bot))
-            return false; // deletion-pending characters never log in
+        if (PlayerbotHolder::IsDeletionPending(bot) || IsLifecycleLoginBlocked(bot))
+            return false; // lifecycle-quarantined/deletion-pending characters never log in
 
         if (!RunActivationPlan(bot, plan))
             return false;
@@ -2767,34 +2821,36 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     //Update the bot
     if (!update)
     {
-        //Clean up expired values
-        if (ai && !ai->HasStrategy("debug", BotState::BOT_STATE_NON_COMBAT))
-            ai->GetAiObjectContext()->ClearExpiredValues();
-
-        //Randomize/teleport bot
+        bool shouldProcess = false;
         if (!sPlayerbotAIConfig.disableRandomLevels)
         {
             if (player->GetGroup() || player->IsTaxiFlying())
                 return false;
 
-            bool update = true;
+            shouldProcess = true;
             if (ai)
             {
                 if (!sRandomPlayerbotMgr.IsRandomBot(player))
-                    update = false;
+                    shouldProcess = false;
 
                 if (player->GetGroup() && ai->GetGroupMaster() && (!ai->GetGroupMaster()->GetPlayerbotAI() || ai->GetGroupMaster()->GetPlayerbotAI()->IsRealPlayer()))
-                    update = false;
+                    shouldProcess = false;
 
                 if (ai->HasPlayerNearby())
-                    update = false;
+                    shouldProcess = false;
             }
-            if (update)
-                ProcessBot(player);
         }
 
         uint32 randomTime = urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime * 5);
-        SetEventValue(bot, "update", 1, randomTime);
+        if (!SetEventValue(bot, "update", 1, randomTime))
+            return false;
+
+        // No due-work side effect runs until the next manager deadline is
+        // execution-confirmed. A failed lease leaves the expired state to retry.
+        if (ai && !ai->HasStrategy("debug", BotState::BOT_STATE_NON_COMBAT))
+            ai->GetAiObjectContext()->ClearExpiredValues();
+        if (shouldProcess)
+            ProcessBot(player);
         return true;
     }
 
@@ -2851,6 +2907,10 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
 
             if (randomiser)
             {
+                uint32 const randomTime = urand(sPlayerbotAIConfig.minRandomBotRandomizeTime,
+                    sPlayerbotAIConfig.maxRandomBotRandomizeTime);
+                if (!ScheduleRandomize(bot, randomTime))
+                    return false;
                 Randomize(player);
                 return true;
             }
@@ -2860,9 +2920,10 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
         {
             if (sPlayerbotAIConfig.enableRandomTeleports)
             {
+                if (!ScheduleChangeStrategy(bot))
+                    return false;
                 sLog.outDetail("Changing strategy for bot #%d %s:%d <%s>", bot, player->GetTeam() == ALLIANCE ? "A" : "H", player->GetLevel(), player->GetName());
                 ChangeStrategy(player);
-                ScheduleChangeStrategy(bot);
             }
             else
             {
@@ -4999,9 +5060,36 @@ void RandomPlayerbotMgr::OnPlayerLogin(Player* player)
 
 void RandomPlayerbotMgr::OnPlayerLoginError(uint32 bot)
 {
-    SetEventValue(bot, "add", 0, 0);
-    SetEventValue(bot, "login", 0, 0);
+    bool cleared = SetEventValue(bot, "add", 0, 0);
+    cleared = SetEventValue(bot, "login", 0, 0) && cleared;
     currentBots.remove(bot);
+    if (!cleared)
+    {
+        failedLoginCleanups.insert(bot);
+        currentBotsDirty = true;
+        sLog.outError("OnPlayerLoginError: activation clear for bot %u not confirmed; bot list marked dirty", bot);
+    }
+    else
+        failedLoginCleanups.erase(bot);
+}
+
+void RandomPlayerbotMgr::RetryFailedLoginCleanups()
+{
+    for (auto it = failedLoginCleanups.begin(); it != failedLoginCleanups.end();)
+    {
+        uint32 const bot = *it;
+        bool cleared = SetEventValue(bot, "add", 0, 0);
+        cleared = SetEventValue(bot, "login", 0, 0) && cleared;
+        if (!cleared)
+        {
+            currentBotsDirty = true;
+            ++it;
+            continue;
+        }
+
+        currentBots.remove(bot);
+        it = failedLoginCleanups.erase(it);
+    }
 }
 
 Player* RandomPlayerbotMgr::GetRandomPlayer()
@@ -6164,11 +6252,11 @@ void RandomPlayerbotMgr::OnBotDeleted(uint32 botGuid, uint32 accountId)
         maxCharsPerAccount = 10;
     #endif
     
-        // Typed count: the cores collapse a FAILED count query to zero, and a
-        // zero here DELETES the account (and any characters it still has).
-        // Unknown occupancy must never be treated as empty.
+        // Effective count includes pending creation reservations. The cores
+        // collapse a FAILED durable query to zero, and a zero here DELETES the
+        // account; unknown or reserved occupancy must never look empty.
         uint32 remainingCharacters = 0;
-        if (TryGetDurableCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
+        if (TryGetEffectiveCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
         {
             std::ostringstream prefix;
             prefix << sPlayerbotAIConfig.randomBotAccountPrefix;

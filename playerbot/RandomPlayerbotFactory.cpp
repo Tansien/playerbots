@@ -718,25 +718,20 @@ void RandomPlayerbotFactory::CreateRandomBots()
         "DELETE apr FROM ai_playerbot_random_bots apr JOIN characters c ON c.guid = apr.bot "
         "WHERE apr.event = 'temporary' AND c.name <> apr.data");
 
-    auto temporarybots = CharacterDatabase.Query("SELECT characters.guid FROM ai_playerbot_random_bots JOIN characters ON (characters.guid = ai_playerbot_random_bots.bot AND characters.name = ai_playerbot_random_bots.data) WHERE ai_playerbot_random_bots.event = 'temporary'");
-
-    if (temporarybots)
+    // A present same-name row is intentionally retained. Across a restart the
+    // marker has no immutable nonce proving that the current GUID occupant is
+    // the temporary character rather than a reused GUID; automatic deletion
+    // would therefore be destructive. Exact recovery needs a schema identity
+    // token and is outside this cleanup pass.
+    if (auto temporaryBots = CharacterDatabase.Query(
+            "SELECT characters.guid FROM ai_playerbot_random_bots JOIN characters ON "
+            "(characters.guid = ai_playerbot_random_bots.bot AND characters.name = ai_playerbot_random_bots.data) "
+            "WHERE ai_playerbot_random_bots.event = 'temporary'"))
     {
-        sLog.outString("Deleting temporary bots");
-
         do
         {
-            Field* fields = temporarybots->Fetch();
-            uint32 guid = fields[0].GetUInt32();
-
-            // DeleteBot queues the deletion and ADOPTS it into the durable
-            // confirmer: the 'temporary' marker (with the bot's other event
-            // rows) is removed - and the empty-account cleanup runs - only
-            // once an execution-ordered readback confirms the character row
-            // absent. A crash or failed deletion leaves the marker for the
-            // next startup to retry instead of orphaning the character.
-            sRandomPlayerbotMgr.DeleteBot(ObjectGuid(HIGHGUID_PLAYER, guid), true);
-        } while (temporarybots->NextRow());
+            sRandomPlayerbotMgr.QuarantineTemporaryBot(temporaryBots->Fetch()[0].GetUInt32());
+        } while (temporaryBots->NextRow());
     }
 
     //Loop over randombot accounts that have no characters and delete them as well, to clean up after temporary bots.
@@ -753,7 +748,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
             // Typed count, same rule as above: unknown occupancy is never
             // "empty" when the next step is account deletion.
             uint32 remainingCharacters = 0;
-            if (PlayerbotHolder::TryGetDurableCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
+            if (PlayerbotHolder::TryGetEffectiveCharacterCount(accountId, remainingCharacters) && remainingCharacters == 0)
             {
                 sAccountMgr.DeleteAccount(accountId);
             }
