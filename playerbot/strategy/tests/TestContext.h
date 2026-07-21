@@ -51,6 +51,7 @@ namespace ai
         size_t cleanupPc;
         bool cleanupPrepared;
         bool whoResponded;
+        bool resultReported = false;
         TestResult result;                       
         std::string resultMessage;
         std::string testName;                    

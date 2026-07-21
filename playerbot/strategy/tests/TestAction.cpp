@@ -183,7 +183,8 @@ bool TestAction::Execute(Event& event)
 
     if (ctx.result != TestResult::PENDING)
     {
-        RunCleanup();
+        if (!RunCleanup())
+            return false;
         ReportResult();
         return true;
     }
@@ -201,7 +202,6 @@ bool TestAction::Execute(Event& event)
 
     if (ctx.pc >= (int)ctx.script.size())
     {
-        RunCleanup();
         SetResult(TestResult::PASS, "Script completed without explicit result");
         return true;
     }
@@ -244,8 +244,9 @@ bool TestAction::Execute(Event& event)
     }
     else
     {
-        RunCleanup();
         SetResult(commandResult, message.empty() ? "Command " + ctx.script[ctx.pc] + " failed" : message);
+        if (!RunCleanup())
+            return false;
     }
 
     return true;
@@ -279,17 +280,37 @@ TestResult TestAction::ExecuteCommand(const std::string& line, std::string& mess
     return TestResult::FAIL;
 }
 
-void TestAction::RunCleanup()
-{   
-    for (size_t i = static_cast<size_t>(std::max(0, ctx.pc)); i < ctx.script.size(); ++i)
+bool TestAction::RunCleanup()
+{
+    if (!ctx.cleanupPrepared)
+    {
+        ctx.deferredCleanups.clear();
+        ctx.cleanupPc = 0;
+        for (size_t i = static_cast<size_t>(std::max(0, ctx.pc)); i < ctx.script.size(); ++i)
+        {
+            for (auto const& command : commands)
+            {
+                if (dynamic_cast<TestCleanup*>(command.get()) && command->Matches(ctx.script[i]))
+                {
+                    ctx.deferredCleanups.push_back(ctx.script[i]);
+                    break;
+                }
+            }
+        }
+        ctx.cleanupPrepared = true;
+    }
+
+    while (ctx.cleanupPc < ctx.deferredCleanups.size())
     {
         std::string message;
+        TestResult const result = ExecuteCommand(ctx.deferredCleanups[ctx.cleanupPc], message);
+        if (result == TestResult::PENDING)
+            return false;
 
-        if (!dynamic_cast<TestCleanup*>(commands[i].get()))
-            continue;
-
-        TestResult commandResult = ExecuteCommand(ctx.script[ctx.pc], message);        
+        ++ctx.cleanupPc;
     }
+
+    return true;
 }
 
 void TestAction::CheckMonitors()
@@ -344,47 +365,58 @@ void TestAction::ReportResult()
     if (ctx.result == TestResult::PENDING)
         return;
 
-    std::string resultStr;
-    switch (ctx.result)
-    {
-        case TestResult::PASS: resultStr = "PASS"; break;
-        case TestResult::FAIL: resultStr = "FAIL"; break;
-        case TestResult::ABORT: resultStr = "ABORT"; break;
-        case TestResult::IMPOSSIBLE: resultStr = "IMPOSSIBLE"; break;
-        default: resultStr = "UNKNOWN"; break;
-    }
-
-    time_t now = time(nullptr);
-    char timestamp[64];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
-
-    std::string logLine = "[BOTTEST] " + std::string(timestamp) + " | " +
-        bot->GetName() + " | " + ctx.testName + " | " + resultStr + " | " +
-                          ctx.resultMessage;
-    LogToConsole(logLine);
-    LogToFile(logLine);
-
     RESET_AI_VALUE2(bool, "manual bool", "is running test");
 
+    if (!ctx.resultReported)
+    {
+        std::string resultStr;
+        switch (ctx.result)
+        {
+            case TestResult::PASS: resultStr = "PASS"; break;
+            case TestResult::FAIL: resultStr = "FAIL"; break;
+            case TestResult::ABORT: resultStr = "ABORT"; break;
+            case TestResult::IMPOSSIBLE: resultStr = "IMPOSSIBLE"; break;
+            default: resultStr = "UNKNOWN"; break;
+        }
+
+        time_t now = time(nullptr);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+        std::string logLine = "[BOTTEST] " + std::string(timestamp) + " | " +
+            bot->GetName() + " | " + ctx.testName + " | " + resultStr + " | " +
+                              ctx.resultMessage;
+        LogToConsole(logLine);
+        LogToFile(logLine);
+
 #ifdef GenerateBotTests 
-    if (ai->GetHolder())
-        ai->GetHolder()->DepositTestResult(ctx.testName, resultStr);
+        if (ai->GetHolder())
+            ai->GetHolder()->DepositTestResult(ctx.testName, resultStr);
 #endif
 
-    DeactivateStrategy();
-
-    TellMaster("Test complete: " + resultStr);
-
-    if (sRandomPlayerbotMgr.GetValue(bot, "temporary"))
-    {
-        std::string logLine = "[BOTTEST] " + std::string(timestamp) + " | " +
-            bot->GetName() + " | deleting bot";
-
-        LogToConsole(logLine);
-
-        if (ai->GetHolder())
-            ai->GetHolder()->DeleteBot(bot->GetObjectGuid(), false);        
+        TellMaster("Test complete: " + resultStr);
+        ctx.resultReported = true;
     }
+
+    uint32 temporary = 0;
+    if (!sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "temporary", temporary))
+        return;
+
+    if (temporary)
+    {
+        ObjectGuid const selfGuid = bot->GetObjectGuid();
+        PlayerbotHolder* const holder = ai->GetHolder();
+
+        // Reset first so spawned children and pending tokens transfer to their
+        // pumped cleanup owner before deleting this action's bot/AI.
+        DeactivateStrategy();
+
+        if (!holder || !holder->DeleteBot(selfGuid, false))
+            PlayerbotHolder::AbandonFinalizedBot(selfGuid.GetCounter());
+        return;
+    }
+
+    DeactivateStrategy();
 }
 
 void TestAction::TellMaster(const std::string& msg)

@@ -805,6 +805,7 @@ bool PlayerbotAIConfig::Initialize()
     PlayerbotHolder::ReadoptPendingDeletions();
     PlayerbotHolder::ReadoptPendingCreations();
     sRandomPlayerbotMgr.ReconstructPostCreateOwners();
+    sRandomPlayerbotMgr.ReconstructStaleLoginClears();
 
     targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f);
 

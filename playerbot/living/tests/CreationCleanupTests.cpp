@@ -675,6 +675,16 @@ LIVING_TEST(abandoned_cleanup_copies_terminal_guids_until_deletion_ownership_sec
     LIVING_CHECK(cleanup.PendingSingles() == 0);
     LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Unknown);
 
+    // An already-finalized GUID transferred by TestContext::Reset uses the
+    // same pumped retry ledger; a refused DeleteBot is never an ownership sink.
+    ownershipSecured = false;
+    cleanup.AdoptGuid(722);
+    cleanup.Pump(ops);
+    LIVING_CHECK(cleanup.PendingGuids() == 1);
+    ownershipSecured = true;
+    cleanup.Pump(ops);
+    LIVING_CHECK(cleanup.PendingGuids() == 0);
+
     // --- batch with PARTIAL success: the secured member is never re-processed
     CreationBatchRegistry::Batch batch;
     batch.initiatorGuid = 9;

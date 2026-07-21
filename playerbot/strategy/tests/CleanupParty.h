@@ -7,7 +7,7 @@ namespace ai
     // =====================================================
     // CleanupParty - cleanup spawned bots/party
     // =====================================================
-    class CleanupParty : public TestCommand
+    class CleanupParty : public TestCleanup
     {
     public:
         TestResult Execute(const std::string& params, Player* bot,

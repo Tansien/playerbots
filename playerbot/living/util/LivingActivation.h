@@ -106,6 +106,16 @@ namespace living
         return alwaysWriteConfirmed;
     }
 
+    inline bool TimedLogoutDue(bool online, bool addKnown, uint32_t addValue)
+    {
+        return online && addKnown && !addValue;
+    }
+
+    inline bool TimedOfflineBlocksLogin(bool online, bool logoutKnown, uint32_t logoutValue)
+    {
+        return !online && (!logoutKnown || logoutValue);
+    }
+
     // Typed always-online state. The durable value space is exactly
     // {0 disabled, 1 active, 2 disabled-by-command} (BotAlwaysOnline in the
     // module); any other stored value is invalid, never coerced.

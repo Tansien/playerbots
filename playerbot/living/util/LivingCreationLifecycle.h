@@ -8,6 +8,13 @@
 
 namespace living
 {
+    // A character may materialize only after the durable intent scan has
+    // established what owns its GUID and no live finalizer still owns it.
+    inline bool CreationMaterializationBlocked(bool intentStateKnown, bool finalizerOwns)
+    {
+        return !intentStateKnown || finalizerOwns;
+    }
+
     // Lifecycle of one bot creation. In every pinned core Player::SaveToDB
     // commits through the asynchronous transaction queue, so returning from it
     // confirms ENQUEUEING, not execution - and Player::DeleteFromDB queues the

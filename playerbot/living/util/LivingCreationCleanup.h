@@ -71,6 +71,12 @@ namespace living
                 batches.push_back(BatchCleanup{ token, {} });
         }
 
+        void AdoptGuid(uint32_t guid)
+        {
+            if (guid && guids.size() < kMaxAdopted)
+                guids.insert(guid);
+        }
+
         void Pump(CreationCleanupOps const& ops)
         {
             for (auto it = singles.begin(); it != singles.end();)
@@ -147,11 +153,20 @@ namespace living
                 else
                     ++it;
             }
+
+            for (auto it = guids.begin(); it != guids.end();)
+            {
+                if (ops.deleteCharacter && ops.deleteCharacter(*it))
+                    it = guids.erase(it);
+                else
+                    ++it;
+            }
         }
 
         size_t PendingSingles() const { return singles.size(); }
         size_t PendingBatches() const { return batches.size(); }
-        bool Empty() const { return singles.empty() && batches.empty(); }
+        size_t PendingGuids() const { return guids.size(); }
+        bool Empty() const { return singles.empty() && batches.empty() && guids.empty(); }
 
     private:
         struct SingleCleanup
@@ -168,6 +183,7 @@ namespace living
 
         std::vector<SingleCleanup> singles;
         std::vector<BatchCleanup> batches;
+        std::set<uint32_t> guids;
     };
 
     // World/database boundary for the durable character-deletion owner. Every

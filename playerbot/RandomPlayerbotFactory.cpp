@@ -417,7 +417,7 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         sLog.outError("BOTS: Unable to create session or player for random acc %d - name: \"%s\"; race: %u; class: %u", accountId, name.c_str(), race, cls);
         return false;
     }
-	if (!player->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender,
+    if (!player->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender,
 	        face.second, // skinColor,
 	        face.first,
 	        hair.first,
@@ -429,6 +429,16 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         delete player;
         sLog.outError("Unable to create random bot for account %d - name: \"%s\"; race: %u; class: %u",
                 accountId, name.c_str(), race, cls);
+        return false;
+    }
+
+    uint32 const botGuid = player->GetGUIDLow();
+    if (!PlayerbotHolder::PrepareAllocatedGuid(botGuid))
+    {
+        delete session;
+        delete player;
+        sLog.outError("Unable to create random bot for account %d - allocated guid %u has pending lifecycle ownership or residue",
+            accountId, botGuid);
         return false;
     }
 
@@ -723,16 +733,8 @@ void RandomPlayerbotFactory::CreateRandomBots()
     // the temporary character rather than a reused GUID; automatic deletion
     // would therefore be destructive. Exact recovery needs a schema identity
     // token and is outside this cleanup pass.
-    if (auto temporaryBots = CharacterDatabase.Query(
-            "SELECT characters.guid FROM ai_playerbot_random_bots JOIN characters ON "
-            "(characters.guid = ai_playerbot_random_bots.bot AND characters.name = ai_playerbot_random_bots.data) "
-            "WHERE ai_playerbot_random_bots.event = 'temporary'"))
-    {
-        do
-        {
-            sRandomPlayerbotMgr.QuarantineTemporaryBot(temporaryBots->Fetch()[0].GetUInt32());
-        } while (temporaryBots->NextRow());
-    }
+    if (!sRandomPlayerbotMgr.ReconstructTemporaryBotQuarantines())
+        sLog.outError("CreateRandomBots: temporary-bot marker scan failed; bot materialization stays blocked until retry");
 
     //Loop over randombot accounts that have no characters and delete them as well, to clean up after temporary bots.
     auto temporaryAccounts = LoginDatabase.PQuery("SELECT id FROM account WHERE username like '%s%%' and id >= %u", sPlayerbotAIConfig.randomBotAccountPrefix.c_str(), sPlayerbotAIConfig.randomBotAccountCount);

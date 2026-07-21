@@ -314,12 +314,15 @@ bool PlayerLoginInfo::LoginBot()
         return false;
     }
 
+    // Persist the complete add/logout transition before materializing the
+    // player. Unknown or uncompensated state leaves the queued login untouched
+    // for a later retry.
+    if (!sRandomPlayerbotMgr.PrepareAsyncLogin(guid))
+        return false;
+
     sRandomPlayerbotMgr.HandlePlayerBotLoginCallback(nullptr, holder);
     holder = nullptr;
     holderState = HolderState::HOLDER_EMPTY;
-
-    if(sPlayerbotAIConfig.randomBotTimedLogout)
-        sRandomPlayerbotMgr.SetValue(guid, "add", 1, "", urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
 
     Player* player = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, guid), false);
 
@@ -351,7 +354,10 @@ bool PlayerLoginInfo::LogoutBot()
 
     Update(player);
 
-    sRandomPlayerbotMgr.SetValue(guid, "add", 0, "", 0);
+    // The offline schedule must be durable before the world transition. A
+    // failed plan is compensated and the bot stays online for a later retry.
+    if (!sRandomPlayerbotMgr.PrepareAsyncLogout(guid))
+        return false;
 
     sRandomPlayerbotMgr.LogoutPlayerBot(guid);
 
@@ -359,9 +365,6 @@ bool PlayerLoginInfo::LogoutBot()
         return false;
 
     loginState = LoginState::BOT_OFFLINE;    
-
-    if (sPlayerbotAIConfig.randomBotTimedOffline)
-        sRandomPlayerbotMgr.SetValue(guid, "logout", 1, "", urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
 
     return true;
 }
@@ -533,9 +536,21 @@ LoginCriteria PlayerBotLoginMgr::GetLoginCriteria(const uint8 attempt)
         if (criterion == "online")
             ADD_KEEP_CRITERIA(ONLINE, info.IsOnline());
         if (criterion == "logoff" && sPlayerbotAIConfig.randomBotTimedLogout)
-            ADD_CRITERIA(RANDOM_TIMED_LOGOUT, info.IsOnline() && !sRandomPlayerbotMgr.GetValue(info.GetId(), "add"));
+            criteria.push_back(std::make_pair(LoginCriterionFailType::RANDOM_TIMED_LOGOUT,
+                [](PlayerLoginInfo const& info, LoginSpace const&)
+                {
+                    uint32 add = 0;
+                    bool const known = sRandomPlayerbotMgr.TryGetEventValue(info.GetId(), "add", add);
+                    return living::TimedLogoutDue(info.IsOnline(), known, add);
+                }));
         if (criterion == "offline" && sPlayerbotAIConfig.randomBotTimedOffline)
-            ADD_CRITERIA(RANDOM_TIMED_OFFLINE, !info.IsOnline() && sRandomPlayerbotMgr.GetValue(info.GetId(), "logout"));
+            criteria.push_back(std::make_pair(LoginCriterionFailType::RANDOM_TIMED_OFFLINE,
+                [](PlayerLoginInfo const& info, LoginSpace const&)
+                {
+                    uint32 logout = 0;
+                    bool const known = sRandomPlayerbotMgr.TryGetEventValue(info.GetId(), "logout", logout);
+                    return living::TimedOfflineBlocksLogin(info.IsOnline(), known, logout);
+                }));
         if (criterion == "bg")
             ADD_KEEP_CRITERIA(BG, info.IsOnline() && info.IsInBG());
         if (criterion == "arena")

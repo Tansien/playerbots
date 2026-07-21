@@ -40,6 +40,13 @@ namespace living
             || IsLifecycleControlEvent(event);
     }
 
+    inline bool IsEventValueActive(std::string const& event, uint32_t value,
+        uint32_t lastChangeTime, uint32_t validIn, uint32_t now)
+    {
+        return value && (IsNonExpiringEvent(event) || now < lastChangeTime
+            || now - lastChangeTime < validIn);
+    }
+
     inline bool EventValueFitsSchema(std::string const& event, std::string const& data)
     {
         return !event.empty()
