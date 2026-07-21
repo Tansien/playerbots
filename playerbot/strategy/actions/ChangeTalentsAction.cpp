@@ -3,9 +3,22 @@
 #include "playerbot/Talentspec.h"
 #include "ChangeTalentsAction.h"
 #include "playerbot/AiFactory.h"
+#include "playerbot/living/util/LivingEventSchema.h"
 #include "playerbot/living/util/LivingRoles.h"
 
 using namespace ai;
+
+namespace
+{
+    bool PersistBotTalentMetadata(uint32 botGuidLow, int specId, std::string const& specLink)
+    {
+        return living::PersistTalentMetadata(specId, specLink,
+            [botGuidLow](char const* event, uint32 value, std::string const& data)
+            {
+                return sRandomPlayerbotMgr.SetValue(botGuidLow, event, value, data);
+            });
+    }
+}
 
 bool ChangeTalentsAction::Execute(Event& event)
 {
@@ -34,8 +47,8 @@ bool ChangeTalentsAction::Execute(Event& event)
             out << "Reset talents and spec";
             TalentSpec newSpec(bot, "0-0-0");
             newSpec.ApplyTalents(bot, &out);
-            sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", 0);
-            sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 0);
+            if (!PersistBotTalentMetadata(bot->GetGUIDLow(), -1, ""))
+                out << " Talent preference could not be saved; retry later.";
         }
         else
         {
@@ -74,8 +87,8 @@ bool ChangeTalentsAction::Execute(Event& event)
                 if (newSpec.CheckTalents(bot, &out))
                 {
                     newSpec.ApplyTalents(bot, &out);
-                    sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", 0);
-                    sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 1, specLink);
+                    if (!PersistBotTalentMetadata(bot->GetGUIDLow(), -1, specLink))
+                        out << " Talent preference could not be saved; retry later.";
                 }
 
                 ai->UpdateTalentSpec();
@@ -107,8 +120,8 @@ bool ChangeTalentsAction::Execute(Event& event)
                         if (newSpec.GetTalentPoints() > 0)
                         {
                             out << "Apply spec " << "|h|cffffffff" << path->name << " " << newSpec.formatSpec(cls);
-                            sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", path->id + 1);
-                            sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 0);
+                            if (!PersistBotTalentMetadata(bot->GetGUIDLow(), path->id, ""))
+                                out << " Talent preference could not be saved; retry later.";
 
                             ai->UpdateTalentSpec();
                         }
@@ -425,13 +438,7 @@ bool ChangeTalentsAction::PersistTalentSpec(uint32 botGuidLow, TalentSelectionRe
     if (!selection.evaluated)
         return true;
 
-    bool ok = sRandomPlayerbotMgr.SetValue(botGuidLow, "specNo", selection.specId + 1);
-    if (!selection.specLink.empty() && selection.specId == -1)
-        ok = sRandomPlayerbotMgr.SetValue(botGuidLow, "specLink", 1, selection.specLink) && ok;
-    else
-        ok = sRandomPlayerbotMgr.SetValue(botGuidLow, "specLink", 0) && ok;
-
-    return ok;
+    return PersistBotTalentMetadata(botGuidLow, selection.specId, selection.specLink);
 }
 
 bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out, BotRoles role)
@@ -440,7 +447,11 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
     if (!selection.evaluated)
         return false;
 
-    PersistTalentSpec(bot, selection);
+    if (!PersistTalentSpec(bot, selection))
+    {
+        *out << " Talent preference could not be saved; retry later.";
+        return false;
+    }
     return selection.hadExistingSpec;
 }
 
@@ -482,4 +493,3 @@ bool AutoSetTalentsAction::Execute(Event& event)
 
     return true;
 }
-

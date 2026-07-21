@@ -54,6 +54,22 @@ namespace living
             && data.size() <= EVENT_DATA_MAX_BYTES;
     }
 
+    // specNo selects the active representation: zero uses specLink, nonzero
+    // uses the premade spec. Persist the payload before activating a custom
+    // link, and activate a premade spec before clearing its now-dormant link.
+    // Short-circuiting keeps the previously active representation intact when
+    // the first write fails.
+    template <typename WriteFn>
+    bool PersistTalentMetadata(int32_t specId, std::string const& specLink, WriteFn&& write)
+    {
+        if (specId == -1)
+            return write("specLink", specLink.empty() ? 0u : 1u, specLink)
+                && write("specNo", 0u, std::string());
+
+        return write("specNo", static_cast<uint32_t>(specId + 1), std::string())
+            && write("specLink", 0u, std::string());
+    }
+
     // The single execution-confirmed statement one event write must run.
     enum class EventWriteKind { Delete, Update, Insert };
 

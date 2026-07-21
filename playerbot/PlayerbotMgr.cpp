@@ -1415,8 +1415,10 @@ std::list<std::string> PlayerbotHolder::HandleSelf(Player* master, const std::st
 
         if (!param.empty() && param == "login")
         {
-            messages.push_back("Enable player ai (on login)");
-            sRandomPlayerbotMgr.SetValue(master->GetObjectGuid().GetCounter(), "selfbot", 1);
+            if (sRandomPlayerbotMgr.SetValue(master->GetGUIDLow(), "selfbot", 1))
+                messages.push_back("Enable player ai (on login)");
+            else
+                messages.push_back("Enable player ai; login preference could not be saved");
         }
         else
             messages.push_back("Enable player ai");

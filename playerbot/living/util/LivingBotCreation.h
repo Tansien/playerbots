@@ -347,6 +347,11 @@ namespace living
     inline constexpr uint32_t kCreationIntentPrePersistence = 1;
     inline constexpr uint32_t kCreationIntentFinalized = 2;
 
+    inline bool CreationIntentBlocksPostCreateSettlement(uint32_t value)
+    {
+        return value != 0 && value != kCreationIntentFinalized;
+    }
+
     // Payload: {identity name, original account, level, login authorization,
     // has-obligations}. The recorded identity is what anchors recovery to the
     // CHARACTER TRANSACTION this intent was written for: resumption feeds it
