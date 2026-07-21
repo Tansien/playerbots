@@ -66,5 +66,10 @@ namespace living
         static LivingRealmConfig FromValues(bool enabled, std::string profileName, bool strict);
         static LivingRealmConfig FromRawValues(std::string const& enabled, std::string profileName,
             std::string const& strict);
+
+        bool IsRuntimeActive() const
+        {
+            return enabledRaw == LivingRealmBool::True && profile == LivingRealmProfile::Organic;
+        }
     };
 }

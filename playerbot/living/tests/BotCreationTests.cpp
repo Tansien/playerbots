@@ -4,6 +4,8 @@
 #include "../util/LivingBotCreation.h"
 #include "../util/LivingCreationLifecycle.h"
 
+#include <algorithm>
+
 using namespace living;
 
 // GroupCreationLedger is the accounting HandleGroup runs per creation attempt.
@@ -1014,18 +1016,32 @@ LIVING_TEST(creation_intent_codec_and_recovery_boundaries)
     bool autoAdd = false;
     bool hasObligations = false;
 
-    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 70, true, true),
-        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 70, true, true),
+        name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(name == "Botname" && account == 42);
     LIVING_CHECK(level == 70 && autoAdd && hasObligations);
-    DecodeCreationIntent(EncodeCreationIntent("X", 1, 1, false, false),
-        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("X", 1, 1, false, false),
+        name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(name == "X" && account == 1);
     LIVING_CHECK(level == 1 && !autoAdd && !hasObligations);
     LIVING_CHECK(EventValueFitsSchema("create pending",
         EncodeCreationIntent("Longestname1", 4294967295u, 4294967295u, true, true)));
-    DecodeCreationIntent("garbage", name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(!DecodeCreationIntent("garbage", name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(name.empty() && account == 0 && level == 0 && !autoAdd && !hasObligations);
+
+    for (std::string const& malformed : {
+            "name:X|account:1|level:1|login:1",
+            "name:X|account:1|level:1|login:2|obligations:0",
+            "name:X|account:1|level:1|login:1|obligations:0junk",
+            "name:X|account:4294967296|level:1|login:1|obligations:0",
+            "name:X|account:1|level:4294967296|login:1|obligations:0" })
+        LIVING_CHECK(!DecodeCreationIntent(malformed, name, account, level, autoAdd, hasObligations));
+
+    LIVING_CHECK(CreationIdentityMatches("Botname", 42, "Botname", 42));
+    LIVING_CHECK(!CreationIdentityMatches("Botname", 42, "Other", 42));
+    LIVING_CHECK(!CreationIdentityMatches("Botname", 42, "Botname", 43));
+    LIVING_CHECK(!CreationIdentityMatches("", 42, "", 42));
+    LIVING_CHECK(!CreationIdentityMatches("Botname", 0, "Botname", 0));
 
     // Crash-boundary recovery over the durable intent:
     // - before the character save committed (or after a rollback): residue;
@@ -1041,6 +1057,8 @@ LIVING_TEST(creation_intent_codec_and_recovery_boundaries)
     //   the intent's persisted login authorization.
     LIVING_CHECK(PlanCreationIntentRecovery(true, kCreationIntentFinalized)
         == CreationIntentRecovery::ReconstructOwner);
+    LIVING_CHECK(PlanCreationIntentRecovery(true, 0) == CreationIntentRecovery::Quarantine);
+    LIVING_CHECK(PlanCreationIntentRecovery(true, 3) == CreationIntentRecovery::Quarantine);
 }
 
 LIVING_TEST(creation_login_authorization_survives_restart_via_intent)
@@ -1054,16 +1072,16 @@ LIVING_TEST(creation_login_authorization_survives_restart_via_intent)
     bool autoAdd = false;
     bool hasObligations = false;
 
-    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, true, true),
-        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, true, true),
+        name, account, level, autoAdd, hasObligations));
     bool const alwaysMember = false; // ordinary creation never persists `always`
     bool const mayAutoLogin = alwaysMember || autoAdd;
     LIVING_CHECK(mayAutoLogin);                                          // login=1 restored
     LIVING_CHECK(MayAutoLoginPostCreateOwner(true, mayAutoLogin, false));
     LIVING_CHECK(!MayAutoLoginPostCreateOwner(false, mayAutoLogin, false)); // LOGIN_ONLY_ALWAYS_ACTIVE
 
-    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, false, true),
-        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, false, true),
+        name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(!(alwaysMember || autoAdd)); // login=0 preserved across restart
 }
 
@@ -1079,13 +1097,13 @@ LIVING_TEST(markerless_creations_register_no_scheduler_owner)
     uint32_t level = 0;
     bool autoAdd = false;
     bool hasObligations = false;
-    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 1, false, false),
-        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 1, false, false),
+        name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(!hasObligations); // -> exposure runs first, THEN the confirmed clear
 
     // Marker-bearing creations DO retain ownership.
-    DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, false, true),
-        name, account, level, autoAdd, hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("Botname", 42, 60, false, true),
+        name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(hasObligations);
 }
 

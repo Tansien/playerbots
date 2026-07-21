@@ -119,6 +119,7 @@ LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
     LivingRealmConfig const badEnabled = LivingRealmConfig::FromRawValues("tru", "organic", "1");
     LIVING_CHECK(badEnabled.enabledRaw == LivingRealmBool::Malformed);
     LIVING_CHECK(badEnabled.enabled); // fail-closed interpretation while the report blocks
+    LIVING_CHECK(!badEnabled.IsRuntimeActive());
     EffectiveConfigReport const enabledReport = BuildEffectiveConfigReport(badEnabled, CleanLegacyInputs());
     LIVING_CHECK(CountReason(enabledReport, ConfigReasonCode::MalformedBoolean) == 1);
     LIVING_CHECK(enabledReport.HasBlockingEntry());
@@ -153,7 +154,11 @@ LIVING_TEST(config_booleans_are_tri_state_and_malformed_values_block)
     // Well-formed raw values behave exactly like the typed constructor.
     LivingRealmConfig const off = LivingRealmConfig::FromRawValues("0", "organic", "1");
     LIVING_CHECK(!off.enabled);
+    LIVING_CHECK(!off.IsRuntimeActive());
     LIVING_CHECK(!BuildEffectiveConfigReport(off, ConflictingLegacyInputs()).HasBlockingEntry());
+
+    LIVING_CHECK(LivingRealmConfig::FromRawValues("1", "organic", "1").IsRuntimeActive());
+    LIVING_CHECK(!LivingRealmConfig::FromRawValues("1", "bogus", "1").IsRuntimeActive());
 }
 
 LIVING_TEST(config_disabled_realm_validates_nothing_and_needs_no_schema)

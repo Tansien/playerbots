@@ -1,6 +1,7 @@
 #pragma once
 
 #include "LivingEventSchema.h"
+#include "LivingNumericParse.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -362,7 +363,7 @@ namespace living
             + "|obligations:" + (hasObligations ? "1" : "0");
     }
 
-    inline void DecodeCreationIntent(std::string const& data, std::string& name, uint32_t& accountId,
+    inline bool DecodeCreationIntent(std::string const& data, std::string& name, uint32_t& accountId,
         uint32_t& level, bool& autoAdd, bool& hasObligations)
     {
         name.clear();
@@ -371,48 +372,52 @@ namespace living
         autoAdd = false;
         hasObligations = false;
 
-        size_t const namePos = data.find("name:");
-        if (namePos == 0)
-        {
-            size_t const nameEnd = data.find("|account:", 5);
-            if (nameEnd != std::string::npos)
-                name = data.substr(5, nameEnd - 5);
-        }
-        size_t const accountPos = data.find("|account:");
-        if (accountPos != std::string::npos)
-        {
-            uint64_t parsed = 0;
-            for (size_t i = accountPos + 9; i < data.size() && data[i] >= '0' && data[i] <= '9'; ++i)
-            {
-                if (parsed > 0xFFFFFFFFull)
-                    break;
-                parsed = parsed * 10 + static_cast<uint64_t>(data[i] - '0');
-            }
-            accountId = static_cast<uint32_t>(parsed);
-        }
+        if (data.compare(0, 5, "name:") != 0)
+            return false;
 
-        size_t const levelPos = data.find("level:");
-        if (levelPos != std::string::npos)
-        {
-            uint64_t parsed = 0;
-            for (size_t i = levelPos + 6; i < data.size() && data[i] >= '0' && data[i] <= '9'; ++i)
-            {
-                if (parsed > 0xFFFFFFull)
-                    break;
-                parsed = parsed * 10 + static_cast<uint64_t>(data[i] - '0');
-            }
-            level = static_cast<uint32_t>(parsed);
-        }
-        size_t const loginPos = data.find("|login:");
-        autoAdd = loginPos != std::string::npos && loginPos + 7 < data.size() && data[loginPos + 7] == '1';
-        size_t const obligationsPos = data.find("|obligations:");
-        hasObligations = obligationsPos != std::string::npos && obligationsPos + 13 < data.size()
-            && data[obligationsPos + 13] == '1';
+        size_t const accountPos = data.find("|account:", 5);
+        size_t const levelPos = accountPos == std::string::npos ? std::string::npos
+            : data.find("|level:", accountPos + 9);
+        size_t const loginPos = levelPos == std::string::npos ? std::string::npos
+            : data.find("|login:", levelPos + 7);
+        size_t const obligationsPos = loginPos == std::string::npos ? std::string::npos
+            : data.find("|obligations:", loginPos + 7);
+
+        if (accountPos <= 5 || levelPos == std::string::npos || loginPos == std::string::npos
+            || obligationsPos != loginPos + 8 || data.size() != obligationsPos + 14)
+            return false;
+
+        uint32_t parsedAccount = 0;
+        uint32_t parsedLevel = 0;
+        if (!TryParseUInt32(data.substr(accountPos + 9, levelPos - accountPos - 9), parsedAccount)
+            || !TryParseUInt32(data.substr(levelPos + 7, loginPos - levelPos - 7), parsedLevel)
+            || parsedAccount == 0 || parsedLevel == 0)
+            return false;
+
+        char const login = data[loginPos + 7];
+        char const obligations = data[obligationsPos + 13];
+        if ((login != '0' && login != '1') || (obligations != '0' && obligations != '1'))
+            return false;
+
+        name = data.substr(5, accountPos - 5);
+        accountId = parsedAccount;
+        level = parsedLevel;
+        autoAdd = login == '1';
+        hasObligations = obligations == '1';
+        return true;
+    }
+
+    inline bool CreationIdentityMatches(std::string const& recordedName, uint32_t recordedAccount,
+        std::string const& currentName, uint32_t currentAccount)
+    {
+        return !recordedName.empty() && recordedAccount != 0
+            && recordedName == currentName && recordedAccount == currentAccount;
     }
 
     // Startup recovery decision for one intent row.
     enum class CreationIntentRecovery
     {
+        Quarantine,        // malformed/undefined phase: retain inert for manual resolution
         DiscardResidue,     // character absent: nothing committed (or rolled back)
         ResumeFinalization, // pre-persistence intent, character committed: re-own it
         ReconstructOwner,   // finalized intent: rebuild the post-create owner + login auth
@@ -420,9 +425,11 @@ namespace living
 
     inline CreationIntentRecovery PlanCreationIntentRecovery(bool characterPresent, uint32_t value)
     {
+        if (value != kCreationIntentPrePersistence && value != kCreationIntentFinalized)
+            return CreationIntentRecovery::Quarantine;
         if (!characterPresent)
             return CreationIntentRecovery::DiscardResidue;
-        return value >= kCreationIntentFinalized ? CreationIntentRecovery::ReconstructOwner
+        return value == kCreationIntentFinalized ? CreationIntentRecovery::ReconstructOwner
                                                  : CreationIntentRecovery::ResumeFinalization;
     }
 

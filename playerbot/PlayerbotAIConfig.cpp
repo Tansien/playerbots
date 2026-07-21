@@ -819,13 +819,15 @@ bool PlayerbotAIConfig::Initialize()
             config.GetStringDefault(living::LIVING_REALM_PROFILE_KEY, living::LIVING_REALM_PROFILE_DEFAULT),
             config.GetStringDefault(living::LIVING_REALM_STRICT_KEY, living::LIVING_REALM_STRICT_DEFAULT ? "1" : "0"));
 
-        livingRealmEnabled = livingConfig.enabled;
+        // Reporting treats malformed Enabled as enabled so the blocking error
+        // is visible; runtime behavior requires an exact, supported opt-in.
+        livingRealmEnabled = livingConfig.IsRuntimeActive();
         livingRealmProfile = livingConfig.profileName;
         livingRealmStrict = livingConfig.strict;
         livingRealmConfigModel = livingConfig;
     }
 
-    if (livingRealmEnabled)
+    if (livingRealmConfigModel.enabled)
     {
         // Phase 0 only reports the effective Organic configuration; blocking
         // startup and suppressing legacy behavior is later Living Realm 0.1 work.

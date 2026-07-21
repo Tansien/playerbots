@@ -114,7 +114,9 @@ GlyphSlotType AvailableGlyphsValue::GetGlyphSlotTypeFromSlot(uint8 slotId, uint3
 
 std::vector<uint32> WantedGlyphsValue::Calculate()
 {
-    uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
+    uint32 specNo = 0;
+    if (!sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "specNo", specNo))
+        return {};
 
     if (!specNo)
     {

@@ -54,14 +54,14 @@ LIVING_TEST(creation_lifecycle_metadata_failure_requires_confirmed_cleanup)
     // nothing is retryable yet.
     LIVING_CHECK(lifecycle.OnMetadataResult(false) == CreationStage::PendingCleanup);
 
-    // Event cleanup confirmed, deletion verified absent -> retryable.
+    // Character absence is established before its durable event owner clears.
     LIVING_CHECK(lifecycle.OnEventCleanupResult(true) == CreationStage::PendingCleanup);
     LIVING_CHECK(lifecycle.OnCleanupVerify(RowVerifyOutcome::Absent, 3) == CreationStage::FailedRetryable);
 }
 
 LIVING_TEST(creation_lifecycle_uncertain_cleanup_stays_quarantined)
 {
-    // Event-state cleanup failure: uncertain cleanup, quarantined.
+    // Event-state cleanup failure after absence: uncertain cleanup, quarantined.
     CreationLifecycle eventsFail;
     eventsFail.OnCharacterVerify(RowVerifyOutcome::Verified, 5);
     eventsFail.OnMetadataResult(false);
