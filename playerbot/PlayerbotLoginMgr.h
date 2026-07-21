@@ -139,12 +139,12 @@ namespace ai
 	class PlayerBotLoginMgr
 	{
 	public:
-		void Update(RealPlayers& realPlayers);
+        void Update(RealPlayers& realPlayers, uint32 maxOnlineBotCount);
 		void ToggleDebug() { debug = !debug; }
 	private:
 		static BotPool LoadBotsFromDb();
 		void UpdateOnlineBots();
-		static BotInfos FillLoginLogoutQueue(BotPool* pool, const RealPlayers& realPlayers);
+        static BotInfos FillLoginLogoutQueue(BotPool* pool, const RealPlayers& realPlayers, uint32 maxOnlineBotCount);
 		void LoginLogoutBots(const BotInfos& queue);
 
 		static RealPlayerInfos GetPlayerInfos(const RealPlayers& realPlayers);
@@ -153,11 +153,10 @@ namespace ai
 		static LoginCriteria GetLoginCriteria(const uint8 attempt);
 		static bool CriteriaStillValid(const LoginCriterionFailType oldFailType, const LoginCriteria& criteria);
 
-		static uint32 GetMaxOnlineBotCount();
 		static uint32 GetMaxLevel();
-		static uint32 GetClassRaceBucketSize(uint8 cls, uint8 race);
-		static uint32 GetLevelBucketSize(uint32 level);
-		static void FillLoginSpace(BotPool* pool, LoginSpace& space, FillStep step);
+        static uint32 GetClassRaceBucketSize(uint8 cls, uint8 race, uint32 maxOnlineBotCount);
+        static uint32 GetLevelBucketSize(uint32 level, uint32 maxOnlineBotCount);
+        static void FillLoginSpace(BotPool* pool, LoginSpace& space, uint32 maxOnlineBotCount, FillStep step);
 
 		static void SendHolders(const BotInfos& queue);
 		static void SendHolders(BotPool* pool);

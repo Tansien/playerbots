@@ -356,7 +356,7 @@ bool PlayerLoginInfo::LogoutBot()
 
     // The offline schedule must be durable before the world transition. A
     // failed plan is compensated and the bot stays online for a later retry.
-    if (!sRandomPlayerbotMgr.PrepareAsyncLogout(guid))
+    if (!sRandomPlayerbotMgr.PrepareLogout(guid))
         return false;
 
     sRandomPlayerbotMgr.LogoutPlayerBot(guid);
@@ -387,7 +387,7 @@ T GetFuture(Method&& method, std::future<T>& fut, bool restart, Args&&... args) 
     return result;
 }
 
-void PlayerBotLoginMgr::Update(RealPlayers& realPlayers)
+void PlayerBotLoginMgr::Update(RealPlayers& realPlayers, uint32 maxOnlineBotCount)
 {
     UpdateOnlineBots();
 
@@ -397,7 +397,8 @@ void PlayerBotLoginMgr::Update(RealPlayers& realPlayers)
         return;
     }
 
-    BotInfos queue = GetFuture(FillLoginLogoutQueue, futureQueue, true, &botPool, realPlayers);
+    BotInfos queue = GetFuture(FillLoginLogoutQueue, futureQueue, true,
+        &botPool, realPlayers, maxOnlineBotCount);
 
     if (!queue.empty())
     {
@@ -583,21 +584,23 @@ RealPlayerInfos PlayerBotLoginMgr::GetPlayerInfos(const RealPlayers& players)
     return realPlayers;
 }
 
-void PlayerBotLoginMgr::FillLoginSpace(BotPool* pool, LoginSpace& space, FillStep step)
+void PlayerBotLoginMgr::FillLoginSpace(BotPool* pool, LoginSpace& space,
+    uint32 maxOnlineBotCount, FillStep step)
 {
-    space.currentSpace = GetMaxOnlineBotCount();
-    space.totalSpace = GetMaxOnlineBotCount();
+    space.currentSpace = maxOnlineBotCount;
+    space.totalSpace = maxOnlineBotCount;
 
     for (uint32 level = 1; level < DEFAULT_MAX_LEVEL + 1; ++level)
     {
-        space.levelBucket[level] = GetLevelBucketSize(level);
+        space.levelBucket[level] = GetLevelBucketSize(level, maxOnlineBotCount);
     }
 
     for (uint32 race = 1; race < MAX_RACES; ++race)
     {
         for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
         {
-            space.classRaceBucket[cls][race] = GetClassRaceBucketSize(cls, race);
+            space.classRaceBucket[cls][race] =
+                GetClassRaceBucketSize(cls, race, maxOnlineBotCount);
         }
     }
 
@@ -629,11 +632,12 @@ bool PlayerBotLoginMgr::CriteriaStillValid(const LoginCriterionFailType oldFailT
     return false;
 }
 
-BotInfos PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool* pool, const RealPlayers& realPlayers)
+BotInfos PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool* pool,
+    const RealPlayers& realPlayers, uint32 maxOnlineBotCount)
 {
     LoginSpace loginSpace;
     loginSpace.realPlayerInfos = GetPlayerInfos(realPlayers);
-    FillLoginSpace(pool, loginSpace, FillStep::NEXT_STEP);
+    FillLoginSpace(pool, loginSpace, maxOnlineBotCount, FillStep::NEXT_STEP);
 
     std::unordered_map<uint32, LoginCriterionFailType> loginFails;
     std::set<PlayerLoginInfo*> potentialQueue;
@@ -747,12 +751,8 @@ uint32 PlayerBotLoginMgr::GetMaxLevel()
     return std::max(sPlayerbotAIConfig.randomBotMinLevel, std::min(sRandomPlayerbotMgr.GetPlayersLevel() + sPlayerbotAIConfig.syncLevelMaxAbove, sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL)));
 }
 
-uint32 PlayerBotLoginMgr::GetMaxOnlineBotCount() 
-{
-    return sRandomPlayerbotMgr.GetValue(uint32(0), "bot_count");
-}
-
-uint32 PlayerBotLoginMgr::GetClassRaceBucketSize(uint8 cls, uint8 race) 
+uint32 PlayerBotLoginMgr::GetClassRaceBucketSize(uint8 cls, uint8 race,
+    uint32 maxOnlineBotCount)
 {
     uint32 prob = sPlayerbotAIConfig.classRaceProbability[cls][race];
 
@@ -762,10 +762,11 @@ uint32 PlayerBotLoginMgr::GetClassRaceBucketSize(uint8 cls, uint8 race)
     if (sPlayerbotAIConfig.useFixedClassRaceCounts)
         return sPlayerbotAIConfig.classRaceProbability[cls][race];
 
-    return GetMaxOnlineBotCount() * sPlayerbotAIConfig.classRaceProbability[cls][race] / sPlayerbotAIConfig.classRaceProbabilityTotal;
+    return maxOnlineBotCount * sPlayerbotAIConfig.classRaceProbability[cls][race]
+        / sPlayerbotAIConfig.classRaceProbabilityTotal;
 }
 
-uint32 PlayerBotLoginMgr::GetLevelBucketSize(uint32 level) 
+uint32 PlayerBotLoginMgr::GetLevelBucketSize(uint32 level, uint32 maxOnlineBotCount)
 {
     uint32 prob = sPlayerbotAIConfig.levelProbability[level];
 
@@ -778,5 +779,6 @@ uint32 PlayerBotLoginMgr::GetLevelBucketSize(uint32 level)
         levelProbabilityTotal += sPlayerbotAIConfig.levelProbability[level];
     }
 
-    return GetMaxOnlineBotCount() * sPlayerbotAIConfig.levelProbability[level] / levelProbabilityTotal;
+    return maxOnlineBotCount * sPlayerbotAIConfig.levelProbability[level]
+        / levelProbabilityTotal;
 }
