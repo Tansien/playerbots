@@ -1389,11 +1389,18 @@ std::list<std::string> PlayerbotHolder::HandleSelf(Player* master, const std::st
     if (master->GetPlayerbotAI())
     {
         DisablePlayerBot(master->GetGUIDLow(), false);
-       
-        if (sRandomPlayerbotMgr.GetValue(master->GetObjectGuid().GetCounter(), "selfbot"))
+
+        uint32 selfbot = 0;
+        if (!sRandomPlayerbotMgr.TryGetEventValue(master->GetGUIDLow(), "selfbot", selfbot))
         {
-            messages.push_back("Disable player ai (on login)");
-            sRandomPlayerbotMgr.SetValue(master->GetObjectGuid().GetCounter(), "selfbot", (uint32)BotAlwaysOnline::DISABLED);
+            messages.push_back("Disable player ai; login preference is unavailable and was not changed");
+        }
+        else if (selfbot)
+        {
+            if (sRandomPlayerbotMgr.SetValue(master->GetGUIDLow(), "selfbot", (uint32)BotAlwaysOnline::DISABLED))
+                messages.push_back("Disable player ai (on login)");
+            else
+                messages.push_back("Disable player ai; login preference could not be cleared");
         }
         else
             messages.push_back("Disable player ai");
@@ -2602,20 +2609,34 @@ bool PlayerbotHolder::ReadoptPendingCreations()
         uint32 level = 0;
         bool autoAdd = false;
         bool hasObligations = false;
-        living::DecodeCreationIntent(fields[2].GetCppString(), recordedName, recordedAccount,
-            level, autoAdd, hasObligations);
+        bool const intentValid = living::DecodeCreationIntent(fields[2].GetCppString(), recordedName,
+            recordedAccount, level, autoAdd, hasObligations);
         bool const present = !fields[4].IsNULL();
+        uint32 const currentAccount = present ? fields[3].GetUInt32() : 0;
         std::string const currentName = present ? fields[4].GetCppString() : std::string();
+
+        if (!intentValid)
+        {
+            sRandomPlayerbotMgr.QuarantinePostCreateOwner(guid);
+            sLog.outError("ReadoptPendingCreations: guid %u has a malformed creation intent; retained QUARANTINED - resolve manually", guid);
+            continue;
+        }
 
         // The RECORDED identity is the anchor: a present row whose identity
         // does not match the intent belongs to a reused GUID (the original
         // save rolled back and a legacy/normal character took the id). Such a
         // row is NEVER finalized, exposed, mutated, or auto-logged-in - the
         // intent row is retained quarantined for manual resolution.
-        bool const identityMatches = present && !recordedName.empty() && currentName == recordedName;
+        bool const identityMatches = present && living::CreationIdentityMatches(
+            recordedName, recordedAccount, currentName, currentAccount);
 
         switch (living::PlanCreationIntentRecovery(present, value))
         {
+            case living::CreationIntentRecovery::Quarantine:
+                sRandomPlayerbotMgr.QuarantinePostCreateOwner(guid);
+                sLog.outError("ReadoptPendingCreations: guid %u has undefined creation-intent phase %u; retained QUARANTINED - resolve manually",
+                    guid, value);
+                break;
             case living::CreationIntentRecovery::DiscardResidue:
                 // Absence proven by this scan; nothing else can own the rows.
                 // The discard must be CONFIRMED - an unconfirmed delete keeps
@@ -2631,6 +2652,7 @@ bool PlayerbotHolder::ReadoptPendingCreations()
             {
                 if (!identityMatches)
                 {
+                    sRandomPlayerbotMgr.QuarantinePostCreateOwner(guid);
                     sLog.outError("ReadoptPendingCreations: guid %u holds a pre-persistence intent for '%s' but the "
                         "present character is '%s' (reused id); intent retained QUARANTINED - resolve manually",
                         guid, recordedName.c_str(), currentName.c_str());
@@ -2676,6 +2698,7 @@ bool PlayerbotHolder::ReadoptPendingCreations()
             case living::CreationIntentRecovery::ReconstructOwner:
                 if (!identityMatches)
                 {
+                    sRandomPlayerbotMgr.QuarantinePostCreateOwner(guid);
                     sLog.outError("ReadoptPendingCreations: guid %u holds a finalized intent for '%s' but the present "
                         "character is '%s'; intent retained QUARANTINED - resolve manually",
                         guid, recordedName.c_str(), currentName.c_str());

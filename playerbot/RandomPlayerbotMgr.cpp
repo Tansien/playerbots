@@ -900,25 +900,15 @@ void RandomPlayerbotMgr::ScaleBotActivity()
 
 void RandomPlayerbotMgr::ReconstructPostCreateOwners()
 {
-    // COUNT-first over the JOINed scan so "no unsettled markers" is
+    // COUNT-first over finalized intents so "no unsettled owners" is
     // distinguishable from "could not ask": the pinned cores return a null
-    // result for BOTH an empty row set and a failed query. Deletion-pending
-    // characters are excluded at the SQL level (durable intents) AND below
-    // via the in-memory confirmer (a deletion-pending bot must never regain
-    // a lifecycle owner that could log it in or mutate it).
+    // result for BOTH an empty row set and a failed query. A marker row alone
+    // cannot own a character: only its exact finalized creation intent can.
     static char const* kScanCondition =
-        "ai_playerbot_random_bots.owner = 0 AND (ai_playerbot_random_bots.event IN "
-        "('create levelup', 'create gear', 'create group', 'test') "
-        // Deliberately NOT anchored at end-of-string: the decoder finds this
-        // field by name wherever it sits, so anchoring here would silently
-        // match zero rows the moment a field is appended to the codec - and a
-        // scan that finds nothing still reports success, leaking every owner.
-        "OR (ai_playerbot_random_bots.event = 'create pending' AND ai_playerbot_random_bots.value >= 2 "
-        "AND ai_playerbot_random_bots.data LIKE '%%|obligations:1%%')) "
-        "AND ai_playerbot_random_bots.bot NOT IN "
-        "(SELECT d.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'delete') d) "
-        "AND ai_playerbot_random_bots.bot NOT IN "
-        "(SELECT p.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value < 2) p)";
+        "i.owner = 0 AND i.event = 'create pending' AND i.value = 2 "
+        "AND i.data LIKE 'name:%%|account:%%|level:%%|login:%%|obligations:1' "
+        "AND i.bot NOT IN "
+        "(SELECT d.bot FROM (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'delete') d)";
 
     // While deletion state is UNKNOWN, this scan cannot be authoritative: it
     // would replace the owner map having skipped rows it could not classify.
@@ -934,14 +924,14 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
     std::map<uint32, PostCreateOwner> scanned;
     bool scanSucceeded = false;
     if (auto countResult = CharacterDatabase.PQuery(
-            "SELECT COUNT(DISTINCT ai_playerbot_random_bots.bot) FROM ai_playerbot_random_bots "
-            "JOIN characters ON characters.guid = ai_playerbot_random_bots.bot WHERE %s", kScanCondition))
+            "SELECT COUNT(*) FROM ai_playerbot_random_bots i "
+            "JOIN characters c ON c.guid = i.bot WHERE %s", kScanCondition))
     {
         if (countResult->Fetch()[0].GetUInt32() == 0)
             scanSucceeded = true; // confirmed: nothing unsettled
         else if (auto rows = CharacterDatabase.PQuery(
-            "SELECT DISTINCT ai_playerbot_random_bots.bot, characters.account FROM ai_playerbot_random_bots "
-            "JOIN characters ON characters.guid = ai_playerbot_random_bots.bot WHERE %s", kScanCondition))
+            "SELECT i.bot, i.data, c.account, c.name FROM ai_playerbot_random_bots i "
+            "JOIN characters c ON c.guid = i.bot WHERE %s", kScanCondition))
         {
             do
             {
@@ -950,60 +940,36 @@ void RandomPlayerbotMgr::ReconstructPostCreateOwners()
                 if (PlayerbotHolder::IsDeletionPending(guid))
                     continue; // in-memory adoption not yet durably visible
 
-                // Lifecycle ownership is reconstructed INDEPENDENTLY of login
-                // authorization; the durable intent overlay below restores the
-                // creation's own login authorization (login=1 survives a
-                // restart even without always-online membership; login=0 stays
-                // unauthorized).
-                scanned[guid] = PostCreateOwner{ fields[1].GetUInt32(),
-                    sPlayerbotAIConfig.IsFreeAltBot(guid) };
+                std::string recordedName;
+                uint32 recordedAccount = 0;
+                uint32 level = 0;
+                bool autoAdd = false;
+                bool hasObligations = false;
+                uint32 const currentAccount = fields[2].GetUInt32();
+                std::string const currentName = fields[3].GetCppString();
+                if (!living::DecodeCreationIntent(fields[1].GetCppString(), recordedName, recordedAccount,
+                        level, autoAdd, hasObligations)
+                    || !hasObligations
+                    || !living::CreationIdentityMatches(recordedName, recordedAccount,
+                        currentName, currentAccount))
+                {
+                    sLog.outError("ReconstructPostCreateOwners: malformed or identity-mismatched finalized intent for guid %u; owner retained QUARANTINED", guid);
+                    postCreateQuarantined.insert(guid);
+                    continue;
+                }
+
+                postCreateQuarantined.erase(guid);
+                scanned[guid] = PostCreateOwner{ currentAccount,
+                    sPlayerbotAIConfig.IsFreeAltBot(guid) || autoAdd };
             } while (rows->NextRow());
             scanSucceeded = true;
         }
     }
 
-    // Authorization overlay from the durable creation intents (COUNT-first so
-    // "no intents" is distinguishable from "could not ask" - a failed overlay
-    // fails the whole scan, keeping existing owners with their authorization).
-    if (scanSucceeded)
-    {
-        if (auto intentCount = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value >= 2"))
-        {
-            if (intentCount->Fetch()[0].GetUInt32() > 0)
-            {
-                if (auto intents = CharacterDatabase.Query(
-                        "SELECT bot, data FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'create pending' AND value >= 2"))
-                {
-                    do
-                    {
-                        Field* fields = intents->Fetch();
-                        auto owner = scanned.find(fields[0].GetUInt32());
-                        if (owner == scanned.end())
-                            continue;
-
-                        std::string recordedName;
-                        uint32 recordedAccount = 0;
-                        uint32 level = 0;
-                        bool autoAdd = false;
-                        bool hasObligations = false;
-                        living::DecodeCreationIntent(fields[1].GetCppString(), recordedName, recordedAccount,
-                            level, autoAdd, hasObligations);
-                        owner->second.mayAutoLogin = owner->second.mayAutoLogin || autoAdd;
-                    } while (intents->NextRow());
-                }
-                else
-                    scanSucceeded = false;
-            }
-        }
-        else
-            scanSucceeded = false;
-    }
-
     if (!scanSucceeded)
-        sLog.outError("ReconstructPostCreateOwners: durable marker scan failed; existing owners are kept and the scan retries with backoff");
+        sLog.outError("ReconstructPostCreateOwners: durable intent scan failed; existing owners are kept and the scan retries with backoff");
     else if (!scanned.empty())
-        sLog.outString("Reconstructed %zu post-create scheduler owner(s) from durable markers", scanned.size());
+        sLog.outString("Reconstructed %zu post-create scheduler owner(s) from durable intents", scanned.size());
 
     postCreateScanFailed = !scanSucceeded;
     postCreateScanRetryPasses = 0;
@@ -1048,6 +1014,9 @@ void RandomPlayerbotMgr::LoginFreeBots()
 
         for (auto [accountId, botGuid, mayAutoLogin] : sweep)
         {
+            if (postCreateQuarantined.count(botGuid))
+                continue;
+
             ObjectGuid guid(ObjectGuid(HIGHGUID_PLAYER, botGuid));
             Player* bot = sObjectMgr.GetPlayer(guid, false);
 
@@ -1409,8 +1378,10 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     postCreateSettled = false;
                 else if (creationIntent == living::kCreationIntentPrePersistence)
                     postCreateSettled = false;
-                else if (creationIntent >= living::kCreationIntentFinalized && postCreateSettled
+                else if (creationIntent == living::kCreationIntentFinalized && postCreateSettled
                     && !sRandomPlayerbotMgr.SetValue(botGuid, "create pending", 0))
+                    postCreateSettled = false;
+                else if (creationIntent != living::kCreationIntentFinalized)
                     postCreateSettled = false;
 
                 // Release from the schedule only from a KNOWN, valid always

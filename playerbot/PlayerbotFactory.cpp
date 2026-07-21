@@ -2484,7 +2484,10 @@ void PlayerbotFactory::InitSpells()
 
 void PlayerbotFactory::InitTalentsTree(bool incremental)
 {
-    uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
+    uint32 specNo = 0;
+    if (!sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "specNo", specNo))
+        return;
+
     if (incremental && specNo)
 	{
         specNo -= 1;
@@ -2497,7 +2500,8 @@ void PlayerbotFactory::InitTalentsTree(bool incremental)
         uint32 p2 = p1 + sPlayerbotAIConfig.specProbability[cls][1];
 
         specNo = (point < p1 ? 0 : (point < p2 ? 1 : 2));
-        sRandomPlayerbotMgr.SetValue(bot, "specNo", specNo + 1);
+        if (!sRandomPlayerbotMgr.SetValue(bot, "specNo", specNo + 1))
+            return;
     }
 
     InitTalents(specNo);
@@ -2955,16 +2959,11 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
         masterGS = ai->GetEquipGearScore(ai->GetMaster(), false, false);
     }
 
-    bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot) && bot->GetPlayerbotAI() && !bot->GetPlayerbotAI()->HasRealPlayerMaster() && !bot->GetPlayerbotAI()->IsInRealGuild();
-    if (!incremental)
-    {
-        DestroyItemsVisitor visitor(bot);
-        ai->InventoryIterateItems(&visitor, IterateItemsMask::ITERATE_ITEMS_IN_EQUIP);
-    }
-
     uint32 specId = sRandomItemMgr.GetPlayerSpecId(bot);
     if (specId == 0)
         return;
+
+    bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot) && bot->GetPlayerbotAI() && !bot->GetPlayerbotAI()->HasRealPlayerMaster() && !bot->GetPlayerbotAI()->IsInRealGuild();
 
     // choose type of weapon
     uint32 weaponType = 0;
@@ -2974,12 +2973,24 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
     if (bot->GetLevel() > 40 && (bot->getClass() == CLASS_PRIEST || bot->getClass() == CLASS_MAGE || bot->getClass() == CLASS_WARLOCK || specId == 20 || specId == 21 || specId == 22 || specId == 29 || specId == 31))
 #endif
     {
-        weaponType = sRandomPlayerbotMgr.GetValue(bot, "weaponType");
+        if (incremental
+            && !sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "weaponType", weaponType))
+            return;
+
         if (!weaponType || !incremental)
         {
             weaponType = urand(0, 1) ? (uint32)INVTYPE_WEAPON : (uint32)INVTYPE_2HWEAPON;
-            sRandomPlayerbotMgr.SetValue(bot, "weaponType", weaponType);
+            if (!sRandomPlayerbotMgr.SetValue(bot, "weaponType", weaponType))
+                return;
         }
+    }
+
+    // Destructive equipment changes start only after every metadata decision
+    // they depend on is known and any replacement value is durable.
+    if (!incremental)
+    {
+        DestroyItemsVisitor visitor(bot);
+        ai->InventoryIterateItems(&visitor, IterateItemsMask::ITERATE_ITEMS_IN_EQUIP);
     }
 
     // update only limited amount of slots with worst items
@@ -3881,8 +3892,12 @@ void PlayerbotFactory::InitAllSkills()
 
 void PlayerbotFactory::InitTradeSkills()
 {
-    uint16 firstSkill = sRandomPlayerbotMgr.GetValue(bot, "firstSkill");
-    uint16 secondSkill = sRandomPlayerbotMgr.GetValue(bot, "secondSkill");
+    uint32 firstSkill = 0;
+    uint32 secondSkill = 0;
+    if (!sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "firstSkill", firstSkill)
+        || !sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "secondSkill", secondSkill))
+        return;
+
     if (!firstSkill || !secondSkill)
     {
         std::vector<uint32> firstSkills;
@@ -3890,7 +3905,7 @@ void PlayerbotFactory::InitTradeSkills()
         switch (urand(0, 4))
         {
             case 0:
-                switch (urand(0, 7))
+                switch (urand(0, 5))
                 {
                     case 0:
                         firstSkill = SKILL_HERBALISM;
@@ -3955,8 +3970,9 @@ void PlayerbotFactory::InitTradeSkills()
                 secondSkill = secondSkills[urand(0, secondSkills.size() - 1)];
                 break;
         }
-        sRandomPlayerbotMgr.SetValue(bot, "firstSkill", firstSkill);
-        sRandomPlayerbotMgr.SetValue(bot, "secondSkill", secondSkill);
+        if (!sRandomPlayerbotMgr.SetValue(bot, "firstSkill", firstSkill)
+            || !sRandomPlayerbotMgr.SetValue(bot, "secondSkill", secondSkill))
+            return;
     }
 
     SetRandomSkill(SKILL_FIRST_AID);
@@ -5197,17 +5213,19 @@ void PlayerbotFactory::InitImmersive()
     uint32 owner = bot->GetObjectGuid().GetCounter();
     std::map<Stats, int32> percentMap;
 
-    bool initialized = false;
+    uint32 total = 0;
     for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
     {
         Stats type = (Stats)i;
         std::ostringstream name; name << "immersive_stat_" << i;
-        uint32 value = sRandomPlayerbotMgr.GetValue(owner, name.str());
-        if (value) initialized = true;
+        uint32 value = 0;
+        if (!sRandomPlayerbotMgr.TryGetEventValue(owner, name.str(), value))
+            return;
+        total += value;
         percentMap[type] = value;
     }
 
-    if (!initialized)
+    if (total != 100)
     {
         switch (bot->getClass())
         {
@@ -5272,7 +5290,8 @@ void PlayerbotFactory::InitImmersive()
         {
             Stats type = (Stats)i;
             std::ostringstream name; name << "immersive_stat_" << i;
-            sRandomPlayerbotMgr.SetValue(owner, name.str(), percentMap[type]);
+            if (!sRandomPlayerbotMgr.SetValue(owner, name.str(), percentMap[type]))
+                return;
         }
     }
     bot->InitStatsForLevel(true);

@@ -93,10 +93,20 @@ public:
         // ownership never overrides login=0.
         void RegisterPostCreateOwner(uint32 botGuid, uint32 accountId, bool mayAutoLogin)
         {
+            postCreateQuarantined.erase(botGuid);
             postCreateOwners[botGuid] = PostCreateOwner{ accountId, mayAutoLogin };
         }
+        void QuarantinePostCreateOwner(uint32 botGuid)
+        {
+            postCreateOwners.erase(botGuid);
+            postCreateQuarantined.insert(botGuid);
+        }
         // Drops a guid from the transient owner set (its deletion was adopted).
-        void ForgetPostCreateOwner(uint32 botGuid) { postCreateOwners.erase(botGuid); }
+        void ForgetPostCreateOwner(uint32 botGuid)
+        {
+            postCreateOwners.erase(botGuid);
+            postCreateQuarantined.erase(botGuid);
+        }
         static void DatabasePing(QueryResult* result, uint32 pingStart, std::string db);
         void SetDatabaseDelay(std::string db, uint32 delay) {databaseDelay[db] = delay;}
         uint32 GetDatabaseDelay(std::string db) {if(databaseDelay.find(db) == databaseDelay.end()) return 0; return databaseDelay[db];}
@@ -389,6 +399,9 @@ public:
             bool mayAutoLogin = false;
         };
         std::map<uint32, PostCreateOwner> postCreateOwners;
+        // Identity-mismatched durable creation intents stay inert for this
+        // process; a restart may re-evaluate them after manual repair.
+        std::set<uint32> postCreateQuarantined;
         // Bounded-backoff retry for a failed owner-reconstruction scan.
         bool postCreateScanFailed = false;
         uint32 postCreateScanRetryPasses = 0;

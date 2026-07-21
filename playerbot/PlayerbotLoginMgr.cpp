@@ -296,6 +296,17 @@ bool PlayerLoginInfo::LoginBot()
     if (holderState != HolderState::HOLDER_RECEIVED)
         return false;
 
+    // The character may have entered durable deletion after this holder was
+    // queued or loaded. The final materialization boundary must fail closed.
+    if (PlayerbotHolder::IsDeletionPending(guid))
+    {
+        delete holder;
+        holder = nullptr;
+        holderState = HolderState::HOLDER_EMPTY;
+        loginState = LoginState::BOT_OFFLINE;
+        return false;
+    }
+
     if (sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, guid), false))
     {
         loginState = LoginState::BOT_ONLINE;
@@ -753,4 +764,3 @@ uint32 PlayerBotLoginMgr::GetLevelBucketSize(uint32 level)
 
     return GetMaxOnlineBotCount() * sPlayerbotAIConfig.levelProbability[level] / levelProbabilityTotal;
 }
-

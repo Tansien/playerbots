@@ -438,17 +438,9 @@ namespace living
                 return;
             }
 
-            // Metadata failed after character durability: clean up, and only a
-            // CONFIRMED cleanup may make this attempt retryable.
-            bool const eventsGone = ops.deleteEventRows ? ops.deleteEventRows(record.guid) : false;
-
-            if (record.lifecycle.OnEventCleanupResult(eventsGone) == CreationStage::Quarantined)
-            {
-                PublishTerminal(record, CreationPollStatus::Quarantined,
-                    "event cleanup failed after metadata failure", onTerminal);
-                return;
-            }
-
+            // Keep the durable creation intent until the character is proven
+            // absent. If deletion or the process dies, restart can still
+            // resume/fail closed instead of inheriting an ownerless character.
             if (ops.deleteCharacter)
                 ops.deleteCharacter(record.guid, record.accountId);
             if (!ops.requestCleanupVerify || !ops.requestCleanupVerify(record.guid))
@@ -458,6 +450,19 @@ namespace living
         void ProcessCleanupVerify(Record& record, RowVerifyOutcome outcome, CreationFinalizerOps const& ops,
             std::function<void(CreationCompletion const&)> const& onTerminal)
         {
+            // Only confirmed absence permits removal of the durable intent and
+            // sibling event rows. The direct delete is execution-confirmed.
+            if (outcome == RowVerifyOutcome::Absent)
+            {
+                bool const eventsGone = ops.deleteEventRows && ops.deleteEventRows(record.guid);
+                if (record.lifecycle.OnEventCleanupResult(eventsGone) == CreationStage::Quarantined)
+                {
+                    PublishTerminal(record, CreationPollStatus::Quarantined,
+                        "character was removed but event cleanup could not be confirmed", onTerminal);
+                    return;
+                }
+            }
+
             switch (record.lifecycle.OnCleanupVerify(outcome, kMaxCleanupAttempts))
             {
                 case CreationStage::FailedRetryable:

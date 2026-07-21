@@ -126,7 +126,9 @@ bool ChangeTalentsAction::Execute(Event& event)
         out.str("");
         out.clear();
 
-        uint32 specId = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo") - 1;
+        uint32 specNo = 0;
+        sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "specNo", specNo);
+        uint32 specId = specNo ? specNo - 1 : 0;
         std::string specName = "";
         TalentPath* specPath;
         if (specId)
@@ -268,9 +270,17 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
         return selection;
     }
 
-    uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
+    uint32 specNo = 0;
+    uint32 specLinkPresent = 0;
+    if (!sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "specNo", specNo)
+        || !sRandomPlayerbotMgr.TryGetEventValue(bot->GetGUIDLow(), "specLink", specLinkPresent))
+    {
+        *out << "Talent metadata is unavailable; retry later.";
+        return selection;
+    }
     uint32 specId = specNo ? specNo - 1 : 0;
-    std::string specLink = sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink");
+    std::string specLink = specLinkPresent
+        ? sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink") : std::string();
     uint8 cls = bot->getClass();
 
     //Continue the current spec
@@ -472,5 +482,4 @@ bool AutoSetTalentsAction::Execute(Event& event)
 
     return true;
 }
-
 

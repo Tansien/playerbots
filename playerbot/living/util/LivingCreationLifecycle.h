@@ -24,8 +24,8 @@ namespace living
         // execution-confirmed: the creation is complete and the GUID may be
         // exposed (freeAltBots, group accounting).
         Created,
-        // Metadata failed after a durable character: deletion of character and
-        // event state is in flight; nothing is retryable yet.
+        // Metadata failed after a durable character: character deletion is in
+        // flight while the durable creation intent remains as restart owner.
         PendingCleanup,
         // Terminal, confirmed: either the character transaction rolled back
         // before any dependent write existed, or cleanup verifiably removed
@@ -96,8 +96,8 @@ namespace living
             return stage;
         }
 
-        // Result of the execution-confirmed event-state cleanup while
-        // PendingCleanup. A failed event cleanup is an UNCERTAIN cleanup.
+        // Result of event-state cleanup after character absence was confirmed.
+        // A failed event cleanup is an UNCERTAIN cleanup.
         CreationStage OnEventCleanupResult(bool eventsConfirmedGone)
         {
             if (stage != CreationStage::PendingCleanup)

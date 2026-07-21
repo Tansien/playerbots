@@ -173,16 +173,17 @@ LIVING_TEST(creation_finalizer_metadata_failure_runs_confirmed_cleanup_through_p
     finalizer.OnCallbackResult(301, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
     finalizer.Pump(spy.Make());
 
-    // Metadata failed after a durable row: event cleanup, queued character
-    // deletion and a cleanup verification - all from Pump.
-    LIVING_CHECK(spy.eventDeletes.size() == 1);
+    // Metadata failed after a durable row: keep the event rows (especially the
+    // restart owner), queue character deletion, then verify it.
+    LIVING_CHECK(spy.eventDeletes.empty());
     LIVING_CHECK(spy.characterDeletes.size() == 1);
     LIVING_CHECK(spy.cleanupVerifyRequests.size() == 1);
     LIVING_CHECK(finalizer.Poll(token, false).status == CreationPollStatus::Pending);
 
-    // Deletion verified absent -> retryable, record erased.
+    // Deletion verified absent -> event rows clear now, then retryable.
     finalizer.OnCallbackResult(301, RowVerifyOutcome::Absent, CreationCallbackKind::CleanupVerify);
     finalizer.Pump(spy.Make());
+    LIVING_CHECK(spy.eventDeletes.size() == 1);
     LIVING_CHECK(finalizer.RecordCount() == 0);
     LIVING_CHECK(finalizer.Poll(token, true).status == CreationPollStatus::FailedRetryable);
 
@@ -194,6 +195,10 @@ LIVING_TEST(creation_finalizer_metadata_failure_runs_confirmed_cleanup_through_p
     uint64_t const qToken = q.Begin(MakeRecord(302, 1, "EventFail"), quarantineSpy.Make());
     q.OnCallbackResult(302, RowVerifyOutcome::Verified, CreationCallbackKind::Verify);
     q.Pump(quarantineSpy.Make());
+    LIVING_CHECK(quarantineSpy.eventDeletes.empty());
+    q.OnCallbackResult(302, RowVerifyOutcome::Absent, CreationCallbackKind::CleanupVerify);
+    q.Pump(quarantineSpy.Make());
+    LIVING_CHECK(quarantineSpy.eventDeletes.size() == 1);
     LIVING_CHECK(q.RecordCount() == 1);
     LIVING_CHECK(q.Poll(qToken, false).status == CreationPollStatus::Quarantined);
 }
