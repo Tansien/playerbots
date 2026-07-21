@@ -101,20 +101,20 @@ public:
             postCreateOwners.erase(botGuid);
             postCreateQuarantined.insert(botGuid);
         }
-        void QuarantineTemporaryBot(uint32 botGuid)
-        {
-            postCreateOwners.erase(botGuid);
-            temporaryBotQuarantined.insert(botGuid);
-        }
+        bool ReconstructTemporaryBotQuarantines();
+        bool ReconstructStaleLoginClears();
         bool IsPostCreateQuarantined(uint32 botGuid) const
         {
             return postCreateQuarantined.count(botGuid) != 0;
         }
         bool IsLifecycleLoginBlocked(uint32 botGuid) const
         {
-            return IsPostCreateQuarantined(botGuid)
+            return temporaryBotScanFailed || staleLoginScanFailed
+                || PlayerbotHolder::IsCreationPending(botGuid)
+                || IsPostCreateQuarantined(botGuid)
                 || temporaryBotQuarantined.count(botGuid) != 0
-                || failedLoginCleanups.count(botGuid) != 0;
+                || failedLoginCleanups.count(botGuid) != 0
+                || failedStaleLoginClears.count(botGuid) != 0;
         }
         bool IsLoginCleanupPending(uint32 botGuid) const { return failedLoginCleanups.count(botGuid) != 0; }
         // Drops a guid from the transient owner set (its deletion was adopted).
@@ -210,7 +210,7 @@ public:
         // rejected before persistence, so a discarded transient character
         // leaves no cache entry behind (load state included - the next read
         // reloads from durable truth).
-        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); oneShotMarkers.erase(bot); }
+        void ForgetEventCache(uint32 bot) { eventCache.erase(bot); eventCacheLoadState.erase(bot); dirtyEvents.erase(bot); oneShotMarkers.erase(bot); }
         void ChangeStrategy(Player* player);
         uint32 GetValue(Player* bot, std::string type);
         uint32 GetValue(uint32 bot, std::string type);
@@ -252,6 +252,8 @@ public:
         static InventoryResult CanEquipUnseenItem(Player* player, uint8 slot, uint16& dest, uint32 item);
 
         bool AddRandomBot(uint32 bot);
+        bool PrepareAsyncLogin(uint32 bot);
+        bool PrepareAsyncLogout(uint32 bot);
         bool CreateRandomBot(const std::string& name, uint8 race, uint8 cls, uint32 level);
         bool DeleteRandomBot(ObjectGuid guid);
         virtual void MovePlayerBot(uint32 guid, PlayerbotHolder* newHolder) override;
@@ -423,10 +425,15 @@ public:
         // and stay login-inert for this process unless deletion or a newly
         // verified creation proves safe reuse of the GUID.
         std::set<uint32> temporaryBotQuarantined;
+        bool temporaryBotScanFailed = true;
+        uint32 temporaryBotScanRetryPasses = 0;
         // Login failures whose durable add/login clears were not confirmed.
         // Retried independently of currentBots so a partial clear cannot lose
         // its cleanup owner during durable-list reconciliation.
         std::set<uint32> failedLoginCleanups;
+        std::set<uint32> failedStaleLoginClears;
+        bool staleLoginScanFailed = true;
+        uint32 staleLoginScanRetryPasses = 0;
         bool eventTimersSynchronized = false;
         uint32 eventTimerSyncCutoff = 0;
         // Bounded-backoff retry for a failed owner-reconstruction scan.
@@ -442,6 +449,7 @@ public:
         // sooner).
         std::map<uint32, time_t> groupJoinBackoffUntil;
         void RetryFailedLoginCleanups();
+        void RetryFailedStaleLoginClears();
         BarGoLink* loginProgressBar;
         std::list<uint32> currentBots;
         std::list<uint32> arenaTeamMembers;

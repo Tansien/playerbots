@@ -2481,6 +2481,11 @@ void PlayerbotHolder::AbandonBatchToken(uint64 batchToken)
     ai::botCreationCleanup.AdoptBatch(batchToken);
 }
 
+void PlayerbotHolder::AbandonFinalizedBot(uint32 guid)
+{
+    ai::botCreationCleanup.AdoptGuid(guid);
+}
+
 void PlayerbotHolder::AdoptCharacterDeletion(uint32 guid, uint32 accountId, std::string const& expectedName,
     bool identityProvenInProcess)
 {
@@ -2499,7 +2504,9 @@ namespace ai
     static constexpr uint32 kDeletionScanRetryPasses = 600;
 
     // Same pattern for the creation-intent scan.
-    static bool creationIntentScanFailed = false;
+    // Starts unknown so login and new creation fail closed until the first
+    // durable scan succeeds (including the startup window before readoption).
+    static bool creationIntentScanFailed = true;
     static uint32 creationIntentScanRetryPasses = 0;
 }
 
@@ -2743,6 +2750,34 @@ bool PlayerbotHolder::IsDeletionPending(uint32 guid)
     // read, so every login/add/post-create path treats every guid as
     // possibly deletion-pending until the scan lands.
     return ai::deletionIntentScanFailed || ai::botDeletionConfirmer.core.Owns(guid);
+}
+
+bool PlayerbotHolder::IsCreationPending(uint32 guid)
+{
+    bool const finalizerOwns = ai::botCreationFinalizer.core.WithRecord(guid,
+        [](living::CreationFinalizer::Record const&) {});
+    return living::CreationMaterializationBlocked(!ai::creationIntentScanFailed, finalizerOwns);
+}
+
+bool PlayerbotHolder::PrepareAllocatedGuid(uint32 guid)
+{
+    if (IsDeletionPending(guid) || sRandomPlayerbotMgr.IsLifecycleLoginBlocked(guid))
+        return false;
+
+    auto residue = CharacterDatabase.PQuery(
+        "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid);
+    if (!residue)
+        return false;
+
+    if (residue->Fetch()[0].GetUInt32() > 0
+        && !CharacterDatabase.DirectPExecute(
+            "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", guid))
+        return false;
+
+    // A reused GUID must not inherit the previous occupant's cached events,
+    // even when the durable residue was already absent.
+    sRandomPlayerbotMgr.ForgetEventCache(guid);
+    return true;
 }
 
 void PlayerbotHolder::OnCharacterDeletionConfirmed(uint32 guid, uint32 accountId)
@@ -3287,6 +3322,26 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         uint32 botGuid = newBot->GetGUIDLow();
         result.guid = newBot->GetObjectGuid();
 
+        auto tearDownTransient = [&](living::BotCreateStatus status, char const* message)
+        {
+            sObjectAccessor.RemoveObject(newBot);
+            delete newBot;
+            delete botSession;
+            sRandomPlayerbotMgr.ForgetEventCache(botGuid);
+            ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
+            result.guid = ObjectGuid();
+            result.status = status;
+            result.messages.push_back(message);
+            return result;
+        };
+
+        // The allocated GUID must be clean BEFORE talent selection reads
+        // specNo/specLink. The same guard is used by legacy bulk creation.
+        if (!PrepareAllocatedGuid(botGuid))
+            return tearDownTransient(living::BotCreateStatus::TransientFailure,
+                "Allocated character id has pending lifecycle ownership or residue; "
+                "creation refused and retried with pacing");
+
         // Stages, in order: (1) apply the talent plan to the TRANSIENT player,
         // (2) derive the resulting roles, (3) verify the requested role,
         // (4) persist the character, (5) persist spec/creation metadata.
@@ -3363,45 +3418,6 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         {
             newBot->SetMap(master->GetMap());
             newBot->SetPosition(master->GetPositionX(), master->GetPositionY(), master->GetPositionZ(), master->GetOrientation());
-        }
-
-        // Stage 3.4: the allocated GUID must be provably CLEAN before any
-        // metadata is written. A GUID still owned by the deletion confirmer
-        // (or unknown while the deletion scan has not succeeded) is refused
-        // outright - its metadata would race the pending blanket clear. Any
-        // lifecycle residue rows from an earlier failed cleanup are removed
-        // with a CONFIRMED delete first, or the creation is refused: writing
-        // fresh metadata over residue would let this character inherit an
-        // older creation's gear/group/test/spec work.
-        auto tearDownTransient = [&](living::BotCreateStatus status, char const* message)
-        {
-            sObjectAccessor.RemoveObject(newBot);
-            delete newBot;
-            delete botSession;
-            sRandomPlayerbotMgr.ForgetEventCache(botGuid);
-            ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
-            result.guid = ObjectGuid();
-            result.status = status;
-            result.messages.push_back(message);
-            return result;
-        };
-
-        if (IsDeletionPending(botGuid) || sRandomPlayerbotMgr.IsLoginCleanupPending(botGuid))
-            return tearDownTransient(living::BotCreateStatus::TransientFailure,
-                "Allocated character id has pending deletion/login cleanup ownership; "
-                "creation refused and retried with pacing");
-
-        {
-            auto residue = CharacterDatabase.PQuery(
-                "SELECT COUNT(*) FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid);
-            if (!residue)
-                return tearDownTransient(living::BotCreateStatus::TransientFailure,
-                    "Lifecycle residue for the allocated character id could not be checked; creation refused");
-            if (residue->Fetch()[0].GetUInt32() > 0
-                && !CharacterDatabase.DirectPExecute(
-                    "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND bot = '%u'", botGuid))
-                return tearDownTransient(living::BotCreateStatus::TransientFailure,
-                    "Lifecycle residue for the allocated character id could not be removed; creation refused");
         }
 
         // Stage 3.5: the durable creation INTENT is written FIRST - it is the

@@ -40,7 +40,7 @@ namespace ai
         void RegisterMonitors();
         TestResult ExecuteCommand(const std::string& line, std::string& message);
         void CheckMonitors();
-        void RunCleanup();
+        bool RunCleanup();
         void SetResult(TestResult result, const std::string& message);
         void ReportResult();
         void TellMaster(const std::string& msg);

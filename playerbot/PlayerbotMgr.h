@@ -153,6 +153,9 @@ public:
     // and deletes any finalized temporary character exactly once.
     static void AbandonCreationToken(uint64 creationToken);
     static void AbandonBatchToken(uint64 batchToken);
+    // Transfers an already-finalized temporary GUID to the same pumped cleanup
+    // owner when a synchronous DeleteBot attempt was refused.
+    static void AbandonFinalizedBot(uint32 guid);
     // Adopts durable ownership of an ALREADY-QUEUED character deletion: login
     // eligibility (freeAltBots) is revoked immediately, and the character's
     // event rows/markers are cleared only after an execution-ordered readback
@@ -174,6 +177,9 @@ public:
     // reconstruct their post-create owner with the persisted login
     // authorization. A failed scan retries with bounded backoff.
     static bool ReadoptPendingCreations();
+    // Fail-closed materialization gate: true while the durable creation-intent
+    // scan is unknown or a live finalizer still owns this GUID.
+    static bool IsCreationPending(uint32 guid);
     // Whether a character deletion is currently owned (adopted, quarantined,
     // or freshly re-adopted from a durable intent). Every login/add-bot path
     // and the post-create owner reconstruction must exclude such guids: a
@@ -184,6 +190,10 @@ public:
     // this process. Dependent scans (creation readoption, owner
     // reconstruction) are non-authoritative while this is false.
     static bool DeletionStateKnown();
+    // Shared post-allocation guard for manual/group and legacy bulk creation.
+    // Refuses lifecycle-owned GUIDs and execution-confirms removal of orphaned
+    // owner=0 event residue before any metadata may be read or written.
+    static bool PrepareAllocatedGuid(uint32 guid);
     // Internal surface for the deletion confirmer: fires the OnBotDeleted
     // account-cleanup hook once absence is CONFIRMED (only then is the
     // durable character count truthful about the deletion).

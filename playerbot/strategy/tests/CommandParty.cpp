@@ -117,11 +117,20 @@ TestResult CommandPartyDespawnBot::Execute(const std::string& params, Player* bo
             ctx.spawnedBots.push_back(ObjectGuid(HIGHGUID_PLAYER, poll.guid));
     }
 
-    for (auto& guid : ctx.spawnedBots)
+    for (auto it = ctx.spawnedBots.begin(); it != ctx.spawnedBots.end();)
     {
-        ai->GetHolder()->DeleteBot(guid);
+        if (!*it || !it->IsPlayer() || ai->GetHolder()->DeleteBot(*it))
+            it = ctx.spawnedBots.erase(it);
+        else
+            ++it;
     }
-    ctx.spawnedBots.clear();
+
+    if (!ctx.spawnedBots.empty())
+    {
+        message = "Deletion intent could not be persisted; retrying spawned-bot cleanup";
+        return TestResult::PENDING;
+    }
+
     return TestResult::PASS;
 }
 

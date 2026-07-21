@@ -10,19 +10,30 @@ TestResult CleanupParty::Execute(const std::string& params, Player* bot,
                     PlayerbotAI* ai, TestContext& ctx, std::string& message)
 {
     // Default cleanup: despawn all spawned bots
-    for (auto& guid : ctx.spawnedBots)
+    for (auto it = ctx.spawnedBots.begin(); it != ctx.spawnedBots.end();)
     {
-        if (guid.IsPlayer())
+        if (it->IsPlayer())
         {
-            if (ai->GetHolder())
-                ai->GetHolder()->DeleteBot(guid, false);
+            if (!ai->GetHolder() || !ai->GetHolder()->DeleteBot(*it, false))
+            {
+                ++it;
+                continue;
+            }
         }
-        else if (Creature* creature = ai->GetCreature(guid))
+        else if (Creature* creature = ai->GetCreature(*it))
         {
             creature->ForcedDespawn();
         }
+
+        it = ctx.spawnedBots.erase(it);
     }
-    ctx.spawnedBots.clear();
+
+    if (!ctx.spawnedBots.empty())
+    {
+        message = "Spawned-bot deletion could not be durably owned; cleanup will retry";
+        return TestResult::PENDING;
+    }
+
     ctx.observing = false;
     return TestResult::PASS;
 }

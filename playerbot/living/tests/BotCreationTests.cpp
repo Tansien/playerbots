@@ -610,6 +610,18 @@ LIVING_TEST(activation_plan_confirms_all_writes_before_reporting_success)
     }
 }
 
+LIVING_TEST(async_login_timers_fail_closed_on_unknown_state)
+{
+    LIVING_CHECK(!TimedLogoutDue(true, false, 0));
+    LIVING_CHECK(TimedLogoutDue(true, true, 0));
+    LIVING_CHECK(!TimedLogoutDue(true, true, 1));
+
+    LIVING_CHECK(TimedOfflineBlocksLogin(false, false, 0));
+    LIVING_CHECK(TimedOfflineBlocksLogin(false, true, 1));
+    LIVING_CHECK(!TimedOfflineBlocksLogin(false, true, 0));
+    LIVING_CHECK(!TimedOfflineBlocksLogin(true, false, 0));
+}
+
 LIVING_TEST(always_toggle_applies_only_on_confirmed_write)
 {
     // Finding 9: `.bot always` may mutate freeAltBots and log the bot in/out

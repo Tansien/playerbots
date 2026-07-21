@@ -309,18 +309,6 @@ RandomPlayerbotMgr::RandomPlayerbotMgr()
         guildsDeleted = false;
         arenaTeamsDeleted = false;
 
-        if (eventTimersSynchronized)
-        {
-            for (uint32 bot : GetBots())
-            {
-                // Typed gate: only a KNOWN set login flag is swept; an unknown
-                // read must not trigger the write.
-                uint32 loginFlag = 0;
-                if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
-                    SetEventValue(bot, "login", 0, 0);
-            }
-        }
-
 #ifndef MANGOSBOT_ZERO
         // load random bot team members
         auto results = CharacterDatabase.PQuery("SELECT guid FROM arena_team_member");
@@ -658,7 +646,16 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     sMemoryMonitor.LogCount(sConfig.GetStringDefault("LogsDir") + "/" + "memory.csv");
 #endif
 
-    if (!sPlayerbotAIConfig.randomBotAutologin || !sPlayerbotAIConfig.enabled)
+    if (!sPlayerbotAIConfig.enabled)
+        return;
+
+    if (temporaryBotScanFailed && ++temporaryBotScanRetryPasses >= kOwnerScanRetryPasses)
+        ReconstructTemporaryBotQuarantines();
+    if (staleLoginScanFailed && ++staleLoginScanRetryPasses >= kOwnerScanRetryPasses)
+        ReconstructStaleLoginClears();
+    RetryFailedStaleLoginClears();
+
+    if (!sPlayerbotAIConfig.randomBotAutologin)
         return;
 
     // Timer rows must be shifted before any per-bot event cache is loaded.
@@ -673,12 +670,6 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
         }
 
         eventTimersSynchronized = true;
-        for (uint32 bot : GetBots())
-        {
-            uint32 loginFlag = 0;
-            if (TryGetEventValue(bot, "login", loginFlag) && loginFlag)
-                SetEventValue(bot, "login", 0, 0);
-        }
     }
 
     RetryFailedLoginCleanups();
@@ -920,6 +911,78 @@ void RandomPlayerbotMgr::ScaleBotActivity()
 
         sPlayerbotAIConfig.log("activity_pid.csv", out.str().c_str());
     }
+}
+
+bool RandomPlayerbotMgr::ReconstructTemporaryBotQuarantines()
+{
+    // Restart-only identity classification. Once authoritative, a config
+    // reload must not reclassify trusted temporary bots created in-process.
+    if (!temporaryBotScanFailed)
+        return true;
+
+    static char const* kCondition =
+        "r.owner = 0 AND r.event = 'temporary' AND c.name = r.data";
+
+    temporaryBotScanFailed = true;
+    temporaryBotScanRetryPasses = 0;
+
+    auto countResult = CharacterDatabase.PQuery(
+        "SELECT COUNT(*) FROM ai_playerbot_random_bots r "
+        "JOIN characters c ON c.guid = r.bot WHERE %s", kCondition);
+    if (!countResult)
+        return false;
+
+    std::set<uint32> scanned;
+    if (countResult->Fetch()[0].GetUInt32() > 0)
+    {
+        auto rows = CharacterDatabase.PQuery(
+            "SELECT r.bot FROM ai_playerbot_random_bots r "
+            "JOIN characters c ON c.guid = r.bot WHERE %s", kCondition);
+        if (!rows)
+            return false;
+
+        do
+        {
+            scanned.insert(rows->Fetch()[0].GetUInt32());
+        } while (rows->NextRow());
+    }
+
+    temporaryBotQuarantined = std::move(scanned);
+    temporaryBotScanFailed = false;
+    return true;
+}
+
+bool RandomPlayerbotMgr::ReconstructStaleLoginClears()
+{
+    if (!staleLoginScanFailed)
+        return true;
+
+    staleLoginScanFailed = true;
+    staleLoginScanRetryPasses = 0;
+
+    auto countResult = CharacterDatabase.Query(
+        "SELECT COUNT(*) FROM ai_playerbot_random_bots "
+        "WHERE owner = 0 AND event = 'login' AND `value` > 0");
+    if (!countResult)
+        return false;
+
+    if (countResult->Fetch()[0].GetUInt32() > 0)
+    {
+        auto rows = CharacterDatabase.Query(
+            "SELECT bot FROM ai_playerbot_random_bots "
+            "WHERE owner = 0 AND event = 'login' AND `value` > 0");
+        if (!rows)
+            return false;
+
+        do
+        {
+            failedStaleLoginClears.insert(rows->Fetch()[0].GetUInt32());
+        } while (rows->NextRow());
+    }
+
+    staleLoginScanFailed = false;
+    RetryFailedStaleLoginClears();
+    return true;
 }
 
 void RandomPlayerbotMgr::ReconstructPostCreateOwners()
@@ -2530,10 +2593,12 @@ InventoryResult RandomPlayerbotMgr::CanEquipUnseenItem(Player* player, uint8 slo
 
 void RandomPlayerbotMgr::SaveCurTime()
 {
-    if (!EventTimeSyncTimer || time(NULL) > (EventTimeSyncTimer + 60))
-        EventTimeSyncTimer = time(NULL);
+    time_t const now = time(nullptr);
+    if (EventTimeSyncTimer && now <= EventTimeSyncTimer + 60)
+        return;
 
-    SetValue(uint32(0), "current_time", uint32(time(nullptr)));
+    if (SetValue(uint32(0), "current_time", static_cast<uint32>(now)))
+        EventTimeSyncTimer = now;
 }
 
 bool RandomPlayerbotMgr::SyncEventTimers()
@@ -2681,6 +2746,49 @@ bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
         currentBots.push_back(bot);
 
     sLog.outDetail("Random bot added #%d", bot);
+    return true;
+}
+
+bool RandomPlayerbotMgr::PrepareAsyncLogin(uint32 bot)
+{
+    uint32 priorAdd = 0, priorLogout = 0;
+    if (!TryGetEventValue(bot, "logout", priorLogout)
+        || (sPlayerbotAIConfig.randomBotTimedLogout
+            && !TryGetEventValue(bot, "add", priorAdd)))
+        return false;
+
+    std::vector<living::PlannedEventWrite> plan;
+    if (sPlayerbotAIConfig.randomBotTimedLogout)
+        plan.push_back({ "add", 1,
+            urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime),
+            priorAdd, RemainingValidity(bot, "add") });
+    plan.push_back({ "logout", 0, 0, priorLogout, RemainingValidity(bot, "logout") });
+    if (!RunActivationPlan(bot, plan))
+        return false;
+
+    currentBotsDirty = true;
+    return true;
+}
+
+bool RandomPlayerbotMgr::PrepareAsyncLogout(uint32 bot)
+{
+    uint32 priorAdd = 0, priorLogout = 0;
+    if (!TryGetEventValue(bot, "add", priorAdd)
+        || (sPlayerbotAIConfig.randomBotTimedOffline
+            && !TryGetEventValue(bot, "logout", priorLogout)))
+        return false;
+
+    std::vector<living::PlannedEventWrite> plan = {
+        { "add", 0, 0, priorAdd, RemainingValidity(bot, "add") },
+    };
+    if (sPlayerbotAIConfig.randomBotTimedOffline)
+        plan.push_back({ "logout", 1,
+            urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime),
+            priorLogout, RemainingValidity(bot, "logout") });
+    if (!RunActivationPlan(bot, plan))
+        return false;
+
+    currentBotsDirty = true;
     return true;
 }
 
@@ -4231,7 +4339,9 @@ living::CountedLoadOutcome RandomPlayerbotMgr::LoadCurrentBotsFromDb()
 {
     static char const* activeBotsWhere =
         "FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'add' AND `value` > 0 "
-        "AND bot NOT IN (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'logout' AND `value` > 0)";
+        "AND (`time` + validIn) > UNIX_TIMESTAMP() "
+        "AND bot NOT IN (SELECT bot FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'logout' "
+        "AND `value` > 0 AND (`time` + validIn) > UNIX_TIMESTAMP())";
 
     std::optional<uint64> count;
     if (auto countResult = CharacterDatabase.PQuery("SELECT COUNT(*) %s", activeBotsWhere))
@@ -4419,7 +4529,8 @@ bool RandomPlayerbotMgr::TryGetEventValue(uint32 bot, std::string const& event, 
     // Expiry interpretation is shared with the host tests: lifecycle-control
     // rows (creation/deletion obligations) are non-expiring - a first login
     // more than 15 days after creation must still see its owed markers.
-    if ((time(0) - e.lastChangeTime) >= e.validIn && !living::IsNonExpiringEvent(event))
+    if (!living::IsEventValueActive(event, e.value, e.lastChangeTime, e.validIn,
+            static_cast<uint32>(time(nullptr))))
         e.value = 0;
 
     value = e.value;
@@ -5089,6 +5200,17 @@ void RandomPlayerbotMgr::RetryFailedLoginCleanups()
 
         currentBots.remove(bot);
         it = failedLoginCleanups.erase(it);
+    }
+}
+
+void RandomPlayerbotMgr::RetryFailedStaleLoginClears()
+{
+    for (auto it = failedStaleLoginClears.begin(); it != failedStaleLoginClears.end();)
+    {
+        if (SetEventValue(*it, "login", 0, 0))
+            it = failedStaleLoginClears.erase(it);
+        else
+            ++it;
     }
 }
 

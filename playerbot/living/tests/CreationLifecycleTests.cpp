@@ -10,6 +10,13 @@ using namespace living;
 // production decision core; the live async-queue/MySQL wiring is
 // compile-verified only.
 
+LIVING_TEST(creation_materialization_fails_closed_until_finalization_is_done)
+{
+    LIVING_CHECK(CreationMaterializationBlocked(false, false));
+    LIVING_CHECK(CreationMaterializationBlocked(true, true));
+    LIVING_CHECK(!CreationMaterializationBlocked(true, false));
+}
+
 LIVING_TEST(creation_lifecycle_character_save_failure_is_retryable_only_when_confirmed)
 {
     // The character INSERT transaction rolled back: the verify observes a

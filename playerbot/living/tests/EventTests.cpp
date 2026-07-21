@@ -623,3 +623,12 @@ LIVING_TEST(lifecycle_control_events_never_expire)
     for (char const* event : { "add", "logout", "login", "update", "teleport", "bot_count" })
         LIVING_CHECK(!living::IsNonExpiringEvent(event));
 }
+
+LIVING_TEST(event_activity_uses_the_same_strict_expiry_boundary_as_durable_loading)
+{
+    LIVING_CHECK(living::IsEventValueActive("add", 1, 100, 10, 109));
+    LIVING_CHECK(!living::IsEventValueActive("add", 1, 100, 10, 110));
+    LIVING_CHECK(living::IsEventValueActive("add", 1, 120, 10, 110));
+    LIVING_CHECK(!living::IsEventValueActive("add", 0, 100, 10, 101));
+    LIVING_CHECK(living::IsEventValueActive("create pending", 1, 100, 10, 1000));
+}

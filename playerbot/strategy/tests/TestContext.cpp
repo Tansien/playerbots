@@ -16,17 +16,20 @@ void TestContext::Reset()
     cleanupPc = 0;
     cleanupPrepared = false;
     whoResponded = false;
+    resultReported = false;
     result = TestResult::PENDING;
     resultMessage.clear();
     testName.clear();
     testStartPosition = WorldPosition();
     destinationPosition = GuidPosition();
 
+    // DeleteBot returning false means no durable deletion intent exists yet.
+    // Transfer the GUID to the always-pumped cleanup owner before resetting.
     for (ObjectGuid const& guid : spawnedBots)
     {
-        if (guid && guid.IsPlayer())
+        if (guid && guid.IsPlayer() && !sRandomPlayerbotMgr.DeleteBot(guid, true))
         {
-            sRandomPlayerbotMgr.DeleteBot(guid, true);
+            PlayerbotHolder::AbandonFinalizedBot(guid.GetCounter());
         }
     }
     spawnedBots.clear();
