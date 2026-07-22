@@ -291,7 +291,7 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
         *out << "Talent metadata is unavailable; retry later.";
         return selection;
     }
-    uint32 specId = specNo ? specNo - 1 : 0;
+    int specId = specNo ? static_cast<int>(specNo - 1) : -1;
     std::string specLink = specLinkPresent
         ? sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink") : std::string();
     uint8 cls = bot->getClass();
@@ -379,7 +379,6 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
         if (paths.size() == 0)
         {
             *out << "No predefined talents found for this class.";
-            specId = -1;
         }
         else if (paths.size() > 1 && sPlayerbotAIConfig.autoPickTalents != "full" && !sRandomPlayerbotMgr.IsRandomBot(bot))
         {

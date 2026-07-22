@@ -1036,6 +1036,9 @@ LIVING_TEST(creation_intent_codec_and_recovery_boundaries)
         name, account, level, autoAdd, hasObligations));
     LIVING_CHECK(name == "X" && account == 1);
     LIVING_CHECK(level == 1 && !autoAdd && !hasObligations);
+    LIVING_CHECK(DecodeCreationIntent(EncodeCreationIntent("Defaultlevel", 1, 0, false, false),
+        name, account, level, autoAdd, hasObligations));
+    LIVING_CHECK(level == 1);
     LIVING_CHECK(EventValueFitsSchema("create pending",
         EncodeCreationIntent("Longestname1", 4294967295u, 4294967295u, true, true)));
     LIVING_CHECK(!DecodeCreationIntent("garbage", name, account, level, autoAdd, hasObligations));

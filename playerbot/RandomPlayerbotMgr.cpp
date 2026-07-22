@@ -712,8 +712,12 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
         }
     }
 
+    std::list<uint32> availableBots(GetBots());
+    uint32 availableBotCount = availableBots.size();
+    uint32 onlineBotCount = GetPlayerbotsAmount();
+
     ScaleBotActivity();
-    if (sPlayerbotAIConfig.asyncBotLogin)
+    if (sPlayerbotAIConfig.asyncBotLogin && !currentBotsDirty)
     {
         auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "AsyncBotLogin");
         // The worker receives one trusted population snapshot. It never reads
@@ -722,10 +726,6 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
         pmo.reset();
     }
 
-    std::list<uint32> availableBots = GetBots();    
-    uint32 availableBotCount = availableBots.size();
-    uint32 onlineBotCount = GetPlayerbotsAmount();
-    
     SetAIInternalUpdateDelay(sPlayerbotAIConfig.randomBotUpdateInterval);
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT,
@@ -794,21 +794,16 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
             if (GetPlayerBot(bot))
                 continue;   
 
-            // find() instead of operator[]: probing must not default-insert an
-            // empty per-bot map (that poisoned the explicit load-state
-            // bookkeeping the bulk loader relies on).
-            auto cachedBot = eventCache.find(bot);
-            if (cachedBot != eventCache.end() && !cachedBot->second.empty() && GetEventValue(bot, "login"))
+            uint32 login = 0;
+            if (!TryGetEventValue(bot, "login", login))
+                break;
+
+            if (login)
             {
-                onlineBotCount++;
+                if (++onlineBotCount >= maxAllowedBotCount)
+                    break;
                 continue;
             }
-
-            if (GetEventValue(bot, "login"))
-                onlineBotCount++;
-
-            if (onlineBotCount >= maxAllowedBotCount)
-                break;
 
             if (ProcessBot(bot)) {
                 --maxLogins;
@@ -1100,10 +1095,14 @@ void RandomPlayerbotMgr::LoginFreeBots()
             bool mayAutoLogin;
         };
         std::vector<SweepEntry> sweep;
+        std::set<uint32> freeAltGuids;
         for (auto const& [entryAccount, entryGuid] : sPlayerbotAIConfig.freeAltBots)
+        {
+            freeAltGuids.insert(entryGuid);
             sweep.push_back({ entryAccount, entryGuid, true });
+        }
         for (auto const& [ownerGuid, owner] : postCreateOwners)
-            if (!sPlayerbotAIConfig.IsFreeAltBot(ownerGuid))
+            if (freeAltGuids.count(ownerGuid) == 0)
                 sweep.push_back({ owner.accountId, ownerGuid, owner.mayAutoLogin });
 
         for (auto [accountId, botGuid, mayAutoLogin] : sweep)
@@ -2780,7 +2779,8 @@ bool RandomPlayerbotMgr::PrepareAsyncLogin(uint32 bot)
     if (!RunActivationPlan(bot, plan))
         return false;
 
-    currentBotsDirty = true;
+    if (std::find(currentBots.begin(), currentBots.end(), bot) == currentBots.end())
+        currentBots.push_back(bot);
     return true;
 }
 
@@ -2795,14 +2795,14 @@ bool RandomPlayerbotMgr::PrepareLogout(uint32 bot)
     std::vector<living::PlannedEventWrite> plan = {
         { "add", 0, 0, priorAdd, RemainingValidity(bot, "add") },
     };
-    if (sPlayerbotAIConfig.randomBotTimedOffline)
+    if (sPlayerbotAIConfig.randomBotTimedOffline && !priorLogout)
         plan.push_back({ "logout", 1,
             urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime),
             priorLogout, RemainingValidity(bot, "logout") });
     if (!RunActivationPlan(bot, plan))
         return false;
 
-    currentBotsDirty = true;
+    currentBots.remove(bot);
     return true;
 }
 
@@ -2878,6 +2878,16 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         else
             sLog.outDetail("Bot #%d %s:%d <%s>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H", player->GetLevel(), player->GetName());
 
+        // An already-offline bot needs only its stale add marker cleared; it
+        // must not receive a fresh offline embargo.
+        if (!player)
+        {
+            if (!SetEventValue(bot, "add", 0, 0))
+                return false;
+            currentBots.remove(bot);
+            return false;
+        }
+
         // Persist and confirm the COMPLETE offline transition before touching
         // the scheduler list or the world. Failure is compensated and retried
         // with the bot still online/current.
@@ -2885,11 +2895,6 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
             return false;
 
         currentBots.remove(bot);
-
-        if (!player)
-        {
-            return false;
-        }
 
         LogoutPlayerBot(bot);
 
@@ -4383,7 +4388,7 @@ living::CountedLoadOutcome RandomPlayerbotMgr::LoadCurrentBotsFromDb()
     return outcome;
 }
 
-std::list<uint32> RandomPlayerbotMgr::GetBots()
+std::list<uint32> const& RandomPlayerbotMgr::GetBots()
 {
     // After an uncertain activation the nonempty in-memory vector is NOT
     // trusted: reconcile from canonical durable state. A confirmed EMPTY
@@ -4690,9 +4695,11 @@ living::EventWriteResult RandomPlayerbotMgr::SetEventValueEx(uint32 bot, std::st
     // inside callers that already batch, so this setter owns no transaction: it
     // runs exactly one synchronous DirectPExecute whose return value is the
     // actual execution result. A nonzero value UPDATEs existing matching rows
-    // or INSERTs a new one (decided by a synchronous probe); zero DELETEs.
+    // or INSERTs a new one. Trusted cache state avoids the old COUNT probe;
+    // unknown row state still probes synchronously. Zero values DELETE.
     uint32 const now = (uint32)time(0);
     living::EventPersistOutcome const outcome = living::PersistEventValue(event, data, value,
+        priorKnown ? std::optional<bool>(priorPresent) : std::nullopt,
         [&]() -> std::optional<bool>
         {
             // COUNT(*) always yields a row, so a null result is a failed probe,
@@ -5224,12 +5231,30 @@ void RandomPlayerbotMgr::RetryFailedLoginCleanups()
 
 void RandomPlayerbotMgr::RetryFailedStaleLoginClears()
 {
-    for (auto it = failedStaleLoginClears.begin(); it != failedStaleLoginClears.end();)
+    if (failedStaleLoginClears.empty())
+        return;
+
+    std::vector<uint32> batch;
+    std::ostringstream ids;
+    // ponytail: one bounded statement avoids both a per-guid round trip and
+    // an unbounded SQL string; raise 256 only if measured cleanup lag warrants it.
+    for (auto it = failedStaleLoginClears.begin(); it != failedStaleLoginClears.end() && batch.size() < 256; ++it)
     {
-        if (SetEventValue(*it, "login", 0, 0))
-            it = failedStaleLoginClears.erase(it);
-        else
-            ++it;
+        if (!batch.empty())
+            ids << ',';
+        ids << *it;
+        batch.push_back(*it);
+    }
+
+    if (!CharacterDatabase.DirectPExecute(
+            "DELETE FROM ai_playerbot_random_bots WHERE owner = 0 AND event = 'login' AND bot IN (%s)",
+            ids.str().c_str()))
+        return;
+
+    for (uint32 bot : batch)
+    {
+        failedStaleLoginClears.erase(bot);
+        ForgetEventCache(bot);
     }
 }
 
@@ -6173,6 +6198,7 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleStats(std::string param)
 std::list<std::string> RandomPlayerbotMgr::HandleConsoleReload(std::string param)
 {
     std::list<std::string> messages;
+    sPlayerBotLoginMgr.WaitForIdle();
     sPlayerbotAIConfig.Initialize();
     std::string msg = "Playerbot config reloaded.";
     messages.push_back(msg);
@@ -6409,8 +6435,9 @@ void RandomPlayerbotMgr::OnBotDeleted(uint32 botGuid, uint32 accountId)
                 std::string username = result->Fetch()[0].GetString();
                 if (username.substr(0, prefixLen) == prefix.str())
                 {
-                    uint32 accountNum = std::stoul(username.substr(prefixLen));
-                    if (accountNum >= sPlayerbotAIConfig.randomBotAccountCount)
+                    uint32 accountNum = 0;
+                    if (living::TryParseUInt32(username.substr(prefixLen), accountNum)
+                        && accountNum >= sPlayerbotAIConfig.randomBotAccountCount)
                     {
                         sAccountMgr.DeleteAccount(accountId);
                         sLog.outString("Deleted empty random bot account: %s (id: %u)", username.c_str(), accountId);

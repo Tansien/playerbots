@@ -286,7 +286,7 @@ namespace living
     // result-returning paths (DirectPExecute), never by transaction queueing.
     template <typename ProbeFn, typename ExecuteFn>
     EventPersistOutcome PersistEventValue(std::string const& event, std::string const& data, uint32_t value,
-        ProbeFn&& probe, ExecuteFn&& execute)
+        std::optional<bool> knownExists, ProbeFn&& probe, ExecuteFn&& execute)
     {
         if (!EventValueFitsSchema(event, data))
             return EventPersistOutcome::Rejected;
@@ -294,7 +294,7 @@ namespace living
         EventWriteKind kind = EventWriteKind::Delete;
         if (value)
         {
-            std::optional<bool> const exists = probe();
+            std::optional<bool> const exists = knownExists.has_value() ? knownExists : probe();
             if (!exists)
                 return EventPersistOutcome::ProbeFailed;
 

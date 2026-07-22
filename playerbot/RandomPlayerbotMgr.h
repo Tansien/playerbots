@@ -323,7 +323,7 @@ public:
         void HandleHomebindVerify(QueryResult* result, uint64 relocationToken);
         // Advances one Finalizing relocation's owed completion work.
         living::RelocationAdvanceResult AdvanceRelocation(Player* bot);
-        std::list<uint32> GetBots();
+        std::list<uint32> const& GetBots();
         std::list<uint32> GetBgBots(uint32 bracket);
         time_t BgCheckTimer;
         time_t LfgCheckTimer;

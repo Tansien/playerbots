@@ -117,12 +117,13 @@ namespace
         int probeCalls = 0;
         int executeCalls = 0;
         std::optional<bool> probeResult = false;
+        std::optional<bool> knownExists;
         bool executeResult = true;
         std::optional<living::EventWriteKind> executedKind;
 
         living::EventPersistOutcome Run(std::string const& event, std::string const& data, uint32_t value)
         {
-            return living::PersistEventValue(event, data, value,
+            return living::PersistEventValue(event, data, value, knownExists,
                 [&]() { ++probeCalls; return probeResult; },
                 [&](living::EventWriteKind kind) { ++executeCalls; executedKind = kind; return executeResult; });
         }
@@ -149,6 +150,22 @@ LIVING_TEST(event_persist_updates_existing_row_and_inserts_missing_row)
     fresh.probeResult = false;
     LIVING_CHECK(fresh.Run("add", "", 1) == EventPersistOutcome::Persisted);
     LIVING_CHECK(fresh.executedKind == EventWriteKind::Insert);
+}
+
+LIVING_TEST(event_persist_reuses_known_row_existence)
+{
+    PersistSpy missing;
+    missing.knownExists = false;
+    missing.probeResult = std::nullopt;
+    LIVING_CHECK(missing.Run("add", "", 1) == EventPersistOutcome::Persisted);
+    LIVING_CHECK(missing.probeCalls == 0);
+    LIVING_CHECK(missing.executedKind == EventWriteKind::Insert);
+
+    PersistSpy present;
+    present.knownExists = true;
+    LIVING_CHECK(present.Run("add", "", 1) == EventPersistOutcome::Persisted);
+    LIVING_CHECK(present.probeCalls == 0);
+    LIVING_CHECK(present.executedKind == EventWriteKind::Update);
 }
 
 LIVING_TEST(event_persist_oversized_value_rejected_before_any_statement)
@@ -193,7 +210,7 @@ LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_resta
 
     auto set = [&](std::string const& event, uint32_t value)
     {
-        auto outcome = living::PersistEventValue(event, "", value,
+        auto outcome = living::PersistEventValue(event, "", value, std::nullopt,
             [&]() -> std::optional<bool> { return rows.count(event) > 0; },
             [&](living::EventWriteKind kind)
             {
