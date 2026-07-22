@@ -364,7 +364,7 @@ namespace living
         uint32_t level, bool autoAdd, bool hasObligations)
     {
         return "name:" + name + "|account:" + std::to_string(accountId)
-            + "|level:" + std::to_string(level) + "|login:" + (autoAdd ? "1" : "0")
+            + "|level:" + std::to_string(level ? level : 1) + "|login:" + (autoAdd ? "1" : "0")
             + "|obligations:" + (hasObligations ? "1" : "0");
     }
 

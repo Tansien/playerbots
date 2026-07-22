@@ -6,6 +6,7 @@
 #include "playerbot/living/util/LivingKeyValueArgs.h"
 #include "playerbot/living/util/LivingNumericParse.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/PlayerbotLoginMgr.h"
 #include "PlayerbotDbStore.h"
 #include "Database/DatabaseImpl.h"
 #include "playerbot/PlayerbotFactory.h"
@@ -1262,6 +1263,7 @@ std::list<std::string> PlayerbotHolder::HandleReload(Player* master, const std::
         return messages;
     }
     messages.push_back("Reloading config");
+    sPlayerBotLoginMgr.WaitForIdle();
     sPlayerbotAIConfig.Initialize();
     return messages;
 }
@@ -2796,11 +2798,10 @@ void PlayerbotHolder::OnCharacterDeletionConfirmed(uint32 guid, uint32 accountId
 
 uint32 PlayerbotHolder::MaxCharsPerAccount()
 {
-#ifdef MANGOSBOT_TWO
-    return 10;
-#else
-    return 9;
-#endif
+    // The durable count is realm-local, and character creation enforces both
+    // configured limits. Reserve against the stricter ceiling.
+    return std::min(sWorld.getConfig(CONFIG_UINT32_CHARACTERS_PER_ACCOUNT),
+        sWorld.getConfig(CONFIG_UINT32_CHARACTERS_PER_REALM));
 }
 
 bool PlayerbotHolder::TryGetDurableCharacterCount(uint32 accountId, uint32& count)
@@ -4385,8 +4386,6 @@ bool PlayerbotHolder::DeleteBot(ObjectGuid guid, bool allowInstant)
     // kept, login still blocked, a restart's scan retries.
     AdoptCharacterDeletion(guid.GetCounter(), botAccount, expectedName, true);
 
-    OnBotDeleted(guid, botAccount);
-
     return true;
 }
 
@@ -4630,7 +4629,7 @@ std::unordered_map<std::string, std::string> PlayerbotHolder::GetCommandTexts()
         {"reload", "Reload the playerbot config (GM only).\nUsage: .(rnd)bot reload"},
         {"tweak", "Adjust the tweak value for testing (GM only).\nUsage: .(rnd)bot tweak"},
         {"self", "Enable self-bot mode for a player.\nUsage: .(rnd)bot self <playername>"},
-        {"group", "Create 4 bots with complementary classes at master's level.\nUsage: .(rnd)bot group"},
+        {"group", "Create a complementary group for a level 10+ master.\nUsage: .(rnd)bot group [size=<1..raid max>] [gear=<default|empty|green/uncommon|blue/rare|purple/epic|upgrade|sync|best|partial>] [login=<true|false>] [temporary=<true|false>]\nClass, role, race, faction, level, name, and test are selected automatically."},
         {"create", "Create a new bot character.\nUsage: .(rnd)bot create level=<n> class=<class> race=<race>"},
         {"spoof", "Spoof as another bot for command routing.\nUsage: .(rnd)bot spoof <botname>"},
         {"runtest", "Run bot tests.\nUsage: .rndbot runtest <testnamepart> [count]"},
