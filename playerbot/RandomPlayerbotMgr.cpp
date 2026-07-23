@@ -720,8 +720,8 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     if (sPlayerbotAIConfig.asyncBotLogin && !currentBotsDirty)
     {
         auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "AsyncBotLogin");
-        // The worker receives one trusted population snapshot. It never reads
-        // bot_count itself, so expiry/unknown cannot collapse into a zero queue.
+        // Queue planning reads the trusted manager state on the world thread;
+        // dirty population state defers the whole pass until reconciliation.
         sPlayerBotLoginMgr.Update(players, maxAllowedBotCount);
         pmo.reset();
     }
@@ -796,7 +796,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
 
             uint32 login = 0;
             if (!TryGetEventValue(bot, "login", login))
-                break;
+                continue;
 
             if (login)
             {
@@ -2766,16 +2766,15 @@ bool RandomPlayerbotMgr::PrepareAsyncLogin(uint32 bot)
 {
     uint32 priorAdd = 0, priorLogout = 0;
     if (!TryGetEventValue(bot, "logout", priorLogout)
-        || (sPlayerbotAIConfig.randomBotTimedLogout
-            && !TryGetEventValue(bot, "add", priorAdd)))
+        || !TryGetEventValue(bot, "add", priorAdd))
         return false;
 
-    std::vector<living::PlannedEventWrite> plan;
-    if (sPlayerbotAIConfig.randomBotTimedLogout)
-        plan.push_back({ "add", 1,
-            urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime),
-            priorAdd, RemainingValidity(bot, "add") });
-    plan.push_back({ "logout", 0, 0, priorLogout, RemainingValidity(bot, "logout") });
+    std::vector<living::PlannedEventWrite> plan = {
+        { "add", 1, sPlayerbotAIConfig.randomBotTimedLogout
+            ? urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime)
+            : static_cast<uint32>(-1), priorAdd, RemainingValidity(bot, "add") },
+        { "logout", 0, 0, priorLogout, RemainingValidity(bot, "logout") },
+    };
     if (!RunActivationPlan(bot, plan))
         return false;
 
@@ -2878,23 +2877,14 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         else
             sLog.outDetail("Bot #%d %s:%d <%s>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H", player->GetLevel(), player->GetName());
 
-        // An already-offline bot needs only its stale add marker cleared; it
-        // must not receive a fresh offline embargo.
-        if (!player)
-        {
-            if (!SetEventValue(bot, "add", 0, 0))
-                return false;
-            currentBots.remove(bot);
-            return false;
-        }
-
         // Persist and confirm the COMPLETE offline transition before touching
         // the scheduler list or the world. Failure is compensated and retried
         // with the bot still online/current.
         if (!PrepareLogout(bot))
             return false;
 
-        currentBots.remove(bot);
+        if (!player)
+            return false;
 
         LogoutPlayerBot(bot);
 
@@ -4778,8 +4768,10 @@ living::EventWriteResult RandomPlayerbotMgr::SetEventValueEx(uint32 bot, std::st
         return classified;
     }
 
-    CachedEvent e(value, now, validIn, data);
-    eventCache[bot][event] = e;
+    if (value)
+        eventCache[bot][event] = CachedEvent(value, now, validIn, data);
+    else
+        eventCache[bot].erase(event);
 
     // A confirmed write makes the cache authoritative again for this event.
     if (auto botDirty = dirtyEvents.find(bot); botDirty != dirtyEvents.end())
@@ -5254,7 +5246,14 @@ void RandomPlayerbotMgr::RetryFailedStaleLoginClears()
     for (uint32 bot : batch)
     {
         failedStaleLoginClears.erase(bot);
-        ForgetEventCache(bot);
+        if (auto botCache = eventCache.find(bot); botCache != eventCache.end())
+            botCache->second.erase("login");
+        if (auto botDirty = dirtyEvents.find(bot); botDirty != dirtyEvents.end())
+        {
+            botDirty->second.erase("login");
+            if (botDirty->second.empty())
+                dirtyEvents.erase(botDirty);
+        }
     }
 }
 
@@ -6414,11 +6413,6 @@ void RandomPlayerbotMgr::OnBotDeleted(uint32 botGuid, uint32 accountId)
 {
     if (accountId > 0 && sPlayerbotAIConfig.IsInRandomAccountList(accountId))
     {
-        uint32 maxCharsPerAccount = 9;
-    #ifdef MANGOSBOT_TWO
-        maxCharsPerAccount = 10;
-    #endif
-    
         // Effective count includes pending creation reservations. The cores
         // collapse a FAILED durable query to zero, and a zero here DELETES the
         // account; unknown or reserved occupancy must never look empty.

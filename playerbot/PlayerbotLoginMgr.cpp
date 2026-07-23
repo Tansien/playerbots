@@ -3,56 +3,8 @@
 #include "PlayerbotMgr.h"
 #include "PlayerbotAIConfig.h"
 #include "RandomPlayerbotMgr.h"
-#include "playerbot/living/util/LivingEventSchema.h"
 
 using namespace ai;
-
-namespace
-{
-    bool LoadLoginTimerSnapshot(LoginSpace& space)
-    {
-        // The sentinel makes an empty successful query distinguishable from a
-        // failed query without a separate COUNT round trip.
-        auto rows = CharacterDatabase.Query(
-            "SELECT bot, event, `value`, `time`, validIn FROM ai_playerbot_random_bots "
-            "WHERE owner = 0 AND event IN ('add', 'logout') "
-            "UNION ALL SELECT 0, '', 0, 0, 0");
-        if (!rows)
-            return false;
-
-        uint32 const now = static_cast<uint32>(time(nullptr));
-        do
-        {
-            Field* fields = rows->Fetch();
-            uint32 const bot = fields[0].GetUInt32();
-            std::string const event = fields[1].GetString();
-            if (bot == 0 && event.empty())
-                continue;
-
-            uint32 const value = living::IsEventValueActive(event, fields[2].GetUInt32(),
-                fields[3].GetUInt32(), fields[4].GetUInt32(), now) ? fields[2].GetUInt32() : 0;
-            if (event == "add")
-                space.timers[bot].add = value;
-            else
-                space.timers[bot].logout = value;
-        } while (rows->NextRow());
-
-        space.timerSnapshotKnown = true;
-        return true;
-    }
-
-    bool TryGetLoginTimer(LoginSpace const& space, uint32 bot, bool add, uint32& value)
-    {
-        value = 0;
-        if (!space.timerSnapshotKnown)
-            return false;
-
-        auto const found = space.timers.find(bot);
-        if (found != space.timers.end())
-            value = add ? found->second.add : found->second.logout;
-        return true;
-    }
-}
 
 class LoginQueryHolder : public SqlQueryHolder
 {
@@ -445,53 +397,29 @@ void PlayerBotLoginMgr::Update(RealPlayers& realPlayers, uint32 maxOnlineBotCoun
         return;
     }
 
-    if (futureQueue.valid())
-    {
-        if (futureQueue.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-            return;
-
-        LoginQueuePlan plan = futureQueue.get();
-        for (LoginQueueTransition const& transition : plan.transitions)
-        {
-            auto found = botPool.find(transition.guid);
-            if (found != botPool.end())
-                found->second.ApplyQueueTransition(transition.expected, transition.desired);
-        }
-
-        BotInfos queue;
-        for (uint32 guid : plan.queued)
-        {
-            auto found = botPool.find(guid);
-            if (found != botPool.end() && found->second.IsQueued())
-                queue.push_back(&found->second);
-        }
-
-        if (!sPlayerbotAIConfig.preloadHolders)
-            SendHolders(queue);
-        else
-            SendHolders(&botPool);
+    BotInfos queue = FillLoginLogoutQueue(&botPool, realPlayers, maxOnlineBotCount);
+    if (!queue.empty())
         LoginLogoutBots(queue);
-    }
-
-    BotPool snapshot = botPool;
-    for (auto& entry : snapshot)
-        entry.second.PrepareQueueSnapshot(entry.second.GetLevel());
-    RealPlayerInfos realPlayerInfos = GetPlayerInfos(realPlayers);
-    futureQueue = std::async(std::launch::async, FillLoginLogoutQueue,
-        std::move(snapshot), std::move(realPlayerInfos), maxOnlineBotCount, debug);
 }
 
 void PlayerBotLoginMgr::WaitForIdle()
 {
-    if (futureQueue.valid())
+    if (!futurePool.valid())
+        return;
+
+    // This barrier exists only for config reload. Discard the old-config scan
+    // so the next Update reloads the pool with the new prefix/options.
+    try
     {
-        futureQueue.wait();
-        futureQueue.get();
-    }
-    if (futurePool.valid())
-    {
-        futurePool.wait();
         futurePool.get();
+    }
+    catch (std::exception const& error)
+    {
+        sLog.outError("PlayerbotLoginMgr: initial bot-pool load failed during config reload: %s", error.what());
+    }
+    catch (...)
+    {
+        sLog.outError("PlayerbotLoginMgr: initial bot-pool load failed during config reload");
     }
 }
 
@@ -627,18 +555,18 @@ LoginCriteria PlayerBotLoginMgr::GetLoginCriteria(const uint8 attempt)
             ADD_KEEP_CRITERIA(ONLINE, info.IsOnline());
         if (criterion == "logoff" && sPlayerbotAIConfig.randomBotTimedLogout)
             criteria.push_back(std::make_pair(LoginCriterionFailType::RANDOM_TIMED_LOGOUT,
-                [](PlayerLoginInfo const& info, LoginSpace const& space)
+                [](PlayerLoginInfo const& info, LoginSpace const&)
                 {
                     uint32 add = 0;
-                    bool const known = TryGetLoginTimer(space, info.GetId(), true, add);
+                    bool const known = sRandomPlayerbotMgr.TryGetEventValue(info.GetId(), "add", add);
                     return living::TimedLogoutDue(info.IsOnline(), known, add);
                 }));
         if (criterion == "offline" && sPlayerbotAIConfig.randomBotTimedOffline)
             criteria.push_back(std::make_pair(LoginCriterionFailType::RANDOM_TIMED_OFFLINE,
-                [](PlayerLoginInfo const& info, LoginSpace const& space)
+                [](PlayerLoginInfo const& info, LoginSpace const&)
                 {
                     uint32 logout = 0;
-                    bool const known = TryGetLoginTimer(space, info.GetId(), false, logout);
+                    bool const known = sRandomPlayerbotMgr.TryGetEventValue(info.GetId(), "logout", logout);
                     return living::TimedOfflineBlocksLogin(info.IsOnline(), known, logout);
                 }));
         if (criterion == "bg")
@@ -721,29 +649,24 @@ bool PlayerBotLoginMgr::CriteriaStillValid(const LoginCriterionFailType oldFailT
     return false;
 }
 
-LoginQueuePlan PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool pool,
-    RealPlayerInfos realPlayerInfos, uint32 maxOnlineBotCount, bool debug)
+BotInfos PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool* pool,
+    const RealPlayers& realPlayers, uint32 maxOnlineBotCount)
 {
     LoginSpace loginSpace;
-    LoadLoginTimerSnapshot(loginSpace);
-    loginSpace.realPlayerInfos = std::move(realPlayerInfos);
-    FillLoginSpace(&pool, loginSpace, maxOnlineBotCount, FillStep::NEXT_STEP);
-
-    std::unordered_map<uint32, LoginState> initialStates;
-    for (auto const& [guid, info] : pool)
-        initialStates[guid] = info.GetLoginState();
+    loginSpace.realPlayerInfos = GetPlayerInfos(realPlayers);
+    FillLoginSpace(pool, loginSpace, maxOnlineBotCount, FillStep::NEXT_STEP);
 
     std::unordered_map<uint32, LoginCriterionFailType> loginFails;
     std::set<PlayerLoginInfo*> potentialQueue;
 
-    if(debug)
+    if (sPlayerBotLoginMgr.debug)
         sLog.outError("PlayerbotLoginMgr: Initial space %d", loginSpace.totalSpace);
 
     for (uint8 attempt = 0; attempt <= GetLoginCriteriaSize(); attempt++)
     {
         LoginCriteria criteria = GetLoginCriteria(attempt);
 
-        for (auto& [guid, botInfo] : pool)
+        for (auto& [guid, botInfo] : *pool)
         {
             if (CriteriaStillValid(loginFails[guid], criteria))
                 continue;
@@ -768,7 +691,7 @@ LoginQueuePlan PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool pool,
             }
         }
 
-        if (debug)
+        if (sPlayerBotLoginMgr.debug)
         {
             std::string variableCriteria;
             for (auto& crit : GetVariableLoginCriteria(attempt))
@@ -782,13 +705,13 @@ LoginQueuePlan PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool pool,
             break;
     }
 
-    LoginQueuePlan plan;
+    BotInfos queue;
     uint32 logins = 0;
 
     for (auto& info : potentialQueue)
         if (info->GetLoginState() == LoginState::BOT_ON_LOGINQUEUE)
         {
-            plan.queued.push_back(info->GetId());
+            queue.push_back(info);
             logins++;
 
             if (logins >= sPlayerbotAIConfig.randomBotsMaxLoginsPerInterval)
@@ -810,18 +733,19 @@ LoginQueuePlan PlayerBotLoginMgr::FillLoginLogoutQueue(BotPool pool,
             if (logouts >= maxLogouts)
                 break;
 
-            plan.queued.push_back(info->GetId());
+            queue.push_back(info);
             logouts++;
         }
 
-    if (debug)
+    if (sPlayerBotLoginMgr.debug)
         sLog.outError("PlayerbotLoginMgr: Queued to log in: %d, out: %d", logins, logouts);
 
-    for (auto const& [guid, info] : pool)
-        if (info.GetLoginState() != initialStates[guid])
-            plan.transitions.push_back({ guid, initialStates[guid], info.GetLoginState() });
+    if (!sPlayerbotAIConfig.preloadHolders)
+        SendHolders(queue);
+    else
+        SendHolders(pool);
 
-    return plan;
+    return queue;
 }
 
 void PlayerBotLoginMgr::LoginLogoutBots(const BotInfos& queue)

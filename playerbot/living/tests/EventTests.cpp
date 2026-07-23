@@ -210,7 +210,8 @@ LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_resta
 
     auto set = [&](std::string const& event, uint32_t value)
     {
-        auto outcome = living::PersistEventValue(event, "", value, std::nullopt,
+        bool const priorPresent = cache.count(event) > 0;
+        auto outcome = living::PersistEventValue(event, "", value, priorPresent,
             [&]() -> std::optional<bool> { return rows.count(event) > 0; },
             [&](living::EventWriteKind kind)
             {
@@ -222,13 +223,18 @@ LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_resta
 
                 if (kind == living::EventWriteKind::Delete)
                     rows.erase(event);
-                else
+                else if (kind == living::EventWriteKind::Insert || rows.count(event))
                     rows[event] = value;
                 return true;
             });
 
         if (outcome == living::EventPersistOutcome::Persisted)
-            cache[event] = value;
+        {
+            if (value)
+                cache[event] = value;
+            else
+                cache.erase(event);
+        }
         else if (outcome == living::EventPersistOutcome::ExecuteFailed)
         {
             // Reload durable value; never publish the intended one.
@@ -243,12 +249,16 @@ LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_resta
 
     auto cacheValue = [&](std::string const& event) { return cache.count(event) ? cache[event] : 0u; };
     auto rowValue = [&](std::string const& event) { return rows.count(event) ? rows[event] : 0u; };
+    auto cacheMatchesRow = [&](std::string const& event)
+    {
+        return cache.count(event) == rows.count(event) && cacheValue(event) == rowValue(event);
+    };
 
     // The AddRandomBots pair: add=1, logout=0.
     LIVING_CHECK(set("add", 1));
     LIVING_CHECK(set("logout", 0));
-    LIVING_CHECK(cacheValue("add") == 1 && rowValue("add") == 1);
-    LIVING_CHECK(cacheValue("logout") == 0 && rowValue("logout") == 0);
+    LIVING_CHECK(cacheMatchesRow("add"));
+    LIVING_CHECK(cacheMatchesRow("logout"));
 
     // Forced SQL failure: the intended value 2 must NOT appear in the cache.
     failNext = true;
@@ -265,6 +275,14 @@ LIVING_TEST(event_persist_cache_matches_durable_state_through_failures_and_resta
     // cleared event is value 0 either as an explicit entry or as no row).
     LIVING_CHECK(set("add", 5));
     LIVING_CHECK(cacheValue("add") == 5 && rowValue("add") == 5);
+
+    // Ordinary login -> logout -> login: DELETE must remove the cache entry
+    // so the next non-zero write INSERTs the now-missing durable row.
+    LIVING_CHECK(set("add", 0));
+    LIVING_CHECK(cacheMatchesRow("add"));
+    LIVING_CHECK(set("add", 1));
+    LIVING_CHECK(cacheMatchesRow("add"));
+
     std::map<std::string, uint32_t> rebuilt(rows.begin(), rows.end());
     auto rebuiltValue = [&](std::string const& event) { return rebuilt.count(event) ? rebuilt[event] : 0u; };
     for (char const* event : { "add", "logout" })
