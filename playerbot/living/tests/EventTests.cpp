@@ -668,6 +668,18 @@ LIVING_TEST(event_activity_uses_the_same_strict_expiry_boundary_as_durable_loadi
     LIVING_CHECK(living::IsEventValueActive("create pending", 1, 100, 10, 1000));
 }
 
+LIVING_TEST(event_remaining_validity_preserves_full_width_schedules)
+{
+    LIVING_CHECK(living::RemainingEventValidity(100, 10, 109) == 1);
+    LIVING_CHECK(living::RemainingEventValidity(100, 10, 110) == 0);
+    LIVING_CHECK(living::RemainingEventValidity(120, 10, 110) == 10);
+
+    // Non-timed async login stores UINT32_MAX. It must remain restorable
+    // instead of narrowing through int32 and becoming an expired zero.
+    LIVING_CHECK(living::RemainingEventValidity(100, 4294967295u, 100) == 4294967295u);
+    LIVING_CHECK(living::RemainingEventValidity(100, 4294967295u, 110) == 4294967285u);
+}
+
 LIVING_TEST(talent_metadata_write_order_preserves_the_active_selector_on_failure)
 {
     std::vector<std::string> writes;

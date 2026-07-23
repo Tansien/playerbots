@@ -55,7 +55,7 @@ struct BotCreationResult
     ObjectGuid guid;
     uint64 creationToken = 0; // nonzero for PendingPersistence
     uint8 createdClass = 0;
-    uint8 createdRole = 0; // ai::BotRoles derived from the created character
+    uint8 createdRole = 0; // verified ai::BotRoles role of the selected build/path
     std::list<std::string> messages;
 };
 

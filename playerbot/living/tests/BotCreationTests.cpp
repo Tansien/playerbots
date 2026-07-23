@@ -3,6 +3,7 @@
 #include "../util/LivingActivation.h"
 #include "../util/LivingBotCreation.h"
 #include "../util/LivingCreationLifecycle.h"
+#include "../util/LivingEventSchema.h"
 
 #include <algorithm>
 
@@ -608,6 +609,30 @@ LIVING_TEST(activation_plan_confirms_all_writes_before_reporting_success)
             });
         LIVING_CHECK(outcome == ActivationOutcome::FailedCompensationUncertain);
     }
+}
+
+LIVING_TEST(activation_compensation_preserves_non_timed_async_add_lifetime)
+{
+    uint32_t const priorValidIn =
+        RemainingEventValidity(/*lastChangeTime*/ 100, 4294967295u, /*now*/ 100);
+    std::vector<PlannedEventWrite> plan = {
+        { "add", 1, 4294967295u, /*prior*/ 1, priorValidIn },
+        { "logout", 0, 0, /*prior*/ 7, 55 },
+    };
+
+    std::vector<std::string> writes;
+    size_t calls = 0;
+    auto const outcome = ExecuteActivationPlan(plan,
+        [&](std::string const& event, uint32_t value, uint32_t validIn)
+        {
+            writes.push_back(event + "=" + std::to_string(value) + "/" + std::to_string(validIn));
+            return calls++ == 1 ? EventWriteResult::DefinitelyNotApplied
+                                : EventWriteResult::DesiredStateConfirmed;
+        });
+
+    LIVING_CHECK(outcome == ActivationOutcome::FailedCompensated);
+    LIVING_CHECK(writes.size() == 3);
+    LIVING_CHECK(writes.back() == "add=1/4294967295");
 }
 
 LIVING_TEST(async_login_timers_fail_closed_on_unknown_state)

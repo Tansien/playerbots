@@ -70,6 +70,7 @@ class TalentSpec {
         int id =0;
         std::string name = "";
         int probability = 100;
+        uint8 role = 0; // optional concrete ai::BotRoles value; 0 = infer from applied build
         std::vector<TalentSpec> talentSpec;
     };
 

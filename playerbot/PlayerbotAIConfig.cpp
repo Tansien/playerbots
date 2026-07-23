@@ -3,6 +3,7 @@
 #include "playerbot/living/config/EffectiveConfigReport.h"
 #include "playerbot/living/util/LivingActivation.h"
 #include "playerbot/living/util/LivingBotCreation.h"
+#include "playerbot/living/util/LivingRoles.h"
 #include "playerbot/playerbot.h"
 #include "RandomPlayerbotFactory.h"
 #include "Accounts/AccountMgr.h"
@@ -1236,6 +1237,17 @@ void PlayerbotAIConfig::LoadTalentSpecs()
                 int probability = config.GetIntDefault(os.str().c_str(), 100);
 
                 TalentPath talentPath(spec, specName, probability);
+                {
+                    std::ostringstream roleOption;
+                    roleOption << "AiPlayerbot.PremadeSpecRole." << cls << "." << spec;
+                    std::string const roleName = config.GetStringDefault(roleOption.str().c_str(), "");
+                    BotRoles const role = ChatHelper::parseRole(roleName);
+                    if (!roleName.empty() && role == BotRoles::BOT_ROLE_NONE)
+                        sLog.outErrorDb("Invalid premade spec role '%s' for class %u spec %u",
+                            roleName.c_str(), cls, spec);
+                    else
+                        talentPath.role = static_cast<uint8>(role);
+                }
 
                 for (uint32 level = 10; level <= 100; level++)
                 {
@@ -1324,7 +1336,17 @@ void PlayerbotAIConfig::LoadTalentSpecs()
 
                 //Only add paths that have atleast 1 spec.
                 if (talentPath.talentSpec.size() > 0)
+                {
+                    uint8 const capabilities = living::SpecTabRoles(static_cast<uint8>(cls),
+                        static_cast<uint8>(talentPath.talentSpec.back().highestTree()));
+                    if (talentPath.role && !living::RolesSatisfy(capabilities, talentPath.role))
+                    {
+                        sLog.outErrorDb("Premade spec role is incompatible with class %u spec %u; using inferred role",
+                            cls, spec);
+                        talentPath.role = 0;
+                    }
                     classSpecs[cls].talentPath.push_back(talentPath);
+                }
             }
         }
     }

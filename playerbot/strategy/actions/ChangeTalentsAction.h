@@ -33,9 +33,9 @@ namespace ai
             int specId = -1;         // chosen premade spec, -1 = none/custom link
             std::string specLink;    // custom link when specId == -1
             bool hadExistingSpec = false;
-            // Intended role capability mask of the APPLIED spec (canonical
-            // spec-tab mapping, ai::BotRoles bits) - never derived from
-            // transient combat auras, and ZERO when no path was applied.
+            // Concrete role of the APPLIED path (ai::BotRoles bits), from its
+            // optional configured role or the learned-build fallback - never
+            // from transient combat auras, and ZERO when no path was applied.
             // Creation verifies explicit role requests as
             // `applied && (selectedRoles & requestedRole)`.
             uint8 selectedRoles = 0;

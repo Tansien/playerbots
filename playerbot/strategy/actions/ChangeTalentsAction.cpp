@@ -183,11 +183,15 @@ std::vector<TalentPath*> ChangeTalentsAction::getPremadePaths(uint8 cls, std::st
         if (!findName.empty() && path.name.find(findName) == std::string::npos)
             continue;
 
-        // Bit containment against the canonical spec-role mapping: a Feral
-        // (TANK|DPS) path satisfies a TANK request; the old equality test
-        // rejected every multi-role spec.
+        // Bit containment against the canonical spec-role mapping. An optional
+        // concrete path role narrows an ambiguous multi-role tab; otherwise a
+        // Feral (TANK|DPS) path remains eligible for either role.
+        uint8 const pathRoles = living::ResolveTalentPathRoles(
+            static_cast<uint8>(AiFactory::GetSpecRoleCapabilities(
+                cls, path.talentSpec.back().highestTree())),
+            path.role);
         if (role != BotRoles::BOT_ROLE_NONE
-            && !living::RolesSatisfy(static_cast<uint8>(AiFactory::GetSpecRoleCapabilities(cls, path.talentSpec.back().highestTree())), static_cast<uint8>(role)))
+            && !living::RolesSatisfy(pathRoles, static_cast<uint8>(role)))
             continue;
 
         ret.push_back(&path);
@@ -411,17 +415,19 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
     selection.specId = specId;
     selection.specLink = specLink;
     selection.hadExistingSpec = specNo != 0;
-    // The APPLIED talents decide the CONCRETE verified role - the exact role
-    // stored and charged in creation/batch accounting - through the learned-
-    // talent distinction, NOT the capability mask (which would let a DPS Feral
-    // build satisfy a tank request) and NOT a transient form/aura (a fresh bot
-    // has none). When no concrete path was applied (none found, or several
-    // merely listed with auto-pick disabled), the role stays ZERO: a
-    // blank-talent character's default tab must never satisfy an explicit
-    // role request.
-    selection.selectedRoles = selection.applied
-        ? static_cast<uint8>(AiFactory::GetAppliedSpecRole(bot))
-        : 0;
+    // The APPLIED path decides the CONCRETE verified role stored and charged in
+    // creation/batch accounting. Normally that is inferred from the learned
+    // talents. An explicitly configured path role is the authoritative intent
+    // for ambiguous hybrid builds (notably the identical TBC cat/bear specs).
+    // No applied path still means no role.
+    if (selection.applied)
+    {
+        TalentPath* selectedPath = specId >= 0 ? getPremadePath(cls, specId) : nullptr;
+        uint8 const configuredRole =
+            selectedPath && selectedPath->id == specId ? selectedPath->role : 0;
+        selection.selectedRoles = living::ResolveTalentPathRoles(
+            static_cast<uint8>(AiFactory::GetAppliedSpecRole(bot)), configuredRole);
+    }
     return selection;
 }
 

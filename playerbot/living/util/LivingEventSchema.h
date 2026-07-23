@@ -47,6 +47,20 @@ namespace living
             || now - lastChangeTime < validIn);
     }
 
+    // Remaining schedule lifetime stays uint32 end-to-end. The production
+    // event schema permits UINT32_MAX (used by non-timed async login), so
+    // routing this through the legacy int32 diagnostic API turns a healthy
+    // long-lived row into an already-expired zero during compensation.
+    inline uint32_t RemainingEventValidity(uint32_t lastChangeTime,
+        uint32_t validIn, uint32_t now)
+    {
+        if (now < lastChangeTime)
+            return validIn;
+
+        uint32_t const elapsed = now - lastChangeTime;
+        return elapsed < validIn ? validIn - elapsed : 0;
+    }
+
     inline bool EventValueFitsSchema(std::string const& event, std::string const& data)
     {
         return !event.empty()

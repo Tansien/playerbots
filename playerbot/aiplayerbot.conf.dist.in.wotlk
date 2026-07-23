@@ -525,6 +525,7 @@ AiPlayerbot.ClassRaceProb.11.6 = 27    # Tauren druid chance
 #
 # AiPlayerbot.PremadeSpecName.<class>.<specno> = <name>         #Name of the talent specialisation
 # AiPlayerbot.PremadeSpecProb.<class>.<specno> = <number>       #Probability Randombots will pick this spec. (default 100)
+# AiPlayerbot.PremadeSpecRole.<class>.<specno> = <role>         #Optional concrete role (tank, healer, dps) for ambiguous hybrid builds.
 # AiPlayerbot.PremadeSpecLink.<class>.<specno>.<level> = <link> #Wowhead style link the bot should work towards at given level.
 # AiPlayerbot.PremadeSpecLink.<class>.<specno>.<level> = <link> #Wowhead style link the bot should work towards at given level.
 # 

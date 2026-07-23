@@ -6,8 +6,8 @@ using namespace living;
 
 // SpecTabRoles is THE canonical creation-time role mapping: AiFactory's
 // spec-tab overload delegates to it (bit values static_asserted there), and
-// tuple capability filtering, talent-path filtering, post-selection role
-// verification and BotCreationResult all consume it. The mapping is
+// tuple capability filtering, talent-path validation/filtering, post-selection
+// role verification and BotCreationResult all consume it. The mapping is
 // core-independent - the same table serves Classic, TBC and WotLK; the Death
 // Knight row is reachable only where the class exists.
 
@@ -30,26 +30,24 @@ LIVING_TEST(roles_druid_feral_capability_mask_is_form_independent_but_verified_r
     LIVING_CHECK(SpecTabRoles(11, 2) == ROLE_HEALER);
 
     // Finding 5: the VERIFIED role (what quota accounting stores/charges) is NOT
-    // this mask - it is the concrete role of the APPLIED build (ConcreteRuntimeRole
-    // fed the learned-talent tank signal), so a DPS feral build cannot pass as a
-    // tank even though it is a candidate. Covered in detail below.
+    // this mask - it is the concrete configured path role or applied-build
+    // fallback, so a DPS Feral path cannot pass as a tank even though an
+    // unannotated Feral tab is a candidate. Covered in detail below.
     LIVING_CHECK(ConcreteRuntimeRole(11, 1, /*tankBuild*/false) == ROLE_DPS);
     LIVING_CHECK(ConcreteRuntimeRole(11, 1, /*tankBuild*/true) == ROLE_TANK);
 }
 
 LIVING_TEST(roles_feral_dps_build_cannot_satisfy_tank_verified_role)
 {
-    // Finding 5 (TBC "pve dps feral cat" / WotLK "Feral dps Pve"): the applied
-    // build has NO learned tank talents, so the VERIFIED role is DPS - it can
-    // neither satisfy nor consume a tank quota. (Same pure mapping on TBC and
-    // WotLK; the host suite cannot load DBC/config, so the tank/dps distinction
-    // is the learned-talent boolean.)
+    // Finding 5: WotLK's applied DPS build has no learned tank talents, so the
+    // fallback resolves to DPS. TBC's duplicate hybrid build is disambiguated
+    // by its configured path role, tested below without loading core config.
     LIVING_CHECK(ConcreteRuntimeRole(11, 1, /*tankBuild*/false) == ROLE_DPS);
     LIVING_CHECK(!RolesSatisfy(ConcreteRuntimeRole(11, 1, false), ROLE_TANK));
     LIVING_CHECK(RolesSatisfy(ConcreteRuntimeRole(11, 1, false), ROLE_DPS));
 
-    // TBC "pve dps feral tank" / WotLK "Feral Tank Pve": the applied build HAS
-    // the tank talents, so the verified role is TANK and satisfies a tank request.
+    // WotLK's applied tank build has the tank talents; TBC's tank path carries
+    // the same explicit TANK role.
     LIVING_CHECK(ConcreteRuntimeRole(11, 1, /*tankBuild*/true) == ROLE_TANK);
     LIVING_CHECK(RolesSatisfy(ConcreteRuntimeRole(11, 1, true), ROLE_TANK));
     LIVING_CHECK(!RolesSatisfy(ConcreteRuntimeRole(11, 1, true), ROLE_DPS));
@@ -141,6 +139,22 @@ LIVING_TEST(roles_capability_masks_and_containment)
     LIVING_CHECK(RolesSatisfy(ROLE_TANK | ROLE_DPS, ROLE_TANK | ROLE_HEALER));
     LIVING_CHECK(!RolesSatisfy(ROLE_HEALER, ROLE_TANK | ROLE_DPS));
     LIVING_CHECK(!RolesSatisfy(0, ROLE_TANK));
+}
+
+LIVING_TEST(roles_premade_path_can_disambiguate_a_shared_hybrid_build)
+{
+    uint8_t const feralCapabilities = ROLE_TANK | ROLE_DPS;
+
+    // Unannotated paths retain the existing capability/applied-build fallback.
+    LIVING_CHECK(ResolveTalentPathRoles(feralCapabilities, 0) == feralCapabilities);
+    LIVING_CHECK(ResolveTalentPathRoles(ROLE_TANK, 0) == ROLE_TANK);
+
+    // TBC cat and bear may share one valid hybrid talent build. Their explicit
+    // path roles keep candidacy and verified quota accounting distinct.
+    LIVING_CHECK(ResolveTalentPathRoles(feralCapabilities, ROLE_DPS) == ROLE_DPS);
+    LIVING_CHECK(ResolveTalentPathRoles(feralCapabilities, ROLE_TANK) == ROLE_TANK);
+    LIVING_CHECK(!RolesSatisfy(
+        ResolveTalentPathRoles(feralCapabilities, ROLE_DPS), ROLE_TANK));
 }
 
 LIVING_TEST(roles_concrete_runtime_role_is_one_role_never_a_mask)
