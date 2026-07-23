@@ -959,7 +959,8 @@ void RandomPlayerbotFactory::CreateRandomBots()
         }
 
         uint32 count = durableCount;
-        if (count >= PlayerbotHolder::MaxCharsPerAccount())
+        uint32 const maxCharsPerAccount = PlayerbotHolder::MaxCharsPerAccount();
+        if (count >= maxCharsPerAccount)
         {
             totalRandomBotChars += count;
             continue;
@@ -968,11 +969,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	RandomPlayerbotFactory factory(accountId);
 	if (sPlayerbotAIConfig.useFixedClassRaceCounts)
 	{
-#ifdef MANGOSBOT_TWO
-	    uint32 maxAllowed = 10 - count;
-#else
-	    uint32 maxAllowed = 9 - count;
-#endif
+            uint32 maxAllowed = maxCharsPerAccount - count;
             living::FillAccount(maxAllowed, [&](uint32 allowance) -> living::AccountFillRound
             {
                 std::vector<std::pair<uint8, uint8>> shuffledKeys;

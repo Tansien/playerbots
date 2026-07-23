@@ -2798,10 +2798,11 @@ void PlayerbotHolder::OnCharacterDeletionConfirmed(uint32 guid, uint32 accountId
 
 uint32 PlayerbotHolder::MaxCharsPerAccount()
 {
-    // The durable count is realm-local, and character creation enforces both
-    // configured limits. Reserve against the stricter ceiling.
-    return std::min(sWorld.getConfig(CONFIG_UINT32_CHARACTERS_PER_ACCOUNT),
-        sWorld.getConfig(CONFIG_UINT32_CHARACTERS_PER_REALM));
+#ifdef MANGOSBOT_TWO
+    return 10;
+#else
+    return 9;
+#endif
 }
 
 bool PlayerbotHolder::TryGetDurableCharacterCount(uint32 accountId, uint32& count)

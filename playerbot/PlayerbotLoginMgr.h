@@ -1,3 +1,5 @@
+#pragma once
+
 #include "WorldPosition.h"
 
 namespace ai
@@ -10,12 +12,6 @@ namespace ai
 	typedef std::vector<PlayerLoginInfo> RealPlayerInfos;
 	typedef std::vector<PlayerLoginInfo*> BotInfos;
 
-    struct LoginTimerState
-    {
-        uint32 add = 0;
-        uint32 logout = 0;
-    };
-
 	struct LoginSpace
 	{
 		int32 currentSpace;
@@ -23,8 +19,6 @@ namespace ai
 		int32 classRaceBucket[MAX_CLASSES][MAX_RACES];
 		int32 levelBucket[DEFAULT_MAX_LEVEL + 1];
 		RealPlayerInfos realPlayerInfos;
-        bool timerSnapshotKnown = false;
-        std::unordered_map<uint32, LoginTimerState> timers;
 	};
 
 	enum class HolderState : uint8
@@ -41,19 +35,6 @@ namespace ai
 		BOT_ONLINE = 2,
 		BOT_ON_LOGOUTQUEUE = 3
 	};
-
-    struct LoginQueueTransition
-    {
-        uint32 guid;
-        LoginState expected;
-        LoginState desired;
-    };
-
-    struct LoginQueuePlan
-    {
-        std::vector<LoginQueueTransition> transitions;
-        std::vector<uint32> queued;
-    };
 
 	enum class FillStep : uint8
 	{
@@ -124,14 +105,6 @@ namespace ai
 		bool IsInInstance() const;
 		bool IsOnline() const { return loginState == LoginState::BOT_ONLINE || loginState == LoginState::BOT_ON_LOGOUTQUEUE; }
 		LoginState GetLoginState() const { return loginState; }
-        void PrepareQueueSnapshot(uint32 effectiveLevel) { level = effectiveLevel; isNew = false; holder = nullptr; holderState = HolderState::HOLDER_EMPTY; }
-        bool ApplyQueueTransition(LoginState expected, LoginState desired)
-        {
-            if (loginState != expected)
-                return false;
-            loginState = desired;
-            return true;
-        }
 
 		bool SendHolder();
 		void HandlePlayerBotLoginCallback(QueryResult* /*dummy*/, SqlQueryHolder* holder);
@@ -157,7 +130,7 @@ namespace ai
 		uint32 level;
 		bool isNew = false;
 		WorldPosition position;
-		uint32 groupId;
+        uint32 groupId = 0;
 		uint32 guildId;
 
 		SqlQueryHolder* holder = nullptr;
@@ -174,7 +147,7 @@ namespace ai
 	private:
 		static BotPool LoadBotsFromDb();
 		void UpdateOnlineBots();
-        static LoginQueuePlan FillLoginLogoutQueue(BotPool pool, RealPlayerInfos realPlayerInfos, uint32 maxOnlineBotCount, bool debug);
+        static BotInfos FillLoginLogoutQueue(BotPool* pool, const RealPlayers& realPlayers, uint32 maxOnlineBotCount);
 		void LoginLogoutBots(const BotInfos& queue);
 
 		static RealPlayerInfos GetPlayerInfos(const RealPlayers& realPlayers);
@@ -191,7 +164,6 @@ namespace ai
 		static void SendHolders(const BotInfos& queue);
 		static void SendHolders(BotPool* pool);
 
-        std::future<LoginQueuePlan> futureQueue;
 		std::future<BotPool> futurePool;
 
 		bool debug = false;
