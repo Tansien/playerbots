@@ -4569,8 +4569,17 @@ bool RandomPlayerbotMgr::TryReadRequiredEvents(uint32 bot, std::initializer_list
 
 uint32 RandomPlayerbotMgr::RemainingValidity(uint32 bot, std::string const& event)
 {
-    int32 const remaining = GetValueValidTime(bot, event);
-    return remaining > 0 ? static_cast<uint32>(remaining) : 0;
+    auto const botIt = eventCache.find(bot);
+    if (botIt == eventCache.end())
+        return 0;
+
+    auto const eventIt = botIt->second.find(event);
+    if (eventIt == botIt->second.end())
+        return 0;
+
+    CachedEvent const& cached = eventIt->second;
+    return living::RemainingEventValidity(cached.lastChangeTime, cached.validIn,
+        static_cast<uint32>(time(nullptr)));
 }
 
 bool RandomPlayerbotMgr::RunActivationPlan(uint32 bot, std::vector<living::PlannedEventWrite> const& plan)

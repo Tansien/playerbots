@@ -16,8 +16,8 @@ namespace living
     // TANK|DPS whether or not Bear Form is currently active. Class ids are
     // core-stable (warrior=1 ... druid=11); the Death Knight row is only
     // reachable on cores where the class exists. Shared by tuple capability
-    // filtering, talent-path filtering, post-selection role verification,
-    // BotCreationResult and group quota accounting.
+    // filtering, talent-path validation/filtering, post-selection role
+    // verification, BotCreationResult and group quota accounting.
     inline uint8_t SpecTabRoles(uint8_t cls, uint8_t tab)
     {
         switch (cls)
@@ -50,6 +50,15 @@ namespace living
     inline bool RolesSatisfy(uint8_t availableRoles, uint8_t requestedRoles)
     {
         return (availableRoles & requestedRoles) != 0;
+    }
+
+    // A premade path may declare one concrete role when its talent tab/build
+    // cannot distinguish that intent (for example TBC cat and bear paths can
+    // legitimately share a hybrid Feral build). Unannotated paths preserve the
+    // existing inferred-role behavior.
+    inline uint8_t ResolveTalentPathRoles(uint8_t inferredRoles, uint8_t configuredRole)
+    {
+        return configuredRole ? configuredRole : inferredRoles;
     }
 
     // Concrete CURRENT role for runtime classification (IsTank/IsHeal, group

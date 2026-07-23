@@ -507,6 +507,7 @@ AiPlayerbot.ClassRaceProb.11.6 = 28    # Tauren druid chance
 #
 # AiPlayerbot.PremadeSpecName.<class>.<specno> = <name>         #Name of the talent specialisation
 # AiPlayerbot.PremadeSpecProb.<class>.<specno> = <number>       #Probability Randombots will pick this spec. (default 100)
+# AiPlayerbot.PremadeSpecRole.<class>.<specno> = <role>         #Optional concrete role (tank, healer, dps) for ambiguous hybrid builds.
 # AiPlayerbot.PremadeSpecLink.<class>.<specno>.<level> = <link> #Wowhead style link the bot should work towards at given level.
 
 # Preset talents supplied by Lidocain. Do you have more/improved specs? Let us know!
@@ -770,8 +771,10 @@ AiPlayerbot.PremadeSpecLink.9.14.70 = 2500120412231114-21500301332001-50500001
 AiPlayerbot.PremadeSpecName.11.0 = pve dps balance
 AiPlayerbot.PremadeSpecLink.11.0.70 = 50032201250313523105--5002335
 AiPlayerbot.PremadeSpecName.11.1 = pve dps feral cat
+AiPlayerbot.PremadeSpecRole.11.1 = dps
 AiPlayerbot.PremadeSpecLink.11.1.70 = 01-503232132322105301251-05503001
 AiPlayerbot.PremadeSpecName.11.2 = pve dps feral tank
+AiPlayerbot.PremadeSpecRole.11.2 = tank
 AiPlayerbot.PremadeSpecLink.11.2.70 = 01-503232132322105301251-05503001
 AiPlayerbot.PremadeSpecName.11.3 = pve resto
 AiPlayerbot.PremadeSpecLink.11.3.70 = 500322012--50050351031500531351

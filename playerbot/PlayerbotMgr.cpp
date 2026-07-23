@@ -3376,9 +3376,10 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             talents = ChangeTalentsAction::SelectTalents(newBot, &out, static_cast<BotRoles>(options.role));
 
             // Stage 3: verify the requested role BEFORE any persistence, from
-            // the SELECTED SPEC's intended role mask - never from runtime
-            // roles, which depend on transient combat auras (a fresh Feral
-            // druid has no bear-form aura yet is a tank). The rejected
+            // the SELECTED PATH's concrete configured role or learned-build
+            // fallback - never from runtime roles, which depend on transient
+            // combat auras (a fresh Feral druid has no bear-form aura yet is a
+            // tank). The rejected
             // transient player and session are destroyed, and the only cache
             // touched so far (the empty event-cache entry created by the spec
             // lookup) is dropped, so the discarded GUID leaves no DB row or
@@ -3386,8 +3387,8 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             if (options.requireRoleMatch && options.role)
             {
                 // An explicit role is satisfiable only by an ACTUALLY APPLIED
-                // talent path whose capability mask contains the request. No
-                // path applied (none configured, or several merely listed with
+                // talent path whose verified role contains the request. No path
+                // applied (none configured, or several merely listed with
                 // auto-pick disabled) never passes - a blank-talent default
                 // tab is not a role.
                 if (!talents.applied || (static_cast<uint32>(talents.selectedRoles) & options.role) == 0)
@@ -3485,10 +3486,10 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         newBot->SaveToDB();
 
         // Report the PLANNED composition (class from the character, role from
-        // the CONCRETE applied talent build - never the capability mask, which
-        // would let a DPS Feral pass as a tank, and never aura-dependent runtime
-        // roles). For group planning this is a reservation, not a persistence
-        // claim: the status below stays PendingPersistence.
+        // the CONCRETE selected path or learned-build fallback - never the
+        // broad capability mask and never aura-dependent runtime roles). For
+        // group planning this is a reservation, not a persistence claim: the
+        // status below stays PendingPersistence.
         result.createdClass = newBot->getClass();
         result.createdRole = talents.evaluated
             ? static_cast<uint8>(talents.selectedRoles)
