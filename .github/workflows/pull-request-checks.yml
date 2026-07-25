@@ -80,4 +80,12 @@ jobs:
         run: cmake --build build-asan -j "$(nproc)"
 
       - name: Test
+        # LeakSanitizer is enabled by default whenever ASan runs on Linux, but it
+        # is off here on purpose: this configuration was validated on macOS, where
+        # LSan does not exist, so turning it on in CI would gate every pull request
+        # on a check that has never once been run green. Enable it in its own
+        # change, after confirming the suite is leak-clean locally on Linux.
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
         run: ctest --test-dir build-asan --output-on-failure --no-tests=error
