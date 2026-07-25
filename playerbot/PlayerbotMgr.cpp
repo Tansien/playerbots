@@ -3312,8 +3312,8 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         if (!newBot->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender, skin, face, hairStyle, hairColor, facialHair, 0))
         {
             // Player first, session second - matching every other teardown in this
-            // function. Create() fails only after Object::_Create has run, so
-            // ~Player still reaches GetSession()->SendPacket() via CombatStop.
+            // function. Create() fails only after Object::_Create has run, so the
+            // Player is live enough for its destructor to reach through m_session.
             delete newBot;
             delete botSession;
             ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure

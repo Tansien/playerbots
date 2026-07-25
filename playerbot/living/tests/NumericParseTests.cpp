@@ -17,7 +17,9 @@ using namespace living;
 // silently keep 0 for every suffixed link.
 LIVING_TEST(numeric_parse_signed_accepts_negatives_and_still_rejects_junk)
 {
-    int32_t value = 0;
+    // Seeded, not zero: comparing a parse of "0" against a variable that is
+    // already 0 would pass for an implementation that never writes `out` at all.
+    int32_t value = -7;
 
     LIVING_CHECK(TryParseInt32("0", value) && value == 0);
     LIVING_CHECK(TryParseInt32("57", value) && value == 57);
@@ -26,10 +28,16 @@ LIVING_TEST(numeric_parse_signed_accepts_negatives_and_still_rejects_junk)
     LIVING_CHECK(TryParseInt32("2147483647", value) && value == 2147483647);
     LIVING_CHECK(TryParseInt32("-2147483648", value) && value == -2147483648LL);
 
-    // Out of int32 range: rejected, never wrapped and never thrown.
+    // Out of int32 range: rejected, never wrapped and never thrown, and `out` is
+    // left ALONE. The sole production caller discards the return value
+    // (ItemUsageValue.cpp passes randomPropertyId straight in), so an
+    // implementation that clamped to INT32_MAX or zeroed on overflow would be
+    // invisible without this - both mutants pass every other assertion here.
+    value = 4242;
     LIVING_CHECK(!TryParseInt32("2147483648", value));
     LIVING_CHECK(!TryParseInt32("-2147483649", value));
     LIVING_CHECK(!TryParseInt32("99999999999999999999", value));
+    LIVING_CHECK(value == 4242);
 
     // Same alphabet/consumption rule as the unsigned helpers.
     LIVING_CHECK(!TryParseInt32("", value));
