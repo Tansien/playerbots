@@ -394,11 +394,20 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
                 break;
             }
             case ItemUsage::ITEM_USAGE_VENDOR:
+            {
                 //basically if AH price is lower than vendor sell price then it's worth it
-                if (cost / auction->itemCount >= (int32)sObjectMgr.GetItemPrototype(auction->itemTemplate)->SellPrice)
+                // The prototype can be null when the item was removed from
+                // item_template after the auction was created, and itemCount can be 0
+                // on a malformed row - the old expression dereferenced and divided
+                // unconditionally. The named-item path below guards this the same way.
+                ItemPrototype const* vendorProto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
+                if (!vendorProto || !auction->itemCount)
+                    continue;
+                if (cost / auction->itemCount >= (int32)vendorProto->SellPrice)
                     continue;
                 power = 1000;
                 break;
+            }
             case ItemUsage::ITEM_USAGE_FORCE_NEED:
             case ItemUsage::ITEM_USAGE_FORCE_GREED:
                 power = 1000;

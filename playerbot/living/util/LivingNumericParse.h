@@ -25,6 +25,12 @@ namespace living
     // Same contract for uint64; used for chat/console-supplied GUID values.
     bool TryParseUInt64(std::string const& text, uint64_t& out);
 
+    // Signed variant for fields that are legitimately negative in the wire format
+    // (an item link's random-property id is negative when it denotes a random
+    // SUFFIX). Accepts an optional leading '-' and rejects '+', matching the other
+    // helpers' "digits only, full consumption, no silent narrowing" rule.
+    bool TryParseInt32(std::string const& text, int32_t& out);
+
     // True when text is exactly a uint32 by the rule above. Use instead of an
     // isNumeric()-style check when the value will be parsed afterwards.
     bool IsExactUInt32(std::string const& text);

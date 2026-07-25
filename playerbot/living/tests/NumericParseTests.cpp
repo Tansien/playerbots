@@ -12,6 +12,41 @@ using namespace living;
 // scan and both GlyphAction slot branches), so these are semantic regressions for
 // that code, not a parallel reimplementation.
 
+// An item link's random-property id is negative when it denotes a random SUFFIX,
+// so the item-qualifier parse needs a signed variant. The unsigned helper would
+// silently keep 0 for every suffixed link.
+LIVING_TEST(numeric_parse_signed_accepts_negatives_and_still_rejects_junk)
+{
+    int32_t value = 0;
+
+    LIVING_CHECK(TryParseInt32("0", value) && value == 0);
+    LIVING_CHECK(TryParseInt32("57", value) && value == 57);
+    LIVING_CHECK(TryParseInt32("-1", value) && value == -1);
+    LIVING_CHECK(TryParseInt32("-113", value) && value == -113);
+    LIVING_CHECK(TryParseInt32("2147483647", value) && value == 2147483647);
+    LIVING_CHECK(TryParseInt32("-2147483648", value) && value == -2147483648LL);
+
+    // Out of int32 range: rejected, never wrapped and never thrown.
+    LIVING_CHECK(!TryParseInt32("2147483648", value));
+    LIVING_CHECK(!TryParseInt32("-2147483649", value));
+    LIVING_CHECK(!TryParseInt32("99999999999999999999", value));
+
+    // Same alphabet/consumption rule as the unsigned helpers.
+    LIVING_CHECK(!TryParseInt32("", value));
+    LIVING_CHECK(!TryParseInt32("-", value));
+    LIVING_CHECK(!TryParseInt32("+5", value));
+    LIVING_CHECK(!TryParseInt32("zz", value));
+    LIVING_CHECK(!TryParseInt32("12abc", value));
+    LIVING_CHECK(!TryParseInt32(" -1", value));
+    LIVING_CHECK(!TryParseInt32("-1 ", value));
+
+    // A rejected parse leaves the destination untouched, so a zero-initialized
+    // field keeps its default instead of picking up a partial value.
+    value = 4242;
+    LIVING_CHECK(!TryParseInt32("nope", value));
+    LIVING_CHECK(value == 4242);
+}
+
 LIVING_TEST(numeric_parse_accepts_only_exact_unsigned_decimals)
 {
     uint32_t value = 0;

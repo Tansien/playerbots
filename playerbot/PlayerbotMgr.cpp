@@ -3311,8 +3311,11 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
         Player* newBot = new Player(botSession);
         if (!newBot->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender, skin, face, hairStyle, hairColor, facialHair, 0))
         {
-            delete botSession;
+            // Player first, session second - matching every other teardown in this
+            // function. Create() fails only after Object::_Create has run, so
+            // ~Player still reaches GetSession()->SendPacket() via CombatStop.
             delete newBot;
+            delete botSession;
             ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
             // Only a randomly GENERATED name/appearance may roll differently on a
             // retry; an explicit name fails deterministically and retrying it

@@ -8,6 +8,7 @@
 
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/ServerFacade.h"
+#include "playerbot/living/util/LivingNumericParse.h"
 
 using namespace ai;
 
@@ -26,10 +27,16 @@ ItemQualifier::ItemQualifier(std::string qualifier, bool linkQualifier) : itemId
     if (numbers.empty())
         return;
 
-    if (!std::all_of(numbers[0].begin(), numbers[0].end(), ::isdigit))
+    // Inbound chat reaches this constructor through ChatFilter BEFORE the security
+    // check in PlayerbotAI::HandleCommand, and there is no exception boundary on
+    // that path: the old std::stoi calls threw std::invalid_argument on a payload
+    // like "Hitem:6948:zz" and std::out_of_range above INT_MAX. The all_of(isdigit)
+    // guard did not help either - it returns true for an EMPTY field, so a ":5"
+    // qualifier still reached stoi(""). Every field now goes through the shared
+    // non-throwing parsers; an unparseable field keeps its zero-initialized value,
+    // which is the same result the old code produced for an absent field.
+    if (!living::TryParseUInt32(numbers[0], itemId))
         return;
-
-    itemId = stoi(numbers[0]);
 
 #ifdef MANGOSBOT_ZERO
     uint32 propertyPosition = linkQualifier ? 2 : 6;
@@ -37,25 +44,22 @@ ItemQualifier::ItemQualifier(std::string qualifier, bool linkQualifier) : itemId
     uint32 propertyPosition = linkQualifier ? 6 : 6;
 #endif
 
-    if (numbers.size() > 1 && !numbers[1].empty())
-        enchantId = stoi(numbers[1]);
+    if (numbers.size() > 1)
+        living::TryParseUInt32(numbers[1], enchantId);
 
-    if (numbers.size() > propertyPosition && !numbers[propertyPosition].empty())
-        randomPropertyId = stoi(numbers[propertyPosition]);
+    // Signed on purpose: a negative random-property id denotes a random SUFFIX.
+    if (numbers.size() > propertyPosition)
+        living::TryParseInt32(numbers[propertyPosition], randomPropertyId);
 
 #ifndef MANGOSBOT_ZERO
     uint8 gemPosition = linkQualifier ? 2 : 2;
 
     if (numbers.size() > gemPosition + 3)
     {
-        if (!numbers[gemPosition].empty())
-            gem1 = stoi(numbers[gemPosition]);
-        if (!numbers[gemPosition + 1].empty())
-            gem2 = stoi(numbers[gemPosition + 1]);
-        if (!numbers[gemPosition + 2].empty())
-            gem3 = stoi(numbers[gemPosition + 2]);
-        if (!numbers[gemPosition + 3].empty())
-            gem4 = stoi(numbers[gemPosition + 3]);
+        living::TryParseUInt32(numbers[gemPosition], gem1);
+        living::TryParseUInt32(numbers[gemPosition + 1], gem2);
+        living::TryParseUInt32(numbers[gemPosition + 2], gem3);
+        living::TryParseUInt32(numbers[gemPosition + 3], gem4);
     }
 #endif
 }
