@@ -68,7 +68,9 @@ jobs:
         run: cmake --build "$RUNNER_TEMP/build-living" -j "$(nproc)"
 
       - name: Test
-        run: ctest --test-dir "$RUNNER_TEMP/build-living" --output-on-failure
+        # --no-tests=error: ctest exits 0 when NO tests are registered, so a suite
+        # that silently stops registering would otherwise report a green build.
+        run: ctest --test-dir "$RUNNER_TEMP/build-living" --output-on-failure --no-tests=error
 
   build:
     name: Build ${{ matrix.version }}

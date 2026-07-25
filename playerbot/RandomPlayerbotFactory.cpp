@@ -385,17 +385,31 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 #endif
     }
 
+    // A race/gender with no CharSections rows for this build (a race id that does
+    // not exist in the expansion's DBC, or one named by FixedClassRaceCounts) left
+    // these vectors empty, and size() - 1 on an empty vector is SIZE_MAX: urand then
+    // returned a multi-billion index and the read went out of bounds. Refuse the
+    // tuple instead - Player::Create would have rejected it a few lines below anyway.
+    if (skinColors.empty() || faces.empty() || hairs.empty())
+    {
+        sLog.outError("Unable to create random bot for account %d - no appearance data for race %u gender %u",
+            accountId, race, gender);
+        return false;
+    }
+
     uint8 skinColor = skinColors[urand(0, skinColors.size() - 1)];
     std::pair<uint8,uint8> face = faces[urand(0, faces.size() - 1)];
     std::pair<uint8,uint8> hair = hairs[urand(0, hairs.size() - 1)];
 
 	bool excludeCheck = (race == RACE_TAUREN) || (gender == GENDER_FEMALE && race != RACE_NIGHTELF && race != RACE_UNDEAD);
 #ifndef MANGOSBOT_TWO
-	uint8 facialHair = excludeCheck ? 0 : facialHairTypes[urand(0, facialHairTypes.size() - 1)];
+	// excludeCheck only covers the races that must not have facial hair; it does not
+	// imply the vector is populated, so the emptiness test is still required here.
+	uint8 facialHair = (excludeCheck || facialHairTypes.empty())
+		? 0 : facialHairTypes[urand(0, facialHairTypes.size() - 1)];
 #else
 	uint8 facialHair = 0;
 #endif
-	//TODO vector crash on cmangos TWO when creating one of the first bot characters, need a fix
 
 	WorldSession* session = new WorldSession(accountId, NULL, SEC_PLAYER,
 
@@ -425,8 +439,10 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 	        facialHair, 0))
     {
         player->DeleteFromDB(player->GetObjectGuid(), accountId, true, true);
-        delete session;
+        // The Player must go first: ~Player runs CleanupsBeforeDelete -> CombatStop
+        // -> SendAttackSwingCancelAttack, which calls GetSession()->SendPacket().
         delete player;
+        delete session;
         sLog.outError("Unable to create random bot for account %d - name: \"%s\"; race: %u; class: %u",
                 accountId, name.c_str(), race, cls);
         return false;
@@ -435,8 +451,11 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     uint32 const botGuid = player->GetGUIDLow();
     if (!PlayerbotHolder::PrepareAllocatedGuid(botGuid))
     {
-        delete session;
+        // Create() succeeded, so this Player is fully constructed and its destructor
+        // WILL reach through m_session; destroying the session first is a
+        // use-after-free.
         delete player;
+        delete session;
         sLog.outError("Unable to create random bot for account %d - allocated guid %u has pending lifecycle ownership or residue",
             accountId, botGuid);
         return false;

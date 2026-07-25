@@ -49,6 +49,26 @@ namespace living
         return true;
     }
 
+    bool TryParseInt32(std::string const& text, int32_t& out)
+    {
+        if (text.empty())
+            return false;
+
+        // std::from_chars on a signed type accepts a leading '-' but still rejects
+        // '+', and reports out_of_range rather than throwing. Full consumption is
+        // checked explicitly for the same reason as the unsigned helpers.
+        int32_t value = 0;
+        char const* const begin = text.data();
+        char const* const end = begin + text.size();
+
+        std::from_chars_result const result = std::from_chars(begin, end, value);
+        if (result.ec != std::errc() || result.ptr != end)
+            return false;
+
+        out = value;
+        return true;
+    }
+
     bool IsExactUInt32(std::string const& text)
     {
         uint32_t ignored = 0;
