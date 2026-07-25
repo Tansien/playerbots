@@ -388,9 +388,13 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     // A race/gender with no CharSections rows for this build (a race id that does
     // not exist in the expansion's DBC, or one named by FixedClassRaceCounts) left
     // these vectors empty, and size() - 1 on an empty vector is SIZE_MAX: urand then
-    // returned a multi-billion index and the read went out of bounds. Refuse the
-    // tuple instead - Player::Create would have rejected it a few lines below anyway.
-    if (skinColors.empty() || faces.empty() || hairs.empty())
+    // returned a multi-billion index and the read went out of bounds.
+    // Only faces and hairs are gated: both halves of each pair are passed to
+    // Player::Create below, so an empty vector there is a genuine unusable tuple.
+    // skinColors is deliberately NOT gated - the value drawn from it is dead (the
+    // skin argument is face.second), so refusing on it would reject tuples the
+    // creation path never reads.
+    if (faces.empty() || hairs.empty())
     {
         sLog.outError("Unable to create random bot for account %d - no appearance data for race %u gender %u",
             accountId, race, gender);
@@ -439,8 +443,13 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 	        facialHair, 0))
     {
         player->DeleteFromDB(player->GetObjectGuid(), accountId, true, true);
-        // The Player must go first: ~Player runs CleanupsBeforeDelete -> CombatStop
-        // -> SendAttackSwingCancelAttack, which calls GetSession()->SendPacket().
+        // Player first: it holds a raw non-owning WorldSession* and its destructor
+        // may reach through it (Player::CleanupsBeforeDelete -> TradeCancel ->
+        // GetSession()), so the session must outlive it. Safe in the other
+        // direction only because WorldSession::_player is never set on a bot
+        // session - nothing here calls SetPlayer - so ~WorldSession's
+        // `if (_player) LogoutPlayer();` is inert. Set _player and this order
+        // becomes load-bearing in both directions.
         delete player;
         delete session;
         sLog.outError("Unable to create random bot for account %d - name: \"%s\"; race: %u; class: %u",
@@ -451,9 +460,8 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     uint32 const botGuid = player->GetGUIDLow();
     if (!PlayerbotHolder::PrepareAllocatedGuid(botGuid))
     {
-        // Create() succeeded, so this Player is fully constructed and its destructor
-        // WILL reach through m_session; destroying the session first is a
-        // use-after-free.
+        // Create() succeeded, so this Player is fully constructed and its
+        // destructor may reach through m_session - same ordering rule as above.
         delete player;
         delete session;
         sLog.outError("Unable to create random bot for account %d - allocated guid %u has pending lifecycle ownership or residue",

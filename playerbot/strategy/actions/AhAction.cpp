@@ -323,6 +323,18 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!auction)
                 continue;
 
+            // One prototype/count check for the whole iteration. Both hazards are
+            // real for a single row and every branch below shares them: the item
+            // can leave item_template after the auction was created (the cached
+            // "item usage" value outlives the row, so the usage filter does not
+            // catch it), and a malformed row can carry itemCount 0. Downstream,
+            // ITEM_USAGE_AH divides by itemCount and dereferences the prototype
+            // inside IsWorthBuyingFromAhToResellAtAH, the vendor arm does the
+            // same inline, and ReasonForNeed formats the item through
+            // ChatHelper::formatItem, which reads proto->Quality.
+            if (!sObjectMgr.GetItemPrototype(auction->itemTemplate) || !auction->itemCount)
+                continue;
+
             // Never bid on the bot's own account's auctions (incl. online AND
             // offline siblings - the preloaded set covers both); ownerless
             // (auction-house-bot) listings pass. Pure set check, no query.
@@ -394,20 +406,12 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
                 break;
             }
             case ItemUsage::ITEM_USAGE_VENDOR:
-            {
                 //basically if AH price is lower than vendor sell price then it's worth it
-                // The prototype can be null when the item was removed from
-                // item_template after the auction was created, and itemCount can be 0
-                // on a malformed row - the old expression dereferenced and divided
-                // unconditionally. The named-item path below guards this the same way.
-                ItemPrototype const* vendorProto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
-                if (!vendorProto || !auction->itemCount)
-                    continue;
-                if (cost / auction->itemCount >= (int32)vendorProto->SellPrice)
+                // Prototype and itemCount are already validated at the top of the loop.
+                if (cost / auction->itemCount >= sObjectMgr.GetItemPrototype(auction->itemTemplate)->SellPrice)
                     continue;
                 power = 1000;
                 break;
-            }
             case ItemUsage::ITEM_USAGE_FORCE_NEED:
             case ItemUsage::ITEM_USAGE_FORCE_GREED:
                 power = 1000;
@@ -635,6 +639,11 @@ bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price
     uint32 count = auction->itemCount;
 
     ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
+
+    // Checked here as well as in the scan loop: BidItem has a second caller that
+    // does not go through that loop, and proto is dereferenced unguarded below.
+    if (!proto)
+        return false;
 
     bot->GetSession()->HandleAuctionPlaceBid(packet);
 
