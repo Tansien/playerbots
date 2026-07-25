@@ -12,6 +12,7 @@
 #include "RandomPlayerbotFactory.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/AiFactory.h"
+#include "playerbot/living/util/LivingImmersiveStats.h"
 #include "Guilds/GuildMgr.h"
 
 #ifndef MANGOSBOT_ZERO
@@ -5214,92 +5215,35 @@ void PlayerbotFactory::InitImmersive()
     std::map<Stats, int32> percentMap;
 
     uint32 total = 0;
-    bool distributionKnown = true;
     for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
     {
         Stats type = (Stats)i;
         std::ostringstream name; name << "immersive_stat_" << i;
         uint32 value = 0;
+        // Unknown stored distribution: touch nothing and leave. The tail below is
+        // NOT a passive refresh - Player::InitStatsForLevel(true) clears the
+        // ghost/AFK/GM flags, drops stealth, reapplies every stat bonus and heals
+        // to full - so running it because a query failed would resurrect and heal
+        // the bot as a side effect of a database hiccup.
         if (!sRandomPlayerbotMgr.TryGetEventValue(owner, name.str(), value))
-        {
-            // Fail closed on the REDISTRIBUTION only. An unreadable row means the
-            // stored distribution is unknown, so it must not be recomputed from
-            // partial data - but applying the bot's base stats below is
-            // unconditional, and returning from here left a freshly created bot
-            // with an un-applied stat block on a transient database failure.
-            distributionKnown = false;
-            break;
-        }
+            return;
         total += value;
         percentMap[type] = value;
     }
 
-    if (distributionKnown && total != 100)
+    if (total != 100)
     {
-        // Reset BEFORE the switch. Each case below assigns only the stats it cares
-        // about and depends on the rest being 0 to reach exactly 100. That held
-        // under the old `if (!initialized)` gate, which ran only when EVERY stored
-        // value was 0. `total != 100` also fires on stored, non-zero data, where an
-        // unassigned stat keeps its stored value: a warrior with 7 stored INT (the
-        // shuffle below can move points into INT) is rewritten to 30/10/20/40 plus
-        // that surviving 7 = 107, the sum-preserving shuffle keeps 107, 107 is
-        // persisted, and every later call re-enters with total != 100 forever.
-        for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
-            percentMap[(Stats)i] = 0;
+        // The per-class table lives in living/ so the "every class totals 100"
+        // invariant is a host test rather than a runtime check: a class with no
+        // row (death knight, for years) used to fall through with an all-zero
+        // split that could never reach 100, so this branch re-derived and rewrote
+        // five durable rows on every call forever.
+        living::ImmersiveStatSpread spread;
+        if (!living::TryImmersiveStatSpread(bot->getClass(), spread))
+            return;
 
-        switch (bot->getClass())
-        {
-        case CLASS_DRUID:
-        case CLASS_SHAMAN:
-            percentMap[STAT_STRENGTH] = 15;
-            percentMap[STAT_INTELLECT] = 10;
-            percentMap[STAT_SPIRIT] = 5;
-            percentMap[STAT_AGILITY] = 35;
-            percentMap[STAT_STAMINA] = 35;
-            break;
-        case CLASS_PALADIN:
-            percentMap[STAT_STRENGTH] = 35;
-            percentMap[STAT_INTELLECT] = 10;
-            percentMap[STAT_SPIRIT] = 5;
-            percentMap[STAT_AGILITY] = 15;
-            percentMap[STAT_STAMINA] = 35;
-            break;
-        case CLASS_WARRIOR:
-#ifdef MANGOSBOT_TWO
-        // Death Knight had no case at all, so it fell through with an all-zero
-        // distribution: the sum never reached 100, the branch re-entered on every
-        // call, and it rewrote five durable rows each time. It is the other plate
-        // strength class without mana, so it takes the warrior spread.
-        case CLASS_DEATH_KNIGHT:
-#endif
-            percentMap[STAT_STRENGTH] = 30;
-            percentMap[STAT_SPIRIT] = 10;
-            percentMap[STAT_AGILITY] = 20;
-            percentMap[STAT_STAMINA] = 40;
-            break;
-        case CLASS_ROGUE:
-        case CLASS_HUNTER:
-            percentMap[STAT_STRENGTH] = 15;
-            percentMap[STAT_SPIRIT] = 5;
-            percentMap[STAT_AGILITY] = 40;
-            percentMap[STAT_STAMINA] = 40;
-            break;
-        case CLASS_MAGE:
-            percentMap[STAT_INTELLECT] = 65;
-            percentMap[STAT_SPIRIT] = 5;
-            percentMap[STAT_STAMINA] = 30;
-            break;
-        case CLASS_PRIEST:
-            percentMap[STAT_INTELLECT] = 15;
-            percentMap[STAT_SPIRIT] = 55;
-            percentMap[STAT_STAMINA] = 30;
-            break;
-        case CLASS_WARLOCK:
-            percentMap[STAT_INTELLECT] = 30;
-            percentMap[STAT_SPIRIT] = 15;
-            percentMap[STAT_STAMINA] = 55;
-            break;
-        }
+        for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
+            percentMap[(Stats)i] = spread[i];
 
         for (int i = 0; i < 5; i++)
         {
@@ -5313,38 +5257,12 @@ void PlayerbotFactory::InitImmersive()
             }
         }
 
-        // Never persist a distribution that is not exactly 100. Without this, any
-        // class the switch above fails to cover writes a sum it will re-enter on
-        // forever - five durable rows per call, with InitStatsForLevel applied to a
-        // budget that is not 100%. Enforcing the invariant here means a future class
-        // that is added to the game but not to the switch degrades to "no immersive
-        // distribution" instead of an unbounded rewrite loop.
-        int32 rolled = 0;
         for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
-            rolled += percentMap[(Stats)i];
-
-        if (rolled != 100)
         {
-            sLog.outError("InitImmersive: refusing to persist a %d%% stat distribution for bot %u (class %u)",
-                rolled, owner, uint32(bot->getClass()));
-        }
-        else
-        {
-            // A failed write stops the remaining writes but must NOT skip the stat
-            // application below: returning from here left a freshly created bot with
-            // an un-applied stat block, and a partial write already changed the
-            // stored total, which the guard above now catches on the next call.
-            for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
-            {
-                Stats type = (Stats)i;
-                std::ostringstream name; name << "immersive_stat_" << i;
-                if (!sRandomPlayerbotMgr.SetValue(owner, name.str(), percentMap[type]))
-                {
-                    sLog.outError("InitImmersive: stat %d could not be persisted for bot %u; distribution left incomplete",
-                        i, owner);
-                    break;
-                }
-            }
+            Stats type = (Stats)i;
+            std::ostringstream name; name << "immersive_stat_" << i;
+            if (!sRandomPlayerbotMgr.SetValue(owner, name.str(), percentMap[type]))
+                return;
         }
     }
     bot->InitStatsForLevel(true);
