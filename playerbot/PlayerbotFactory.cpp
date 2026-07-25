@@ -5214,19 +5214,39 @@ void PlayerbotFactory::InitImmersive()
     std::map<Stats, int32> percentMap;
 
     uint32 total = 0;
+    bool distributionKnown = true;
     for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
     {
         Stats type = (Stats)i;
         std::ostringstream name; name << "immersive_stat_" << i;
         uint32 value = 0;
         if (!sRandomPlayerbotMgr.TryGetEventValue(owner, name.str(), value))
-            return;
+        {
+            // Fail closed on the REDISTRIBUTION only. An unreadable row means the
+            // stored distribution is unknown, so it must not be recomputed from
+            // partial data - but applying the bot's base stats below is
+            // unconditional, and returning from here left a freshly created bot
+            // with an un-applied stat block on a transient database failure.
+            distributionKnown = false;
+            break;
+        }
         total += value;
         percentMap[type] = value;
     }
 
-    if (total != 100)
+    if (distributionKnown && total != 100)
     {
+        // Reset BEFORE the switch. Each case below assigns only the stats it cares
+        // about and depends on the rest being 0 to reach exactly 100. That held
+        // under the old `if (!initialized)` gate, which ran only when EVERY stored
+        // value was 0. `total != 100` also fires on stored, non-zero data, where an
+        // unassigned stat keeps its stored value: a warrior with 7 stored INT (the
+        // shuffle below can move points into INT) is rewritten to 30/10/20/40 plus
+        // that surviving 7 = 107, the sum-preserving shuffle keeps 107, 107 is
+        // persisted, and every later call re-enters with total != 100 forever.
+        for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
+            percentMap[(Stats)i] = 0;
+
         switch (bot->getClass())
         {
         case CLASS_DRUID:
@@ -5245,6 +5265,13 @@ void PlayerbotFactory::InitImmersive()
             percentMap[STAT_STAMINA] = 35;
             break;
         case CLASS_WARRIOR:
+#ifdef MANGOSBOT_TWO
+        // Death Knight had no case at all, so it fell through with an all-zero
+        // distribution: the sum never reached 100, the branch re-entered on every
+        // call, and it rewrote five durable rows each time. It is the other plate
+        // strength class without mana, so it takes the warrior spread.
+        case CLASS_DEATH_KNIGHT:
+#endif
             percentMap[STAT_STRENGTH] = 30;
             percentMap[STAT_SPIRIT] = 10;
             percentMap[STAT_AGILITY] = 20;
@@ -5286,12 +5313,38 @@ void PlayerbotFactory::InitImmersive()
             }
         }
 
+        // Never persist a distribution that is not exactly 100. Without this, any
+        // class the switch above fails to cover writes a sum it will re-enter on
+        // forever - five durable rows per call, with InitStatsForLevel applied to a
+        // budget that is not 100%. Enforcing the invariant here means a future class
+        // that is added to the game but not to the switch degrades to "no immersive
+        // distribution" instead of an unbounded rewrite loop.
+        int32 rolled = 0;
         for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
+            rolled += percentMap[(Stats)i];
+
+        if (rolled != 100)
         {
-            Stats type = (Stats)i;
-            std::ostringstream name; name << "immersive_stat_" << i;
-            if (!sRandomPlayerbotMgr.SetValue(owner, name.str(), percentMap[type]))
-                return;
+            sLog.outError("InitImmersive: refusing to persist a %d%% stat distribution for bot %u (class %u)",
+                rolled, owner, uint32(bot->getClass()));
+        }
+        else
+        {
+            // A failed write stops the remaining writes but must NOT skip the stat
+            // application below: returning from here left a freshly created bot with
+            // an un-applied stat block, and a partial write already changed the
+            // stored total, which the guard above now catches on the next call.
+            for (int i = STAT_STRENGTH; i < MAX_STATS; ++i)
+            {
+                Stats type = (Stats)i;
+                std::ostringstream name; name << "immersive_stat_" << i;
+                if (!sRandomPlayerbotMgr.SetValue(owner, name.str(), percentMap[type]))
+                {
+                    sLog.outError("InitImmersive: stat %d could not be persisted for bot %u; distribution left incomplete",
+                        i, owner);
+                    break;
+                }
+            }
         }
     }
     bot->InitStatsForLevel(true);
