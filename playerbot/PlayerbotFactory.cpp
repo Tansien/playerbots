@@ -5220,11 +5220,16 @@ void PlayerbotFactory::InitImmersive()
         Stats type = (Stats)i;
         std::ostringstream name; name << "immersive_stat_" << i;
         uint32 value = 0;
-        // Unknown stored distribution: touch nothing and leave. The tail below is
-        // NOT a passive refresh - Player::InitStatsForLevel(true) clears the
-        // ghost/AFK/GM flags, drops stealth, reapplies every stat bonus and heals
-        // to full - so running it because a query failed would resurrect and heal
-        // the bot as a side effect of a database hiccup.
+        // Unknown stored distribution: touch nothing and leave, matching the
+        // behaviour before this function was reworked.
+        // NOTE the tail is not a passive refresh - Player::InitStatsForLevel(true)
+        // clears the ghost/AFK/GM flags, drops stealth, reapplies every stat bonus
+        // and heals to full - but it still runs unconditionally on every call that
+        // gets past this loop, including the steady-state total == 100 case. So
+        // returning here avoids that on a failed read only; it does not make the
+        // side effect conditional in any meaningful sense. Whether the tail should
+        // be unconditional at all is an open question for whoever reconnects this
+        // function (it currently has no callers).
         if (!sRandomPlayerbotMgr.TryGetEventValue(owner, name.str(), value))
             return;
         total += value;
@@ -5238,6 +5243,17 @@ void PlayerbotFactory::InitImmersive()
         // row (death knight, for years) used to fall through with an all-zero
         // split that could never reach 100, so this branch re-derived and rewrote
         // five durable rows on every call forever.
+        // The header is core-free, so it hardcodes the stat count, the index order
+        // and the class ids and can only document them. Pin them here, where both
+        // sides are visible - same idiom as AiFactory.cpp's role-bit assertions.
+        static_assert(MAX_STATS == living::IMMERSIVE_STAT_COUNT,
+            "living::ImmersiveStatSpread must have one entry per core stat");
+        static_assert(STAT_STRENGTH == 0 && STAT_AGILITY == 1 && STAT_STAMINA == 2
+            && STAT_INTELLECT == 3 && STAT_SPIRIT == 4,
+            "ImmersiveStatSpread is positional: it assumes this Stats enum order");
+        static_assert(CLASS_WARRIOR == 1 && CLASS_DRUID == 11,
+            "TryImmersiveStatSpread switches on raw class ids");
+
         living::ImmersiveStatSpread spread;
         if (!living::TryImmersiveStatSpread(bot->getClass(), spread))
             return;

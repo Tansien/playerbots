@@ -32,6 +32,37 @@ LIVING_TEST(immersive_spread_totals_exactly_100_for_every_supported_class)
     }
 }
 
+// The totals test above is blind to a transposition: swapping two entries in a row
+// keeps the sum at 100 and every bound satisfied, while silently applying one stat's
+// budget as another. The delegation site static_asserts the core's Stats ORDER, but
+// nothing there can tell whether these rows were written in it - so pin the slot each
+// class's signature stat must land in. Chosen to be unambiguous: a mage is the most
+// intellect-heavy class, a warrior the most strength-heavy, a priest the most spirit-heavy.
+LIVING_TEST(immersive_spread_puts_each_signature_stat_in_the_right_slot)
+{
+    enum { STR = 0, AGI = 1, STA = 2, INT = 3, SPI = 4 };
+
+    ImmersiveStatSpread mage{};
+    LIVING_CHECK(TryImmersiveStatSpread(8, mage));
+    LIVING_CHECK(mage[INT] == 65);
+    LIVING_CHECK(mage[STR] == 0 && mage[AGI] == 0);
+
+    ImmersiveStatSpread warrior{};
+    LIVING_CHECK(TryImmersiveStatSpread(1, warrior));
+    LIVING_CHECK(warrior[STR] == 30 && warrior[AGI] == 20 && warrior[STA] == 40);
+    LIVING_CHECK(warrior[INT] == 0 && warrior[SPI] == 10);
+
+    ImmersiveStatSpread priest{};
+    LIVING_CHECK(TryImmersiveStatSpread(5, priest));
+    LIVING_CHECK(priest[SPI] == 55 && priest[INT] == 15 && priest[STA] == 30);
+
+    // Death knight shares the warrior row; pin that too, since it is the arm that
+    // was missing entirely and the one most likely to be edited next.
+    ImmersiveStatSpread deathKnight{};
+    LIVING_CHECK(TryImmersiveStatSpread(6, deathKnight));
+    LIVING_CHECK(deathKnight == warrior);
+}
+
 LIVING_TEST(immersive_spread_covers_every_playable_class)
 {
     // warrior, paladin, hunter, rogue, priest, death knight, shaman, mage,

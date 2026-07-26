@@ -342,7 +342,7 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     if (name.empty())
         return false;
 
-    std::vector<uint8> skinColors, facialHairTypes;
+    std::vector<uint8> facialHairTypes;
     std::vector<std::pair<uint8,uint8>> faces, hairs;
     for (CharSectionsMap::const_iterator itr = sCharSectionMap.begin(); itr != sCharSectionMap.end(); ++itr)
     {
@@ -353,9 +353,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 #ifndef MANGOSBOT_TWO
         switch (entry->BaseSection)
         {
-        case SECTION_TYPE_SKIN:
-            skinColors.push_back(entry->ColorIndex);
-            break;
         case SECTION_TYPE_FACE:
             faces.push_back(std::pair<uint8,uint8>(entry->VariationIndex, entry->ColorIndex));
             break;
@@ -369,9 +366,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 #else
         switch (entry->BaseSection)
         {
-        case SECTION_TYPE_SKIN:
-            skinColors.push_back(entry->Color);
-            break;
         case SECTION_TYPE_FACE:
             faces.push_back(std::pair<uint8, uint8>(entry->VariationIndex, entry->Color));
             break;
@@ -386,14 +380,11 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     }
 
     // A race/gender with no CharSections rows for this build (a race id that does
-    // not exist in the expansion's DBC, or one named by FixedClassRaceCounts) left
+    // not exist in the expansion's DBC, or one named by FixedClassRaceCounts) leaves
     // these vectors empty, and size() - 1 on an empty vector is SIZE_MAX: urand then
-    // returned a multi-billion index and the read went out of bounds.
-    // Only faces and hairs are gated: both halves of each pair are passed to
-    // Player::Create below, so an empty vector there is a genuine unusable tuple.
-    // skinColors is deliberately NOT gated - the value drawn from it is dead (the
-    // skin argument is face.second), so refusing on it would reject tuples the
-    // creation path never reads.
+    // returns a multi-billion index and the read goes out of bounds. Both halves of
+    // each pair below are passed to Player::Create, so an empty vector here is a
+    // genuinely unusable tuple.
     if (faces.empty() || hairs.empty())
     {
         sLog.outError("Unable to create random bot for account %d - no appearance data for race %u gender %u",
@@ -401,7 +392,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         return false;
     }
 
-    uint8 skinColor = skinColors[urand(0, skinColors.size() - 1)];
     std::pair<uint8,uint8> face = faces[urand(0, faces.size() - 1)];
     std::pair<uint8,uint8> hair = hairs[urand(0, hairs.size() - 1)];
 
