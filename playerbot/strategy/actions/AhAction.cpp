@@ -323,16 +323,17 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!auction)
                 continue;
 
-            // One prototype/count check for the whole iteration. Both hazards are
-            // real for a single row and every branch below shares them: the item
-            // can leave item_template after the auction was created (the cached
-            // "item usage" value outlives the row, so the usage filter does not
-            // catch it), and a malformed row can carry itemCount 0. Downstream,
-            // ITEM_USAGE_AH divides by itemCount and dereferences the prototype
-            // inside IsWorthBuyingFromAhToResellAtAH, the vendor arm does the
-            // same inline, and ReasonForNeed formats the item through
-            // ChatHelper::formatItem, which reads proto->Quality.
-            if (!sObjectMgr.GetItemPrototype(auction->itemTemplate) || !auction->itemCount)
+            // Resolve once and keep it, so every dereference below is visibly
+            // covered instead of trusting a check tens of lines away.
+            // itemCount is the load-bearing half: a malformed row carrying 0
+            // reaches `totalCost / itemCount` inside
+            // IsWorthBuyingFromAhToResellAtAH for ITEM_USAGE_AH and the same
+            // division inline in the vendor arm. The null-prototype half is
+            // cheap insurance only - ItemUsageValue::Calculate already maps a
+            // missing prototype to ITEM_USAGE_NONE, which the usage filter
+            // below drops - so it is not the thing doing the work here.
+            ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
+            if (!proto || !auction->itemCount)
                 continue;
 
             // Never bid on the bot's own account's auctions (incl. online AND
@@ -397,7 +398,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             case ItemUsage::ITEM_USAGE_AH:
             {
                 auto pmo = sPerformanceMonitor.start(PERF_MON_VALUE, "IsWorthBuyingFromAhToResellAtAH", ai);
-                bool isWorthBuyingFromAhToResellAtAH = ItemUsageValue::IsWorthBuyingFromAhToResellAtAH(sObjectMgr.GetItemPrototype(auction->itemTemplate), cost, auction->itemCount);
+                bool isWorthBuyingFromAhToResellAtAH = ItemUsageValue::IsWorthBuyingFromAhToResellAtAH(proto, cost, auction->itemCount);
                 pmo.reset();
 
                 if (!isWorthBuyingFromAhToResellAtAH)
@@ -407,8 +408,7 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             }
             case ItemUsage::ITEM_USAGE_VENDOR:
                 //basically if AH price is lower than vendor sell price then it's worth it
-                // Prototype and itemCount are already validated at the top of the loop.
-                if (cost / auction->itemCount >= sObjectMgr.GetItemPrototype(auction->itemTemplate)->SellPrice)
+                if (cost / auction->itemCount >= proto->SellPrice)
                     continue;
                 power = 1000;
                 break;
@@ -640,8 +640,12 @@ bool AhBidAction::BidItem(Player* requester, AuctionEntry* auction, uint32 price
 
     ItemPrototype const* proto = sObjectMgr.GetItemPrototype(auction->itemTemplate);
 
-    // Checked here as well as in the scan loop: BidItem has a second caller that
-    // does not go through that loop, and proto is dereferenced unguarded below.
+    // Both callers already reject a null prototype (the scan loop, and the
+    // named-item path's own filter), so this is a local invariant rather than a
+    // compensating control - it keeps the dereferences below obviously safe
+    // without having to go and re-check either caller. It must stay ahead of
+    // HandleAuctionPlaceBid: returning after the send would spend real money and
+    // still report failure, so a landed standing bid would not consume a cap slot.
     if (!proto)
         return false;
 

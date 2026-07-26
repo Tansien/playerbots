@@ -37,7 +37,6 @@ LIVING_TEST(numeric_parse_signed_accepts_negatives_and_still_rejects_junk)
     LIVING_CHECK(!TryParseInt32("2147483648", value));
     LIVING_CHECK(!TryParseInt32("-2147483649", value));
     LIVING_CHECK(!TryParseInt32("99999999999999999999", value));
-    LIVING_CHECK(value == 4242);
 
     // Same alphabet/consumption rule as the unsigned helpers.
     LIVING_CHECK(!TryParseInt32("", value));
@@ -47,6 +46,11 @@ LIVING_TEST(numeric_parse_signed_accepts_negatives_and_still_rejects_junk)
     LIVING_CHECK(!TryParseInt32("12abc", value));
     LIVING_CHECK(!TryParseInt32(" -1", value));
     LIVING_CHECK(!TryParseInt32("-1 ", value));
+
+    // Covers the whole rejection group, not just the overflow trio: a partial-parse
+    // implementation that consumed "12abc" as 12 and wrote it before rejecting the
+    // tail passed when this only guarded the out-of-range inputs.
+    LIVING_CHECK(value == 4242);
 
     // A rejected parse leaves the destination untouched, so a zero-initialized
     // field keeps its default instead of picking up a partial value.
