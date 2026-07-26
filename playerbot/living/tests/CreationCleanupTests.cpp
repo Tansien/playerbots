@@ -546,6 +546,36 @@ LIVING_TEST(durable_deletion_restart_recovery_follows_the_intent_plan)
     DecodeDeletionIntent("LegacyName", name, account);
     LIVING_CHECK(name == "LegacyName" && account == 0);
 
+    // An account token that does not parse EXACTLY must keep the name-only
+    // interpretation, never a truncated one. The hand-rolled accumulator this
+    // replaced tested its overflow bound before the multiply-add, so
+    // UINT32_MAX + 1 slipped past on its final digit and truncated to account 1
+    // - which restart recovery would then carry into confirmed-deletion account
+    // cleanup against an unrelated account.
+    DecodeDeletionIntent(EncodeDeletionIntent("Edge", 4294967295u), name, account);
+    LIVING_CHECK(name == "Edge" && account == 4294967295u);   // UINT32_MAX round-trips
+
+    name.clear();
+    account = 0xDEAD;
+    DecodeDeletionIntent("Edge|account:4294967296", name, account);      // UINT32_MAX + 1
+    LIVING_CHECK(name == "Edge|account:4294967296" && account == 0);
+
+    account = 0xDEAD;
+    DecodeDeletionIntent("Edge|account:4294967297", name, account);      // the truncating case
+    LIVING_CHECK(name == "Edge|account:4294967297" && account == 0);
+
+    account = 0xDEAD;
+    DecodeDeletionIntent("Edge|account:99999999999999999999", name, account);
+    LIVING_CHECK(name == "Edge|account:99999999999999999999" && account == 0);
+
+    account = 0xDEAD;
+    DecodeDeletionIntent("Edge|account:", name, account);                // empty token
+    LIVING_CHECK(name == "Edge|account:" && account == 0);
+
+    account = 0xDEAD;
+    DecodeDeletionIntent("Edge|account:12abc", name, account);           // trailing junk
+    LIVING_CHECK(name == "Edge|account:12abc" && account == 0);
+
     // The re-adopted owner in a FRESH process completes normally.
     DurableCharacterDeletions restarted;
     DeletionSpyOps spy;

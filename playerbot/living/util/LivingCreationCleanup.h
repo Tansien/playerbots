@@ -2,6 +2,7 @@
 
 #include "LivingCreationBatch.h"     // BatchPollResult / BatchPollStatus
 #include "LivingCreationFinalizer.h" // CreationPollResult / CreationPollStatus
+#include "LivingNumericParse.h"      // TryParseUInt32
 
 #include <cstddef>
 #include <cstdint>
@@ -229,19 +230,22 @@ namespace living
         if (tag == std::string::npos)
             return; // legacy name-only intent: account unknown (0)
 
-        uint64_t parsed = 0;
-        for (size_t i = tag + 9; i < data.size(); ++i)
-        {
-            char const c = data[i];
-            if (c < '0' || c > '9' || parsed > 0xFFFFFFFFull)
-                return; // malformed: keep name-only interpretation
-            parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
-        }
-        if (tag + 9 == data.size())
-            return;
+        // Route through the shared exact parser, exactly as DecodeCreationIntent
+        // does for the same field. The hand-rolled accumulator this replaces
+        // checked its overflow bound BEFORE the multiply-add, so a value one
+        // decimal digit past UINT32_MAX ("|account:4294967297") passed the guard
+        // on its last digit and then truncated to a different, valid-looking
+        // account - which restart recovery would carry into confirmed-deletion
+        // account cleanup against an unrelated account. TryParseUInt32 rejects
+        // the whole token instead, and an unparsable account keeps the
+        // name-only interpretation (accountId stays 0) so identity checks still
+        // fail closed.
+        uint32_t decoded = 0;
+        if (!TryParseUInt32(data.substr(tag + 9), decoded))
+            return; // malformed: keep name-only interpretation
 
         name = data.substr(0, tag);
-        accountId = static_cast<uint32_t>(parsed);
+        accountId = decoded;
     }
 
     // Typed deletion preflight over ONE identity query
