@@ -318,30 +318,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     if (!race)
         return false;
 
-    NameRaceAndGender raceAndGender = CombineRaceAndGender(gender, race);
-
-    std::string name;
-    auto it = freeNames.find(raceAndGender);
-    if (it == freeNames.end() || it->second.empty())
-    {
-        // Try fallback: generate new name with suffix if all names exhausted
-        // First try other gender
-        std::string baseName = CreateRandomBotName(raceAndGender);
-        if (baseName.empty())
-            return false;
-        name = baseName;
-    }
-    else
-    {
-        uint32 i = urand(0, it->second.size() - 1);
-        name = it->second[i];
-        swap(it->second[i], it->second.back());
-        it->second.pop_back();
-    }
-
-    if (name.empty())
-        return false;
-
     std::vector<uint8> facialHairTypes;
     std::vector<std::pair<uint8,uint8>> faces, hairs;
     for (CharSectionsMap::const_iterator itr = sCharSectionMap.begin(); itr != sCharSectionMap.end(); ++itr)
@@ -391,6 +367,32 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
             accountId, race, gender);
         return false;
     }
+
+    NameRaceAndGender raceAndGender = CombineRaceAndGender(gender, race);
+
+    std::string name;
+    auto it = freeNames.find(raceAndGender);
+    if (it == freeNames.end() || it->second.empty())
+    {
+        // nameMutex is ALREADY held here. CreateRandomBotName locks the same
+        // non-recursive mutex, so calling it from this branch self-deadlocks the
+        // world thread - and it would return "" anyway, because it re-tests this
+        // exact empty-pool condition. Despite the old comment there is no
+        // suffix-generation fallback to reach.
+        sLog.outError("No more names left for random bots for race/gender %u; add rows to ai_playerbot_names",
+            static_cast<uint8>(raceAndGender));
+        return false;
+    }
+    else
+    {
+        uint32 i = urand(0, it->second.size() - 1);
+        name = it->second[i];
+        swap(it->second[i], it->second.back());
+        it->second.pop_back();
+    }
+
+    if (name.empty())
+        return false;
 
     std::pair<uint8,uint8> face = faces[urand(0, faces.size() - 1)];
     std::pair<uint8,uint8> hair = hairs[urand(0, hairs.size() - 1)];

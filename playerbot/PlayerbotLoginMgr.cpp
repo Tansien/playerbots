@@ -174,6 +174,12 @@ bool PlayerLoginInfo::SendHolder()
     if (!lqh->Initialize())
     {
         delete holder;                                      // delete all unprocessed queries
+        // holderState was set to HOLDER_SENT above. Leaving it there with a
+        // dangling holder wedges every later send for this bot behind a pointer
+        // that has been freed, so release the state the same way the
+        // deletion-pending path in LoginBot does.
+        holder = nullptr;
+        holderState = HolderState::HOLDER_EMPTY;
         return false;
     }
 
@@ -310,8 +316,17 @@ bool PlayerLoginInfo::LoginBot()
 
     if (sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, guid), false))
     {
+        // The player already exists, so this holder will never be consumed:
+        // release it instead of leaving it received and leaked. Report success
+        // so LoginLogoutBots tracks a bot we have just declared BOT_ONLINE -
+        // returning false left it online but absent from onlineBots. The
+        // loginState guard at the top of this function means this can only fire
+        // once per queued entry, so the caller cannot double-track it.
+        delete holder;
+        holder = nullptr;
+        holderState = HolderState::HOLDER_EMPTY;
         loginState = LoginState::BOT_ONLINE;
-        return false;
+        return true;
     }
 
     // Persist the complete add/logout transition before materializing the
