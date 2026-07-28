@@ -304,7 +304,12 @@ std::set<uint32> ChatHelper::ExtractAllQuestIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 7)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 7), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -320,7 +325,12 @@ std::set<uint32> ChatHelper::ExtractAllItemIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 6)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 6), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -336,7 +346,12 @@ std::set<uint32> ChatHelper::ExtractAllSkillIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 7)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 7), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -352,7 +367,12 @@ std::set<uint32> ChatHelper::ExtractAllFactionIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 9)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 9), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -406,12 +426,13 @@ std::vector<uint32> ChatHelper::parseItemsUnordered(const std::string& text, boo
             continue;
         }
 
-        if (isNumeric(itemStr))
+        int32 parsedItemId = 0;
+        if (Qualified::parseNumberString(itemStr, parsedItemId) && parsedItemId > 0)
         {
-            const uint32 itemID = std::stoi(itemStr);
+            const uint32 itemID = uint32(parsedItemId);
             if (!validate || sObjectMgr.GetItemPrototype(itemID) != nullptr)
             {
-                itemIds.push_back(std::stoi(itemStr));
+                itemIds.push_back(itemID);
             }
         }
     }

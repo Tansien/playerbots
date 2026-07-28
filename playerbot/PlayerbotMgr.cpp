@@ -2128,7 +2128,23 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
 
         int32 parsedSize = 0;
         if (key == "size" && Qualified::parseNumberString(value, parsedSize))
-            groupSize = parsedSize;
+        {
+            // groupSize is a uint8, so the range must be checked BEFORE the
+            // narrowing: size=-1 became 255 and drove up to 2550 creation
+            // attempts, and size=256 became 0. Same bug class already fixed
+            // in SetValueAction.
+            // 40 is the largest raid, matching the sizes InviteToGroupAction
+            // accepts. A literal rather than MAX_RAID_SIZE because that symbol
+            // is not otherwise used in this module and cannot be compile-
+            // checked in this environment.
+            if (parsedSize < 1 || parsedSize > 40)
+            {
+                messages.push_back("Unsupported group size '" + value + "'");
+                return messages;
+            }
+
+            groupSize = uint8(parsedSize);
+        }
         else
             passThroughParam += key + "=" + value + " ";
     }
