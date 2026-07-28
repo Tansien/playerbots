@@ -1238,7 +1238,13 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
         return "Self-bot is disabled";
     }
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    // This had no validation at all: an "always=<value>" override went
+    // straight into stoull.
+    uint64 rawGuid = 0;
+    if (!Qualified::parseUInt64String(param, rawGuid))
+        return "Always: Error parsing " + param;
+
+    ObjectGuid guid = ObjectGuid(rawGuid);
     uint32 accountId = sObjectMgr.GetPlayerAccountIdByGUID(guid);
     std::string alwaysName;    
 
@@ -1809,10 +1815,14 @@ std::string PlayerbotHolder::HandleBotAddLogin(Player* bot, Player* master, cons
     if (bot)
         return "Player already logged in";
 
-    if (!Qualified::isValidNumberString(param))
+    // The command parser lets a user-supplied "add=<value>" override the GUID
+    // it resolved, so this string is untrusted: a syntax check alone still
+    // threw out_of_range in stoull on an oversized number.
+    uint64 rawGuid = 0;
+    if (!Qualified::parseUInt64String(param, rawGuid))
         return "Add: Error parsing " + param;
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    ObjectGuid guid = ObjectGuid(rawGuid);
 
     uint32 guildId = Player::GetGuildIdFromDB(guid);
     uint32 masterAccountId = master ? master->GetSession()->GetAccountId() : 0;
@@ -1892,7 +1902,20 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
         else if (key == "gender")
             gender = ChatHelper::parseGender(value);
         else if (key == "level")
-            level = std::stoul(value);
+        {
+            // Raw stoul threw on a non-numeric or oversized value, and "-1"
+            // wrapped to a huge unsigned that went on to SetLevel.
+            int32 parsedLevel = 0;
+            if (!Qualified::parseNumberString(value, parsedLevel)
+                || parsedLevel < 1
+                || uint32(parsedLevel) > sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+            {
+                messages.push_back("Unsupported level '" + value + "'");
+                return;
+            }
+
+            level = uint32(parsedLevel);
+        }
         else if (key == "role")
             role = ChatHelper::parseRole(value);
         else if (key == "login")
@@ -2467,10 +2490,11 @@ std::string PlayerbotHolder::HandleBotDelete(Player* bot, Player* master, const 
     ObjectGuid guid;
     if (!bot)
     {
-        if (!Qualified::isValidNumberString(param))
-            return "Add: Error parsing " + param;
+        uint64 rawGuid = 0;
+        if (!Qualified::parseUInt64String(param, rawGuid))
+            return "Delete: Error parsing " + param;
 
-        guid = ObjectGuid(uint64(std::stoull(param)));
+        guid = ObjectGuid(rawGuid);
     }
     else
     {

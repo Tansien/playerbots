@@ -174,6 +174,32 @@ namespace ai
             return true;
         }
 
+        // Parses an unsigned decimal without ever throwing. Rejects the empty
+        // string, ANY sign - a raw ObjectGuid is never signed, and std::stoull
+        // silently wraps a negative rather than failing - non-digits, and
+        // anything that will not fit in uint64.
+        static bool parseUInt64String(const std::string& str, uint64& result)
+        {
+            if (str.empty())
+                return false;
+
+            uint64 value = 0;
+            for (char c : str)
+            {
+                if (c < '0' || c > '9')
+                    return false;
+
+                uint64 const digit = uint64(c - '0');
+                if (value > (0xFFFFFFFFFFFFFFFFull - digit) / 10)
+                    return false;
+
+                value = value * 10 + digit;
+            }
+
+            result = value;
+            return true;
+        }
+
         static int32 getMultiQualifierInt(const std::string& qualifier1, uint32 pos, const std::string& separator)
         {
             std::vector<std::string> qualifiers = getMultiQualifiers(qualifier1, separator);
