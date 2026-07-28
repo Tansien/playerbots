@@ -155,7 +155,7 @@ bool RandomPlayerbotFactory::isAvailableRole(uint8 cls, BotRoles role)
 uint8 RandomPlayerbotFactory::GetRandomClass(uint8 useRace, BotRoles role)
 {
     uint32 classProb[MAX_CLASSES] = { 0 };
-
+    uint32 totalClassProb = 0;
 
     for (uint32 race = 1; race < MAX_RACES; ++race)
     {
@@ -168,10 +168,26 @@ uint8 RandomPlayerbotFactory::GetRandomClass(uint8 useRace, BotRoles role)
                 continue;
 
             classProb[cls] += sPlayerbotAIConfig.classRaceProbability[cls][race];
+            totalClassProb += sPlayerbotAIConfig.classRaceProbability[cls][race];
         }
     }
 
-    uint32 randomProb = urand(0, sPlayerbotAIConfig.classRaceProbabilityTotal);
+    // No class satisfies the requested race/role: fail closed, the same way
+    // GetRandomRace does. The old fallback returned the first eligible class
+    // (warrior for an unfiltered pool), silently ignoring the configured
+    // weights; the sole caller treats 0 as a failed creation and releases the
+    // character slot it reserved.
+    if (totalClassProb == 0)
+        return 0;
+
+    // Draw from the FILTERED total, exclusively. Two bugs here before:
+    // sampling 0..total INCLUSIVE let the draw == total case fall through
+    // every bucket into the fallback, and the range was the GLOBAL
+    // classRaceProbabilityTotal rather than the sum of the buckets actually
+    // iterated - so with a race or role constraint the draw routinely
+    // exceeded every bucket and selection collapsed onto the first eligible
+    // class. Only the sole unfiltered caller kept that latent.
+    uint32 randomProb = urand(0, totalClassProb - 1);
 
     for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
     {
@@ -184,16 +200,8 @@ uint8 RandomPlayerbotFactory::GetRandomClass(uint8 useRace, BotRoles role)
         randomProb -= classProb[cls];
     }
 
-    for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
-    {
-        if (!isAvailableRole(cls, role))
-            continue;
-
-        if (classProb[cls] > 0)
-            return cls;
-    }
-
-    return 1;
+    // Unreachable with the exclusive draw above; keep the closed failure.
+    return 0;
 }
 
 bool RandomPlayerbotFactory::isRaceForTeam(uint8 race, Team team)
@@ -313,6 +321,12 @@ void RandomPlayerbotFactory::ReturnFreeName(NameRaceAndGender raceAndGender, std
 
 bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 {
+    // GetRandomClass fails closed with 0 when no class satisfies the
+    // request. Row 0 of classRaceProbability is never populated (every
+    // config loop starts at cls 1), so refuse before anything reads it.
+    if (!cls)
+        return false;
+
     std::lock_guard<std::mutex> lock(nameMutex);
     EnsureNamesInitialized();
 
