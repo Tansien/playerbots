@@ -99,39 +99,71 @@ namespace ai
             return result;
         }
 
-        static bool isValidNumberString(const std::string& str)
+        // Parses a signed decimal integer without ever throwing.
+        // Returns false (leaving 'result' untouched) for the empty string, for a
+        // lone sign, for anything containing a non-digit and for values that do
+        // not fit in int32. Callers must not use std::stoi on strings that were
+        // only checked with isValidNumberString: stoi throws std::invalid_argument
+        // on "-" and std::out_of_range on oversized values, and nothing on the
+        // chat command path catches those exceptions.
+        static bool parseNumberString(const std::string& str, int32& result)
         {
-            bool valid = !str.empty();
-            if (valid)
+            // Check for sign character at the beginning
+            size_t start = 0;
+            bool negative = false;
+            if (!str.empty() && (str[0] == '+' || str[0] == '-'))
             {
-                // Check for sign character at the beginning
-                size_t start = 0;
-                if (str[0] == '+' || str[0] == '-')
-                {
-                    start = 1;
-                }
-
-                // Loop through each character to check if it's a digit
-                for (size_t i = start; i < str.size(); ++i) 
-                {
-                    if (!std::isdigit(str[i])) 
-                    {
-                        // Non-numeric character found
-                        valid = false;
-                        break;
-                    }
-                }
+                negative = (str[0] == '-');
+                start = 1;
             }
 
-            return valid;
-        }
-        
-        static int32 getMultiQualifierInt(const std::string& qualifier1, uint32 pos, const std::string& separator)
-        { 
-            std::vector<std::string> qualifiers = getMultiQualifiers(qualifier1, separator);
-            if (qualifiers.size() > pos && isValidNumberString(qualifiers[pos]))
+            // A sign on its own is not a number.
+            if (start >= str.size())
+                return false;
+
+            // Loop through each character to check if it's a digit
+            const long long intMax = 2147483647LL;
+            const long long intMin = -2147483647LL - 1LL;
+            long long value = 0;
+            for (size_t i = start; i < str.size(); ++i)
             {
-                return stoi(qualifiers[pos]);
+                if (!std::isdigit(static_cast<unsigned char>(str[i])))
+                {
+                    // Non-numeric character found
+                    return false;
+                }
+
+                value = value * 10 + (str[i] - '0');
+
+                // Bail out as soon as the magnitude can no longer fit so the
+                // accumulator itself cannot overflow on a long digit string.
+                if (value > intMax + 1LL)
+                    return false;
+            }
+
+            if (negative)
+                value = -value;
+
+            if (value < intMin || value > intMax)
+                return false;
+
+            result = int32(value);
+            return true;
+        }
+
+        static bool isValidNumberString(const std::string& str)
+        {
+            int32 parsed = 0;
+            return parseNumberString(str, parsed);
+        }
+
+        static int32 getMultiQualifierInt(const std::string& qualifier1, uint32 pos, const std::string& separator)
+        {
+            std::vector<std::string> qualifiers = getMultiQualifiers(qualifier1, separator);
+            int32 parsed = 0;
+            if (qualifiers.size() > pos && parseNumberString(qualifiers[pos], parsed))
+            {
+                return parsed;
             }
 
             return 0;

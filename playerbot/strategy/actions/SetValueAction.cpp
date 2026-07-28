@@ -17,7 +17,8 @@ bool SetValueAction::Execute(Event& event)
     {
         value = param.substr(std::string("group size ").size());
 
-        if (!Qualified::isValidNumberString(value))
+        int32 type = 0;
+        if (!Qualified::parseNumberString(value, type))
         {
 #ifdef MANGOSBOT_ZERO
             ai->TellPlayer(requester, "Incorrect value " + value + " allowed values: -1,0,1,2,3,4,5,20,40", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
@@ -26,8 +27,6 @@ bool SetValueAction::Execute(Event& event)
 #endif
             return false;
         }
-
-        int8 type = stoi(value);
 
         switch (type)
         {
@@ -75,7 +74,8 @@ bool SetValueAction::Execute(Event& event)
     {
         value = param.substr(std::string("guild size ").size());
 
-        if (!Qualified::isValidNumberString(value))
+        int32 type = 0;
+        if (!Qualified::parseNumberString(value, type))
         {
             ai->TellPlayer(requester, "Incorrect value " + value + " needs to be a number.", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             return false;
@@ -83,20 +83,22 @@ bool SetValueAction::Execute(Event& event)
 
         std::vector<int32> ranges = { 0,30,50,70,120,250 };
 
-        uint8 type = stoi(value);
-
         if (type < -1)
             type = -1;
         if (type > 250)
             type = 250;
 
-        for (auto& r : ranges)
+        // -1 means "reset to random" and must not be snapped up to a bucket.
+        if (type >= 0)
         {
-            if (type > r)
-                continue;
+            for (auto& r : ranges)
+            {
+                if (type > r)
+                    continue;
 
-            type = r;
-            break;
+                type = r;
+                break;
+            }
         }
         SET_AI_VALUE2(int32, "manual saved int", "guilder override", uint32(type));
 
@@ -113,15 +115,12 @@ bool SetValueAction::Execute(Event& event)
     {
         value = param.substr(std::string("rpg style ").size());
 
-        if (!Qualified::isValidNumberString(value))
+        int32 style = 0;
+        if (!Qualified::parseNumberString(value, style))
         {
             ai->TellPlayer(requester, "Incorrect value " + value + " needs to be a number.", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             return false;
         }
-
-        std::vector<int32> ranges = { 0,30,50,70,120,250 };
-
-        uint8 style = stoi(value);
 
         if (style < -1)
             style = -1;
