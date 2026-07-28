@@ -151,10 +151,27 @@ namespace ai
             return true;
         }
 
+        // SYNTAX-only validation: non-empty, an optional leading sign, and at
+        // least one character, all of them digits. Deliberately does NOT bound
+        // the magnitude: callers that go on to std::stoull legitimately accept
+        // values far wider than int32 (a raw ObjectGuid is a uint64, and
+        // PlayerbotMgr serializes one into the .bot add/login/delete param).
+        // When the value will be consumed as an int, use parseNumberString
+        // instead - std::stoi throws std::out_of_range on anything wider, and
+        // nothing on the chat command path catches that.
         static bool isValidNumberString(const std::string& str)
         {
-            int32 parsed = 0;
-            return parseNumberString(str, parsed);
+            size_t const start = (!str.empty() && (str[0] == '+' || str[0] == '-')) ? 1 : 0;
+
+            // A sign on its own is not a number.
+            if (start >= str.size())
+                return false;
+
+            for (size_t i = start; i < str.size(); ++i)
+                if (!std::isdigit(static_cast<unsigned char>(str[i])))
+                    return false;
+
+            return true;
         }
 
         static int32 getMultiQualifierInt(const std::string& qualifier1, uint32 pos, const std::string& separator)
