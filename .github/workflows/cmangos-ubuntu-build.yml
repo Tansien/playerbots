@@ -18,10 +18,12 @@ name: Ubuntu Build
 # - Build state: each job configures and builds under RUNNER_TEMP, which the runner
 #   recreates per job, so no CMake cache or artifact survives between runs.
 # - Runners are provisioned by the repository owner and are expected to provide the
-#   normal CMaNGOS build dependencies: git, cmake (>= 3.16), g++ or clang++,
+#   normal CMaNGOS build dependencies: git, cmake (>= 3.20), g++ or clang++,
 #   libboost-all-dev, libssl-dev, libmysqlclient-dev/default-libmysqlclient-dev, and
 #   libicu-dev (on 26.04 the mysql client library links ICU, so the dev package is
-#   required at link time).
+#   required at link time). The 3.20 floor is set by `ctest --test-dir` in the
+#   Test steps below; CMakeLists.txt asks only for 3.16 because that is all the
+#   CMake source needs, and it is evaluated only on a standalone configure.
 
 on:
   push:
