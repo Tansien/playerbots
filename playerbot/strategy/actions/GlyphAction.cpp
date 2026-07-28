@@ -192,7 +192,11 @@ void GlyphAction::Set(uint32 itemId, uint8 wantedSlotId, std::ostringstream& msg
 
     std::vector<uint32> equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
     uint8 useSlotId = wantedSlotId;
-    bool detectSlot = wantedSlotId > equipedGlyphs.size();
+    // >=, not >: a slot equal to the count is one past the end of the glyph
+    // array. With six slots, an explicit suffix of 6 skipped auto-detection
+    // here, passed the "no free slot" test below for the same reason, and
+    // reached ApplyGlyph/SetGlyph out of range.
+    bool detectSlot = wantedSlotId >= equipedGlyphs.size();
 
     if (!detectSlot && EquipedGlyphsValue::GetGlyphSlotTypeFromSlot(useSlotId, bot->GetLevel()) == GlyphSlotType::LOCKED_SLOT)
     {
@@ -223,7 +227,7 @@ void GlyphAction::Set(uint32 itemId, uint8 wantedSlotId, std::ostringstream& msg
 
     placeholders["%slot"] = std::to_string(useSlotId);
 
-    if (useSlotId > equipedGlyphs.size())
+    if (useSlotId >= equipedGlyphs.size())
     {
         msg << BOT_TEXT2("No free slot available for %glyph", placeholders);
         return;
@@ -347,7 +351,9 @@ bool AutoSetGlyphAction::Execute(Event& event)
             useSlot = newSlot;
         }
 
-        if (useSlot > equipedGlyphs.size())
+        // >= for the same reason as Set(): equipedGlyphs[useSlot] below is an
+        // out-of-bounds WRITE when useSlot equals the slot count.
+        if (useSlot >= equipedGlyphs.size())
             continue;
 
         newGlyphs.push_back(itemId);
