@@ -262,22 +262,32 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
     }
 
     uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
-    uint32 specId = specNo ? specNo - 1 : 0;
+    int32 specId = specNo ? int32(specNo) - 1 : -1;
     std::string specLink = sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink");
     uint8 cls = bot->getClass();
 
     // A persisted specNo can outlive the configuration that produced it: a
     // trimmed aiplayerbot.conf, a link newly rejected by CheckTalents, or a
-    // reload that renumbers the paths. getPremadePath then returns nullptr,
-    // GetBestPremadeSpec falls back to baseSpec - every class talent at rank
-    // zero - and applying that strips every talent the bot has learned. The
-    // stale specNo is never cleared, so the wipe repeats on every later pass.
-    // The name lookup below would have dereferenced the same nullptr.
+    // reload that renumbers the paths.
+    //
+    // The id must be compared explicitly. getPremadePath falls back to the
+    // FIRST configured path when the id is absent and only returns nullptr
+    // when the class has no paths at all, so a null check alone catches only
+    // the rare empty-class case. In the common one - a single path removed,
+    // the rest still present - it silently hands back path 0, the wrong build
+    // is applied, and specId + 1 re-persists the stale id at the end of this
+    // function, so the mismatch survives every later pass.
+    //
+    // When the class has no paths at all, GetBestPremadeSpec instead falls
+    // back to baseSpec, every class talent at rank zero, and applying that
+    // strips every talent the bot has learned. The name lookup below would
+    // have dereferenced the same nullptr.
     TalentPath* currentPath = specNo > 0 ? getPremadePath(cls, specId) : nullptr;
-    if (specNo > 0 && (!currentPath || currentPath->talentSpec.empty()))
+    if (specNo > 0 && (!currentPath || currentPath->id != specId || currentPath->talentSpec.empty()))
     {
         *out << "Stored spec is no longer configured; selecting a new one. ";
         specNo = 0;
+        specId = -1;
         currentPath = nullptr;
     }
 
