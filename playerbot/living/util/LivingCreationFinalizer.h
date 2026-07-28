@@ -508,6 +508,7 @@ namespace living
             completion.status = status;
             completion.name = record.name;
             completion.message = std::move(message);
+            bool const holdsReservation = record.holdsAccountReservation;
 
             if (onTerminal)
                 onTerminal(completion);
@@ -519,11 +520,21 @@ namespace living
             if (status == CreationPollStatus::Quarantined)
                 return;
 
-            if (record.holdsAccountReservation)
-                ReleaseAccountSlot(record.accountId);
+            // Everything below uses the copies taken above, so nothing touches
+            // `record` once onTerminal has run. Two reasons. `record` is a
+            // reference INTO `records`, so `records.erase(record.guid)` would
+            // bind the key parameter to storage the erase is about to destroy
+            // - harmless with libstdc++, which resolves the position via
+            // equal_range before unlinking, but not a guarantee the standard
+            // makes. And onTerminal is an arbitrary observer: today's is
+            // re-entrancy-free by construction, but if one ever did erase this
+            // record, reading `record` afterwards would be a use-after-free
+            // while erasing a copied key is merely a no-op.
+            if (holdsReservation)
+                ReleaseAccountSlot(completion.accountId);
 
-            tokenToGuid.erase(record.token);
-            records.erase(record.guid);
+            tokenToGuid.erase(completion.token);
+            records.erase(completion.guid);
         }
 
         void PruneExpiredCompletions()
