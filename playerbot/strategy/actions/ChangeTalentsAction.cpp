@@ -383,16 +383,27 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
 //Returns a pre-made talent spec that best suits the bots current talents. 
 TalentSpec* ChangeTalentsAction::GetBestPremadeSpec(Player* bot, int specId)
 {
+    // getPremadePath returns nullptr when the class has no premade paths
+    // configured at all, and every caller dereferences what we return, so the
+    // fallback below has to stay reachable and has to be safe.
     TalentPath* path = getPremadePath(bot->getClass(), specId);
-    for (auto& spec : path->talentSpec)
+    if (path)
     {
-        if (spec.points >= bot->CalculateTalentsPoints())
-            return &spec;
-    }
-    if (path->talentSpec.size())
-        return &path->talentSpec.back();
+        for (auto& spec : path->talentSpec)
+        {
+            if (spec.points >= bot->CalculateTalentsPoints())
+                return &spec;
+        }
 
-    return &sPlayerbotAIConfig.classSpecs[bot->getClassMask()].baseSpec;
+        if (path->talentSpec.size())
+            return &path->talentSpec.back();
+    }
+
+    // classSpecs is 'ClassSpecs classSpecs[MAX_CLASSES]', indexed by class id.
+    // getClassMask() is a bitmask - 1 << (class - 1), so up to 1024 - and using
+    // it here read far past the end of the array for every class above the
+    // fourth.
+    return &sPlayerbotAIConfig.classSpecs[bot->getClass()].baseSpec;
 }
 
 bool AutoSetTalentsAction::Execute(Event& event)
