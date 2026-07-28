@@ -46,14 +46,35 @@ bool AhAction::Execute(Event& event)
 
 bool AhBidAction::PrepareAction()
 {
-    // ONE account lookup per bid action, before the AH mutex: every character
-    // GUID on the bidder's account. Same-account admission for every listing
-    // in this action is then a pure set check - the per-listing
-    // GetPlayerAccountIdByGUID resolution performed a synchronous
-    // CharacterDatabase round trip for every offline owner, turning a full
+    // ONE account lookup, before the AH mutex: every character GUID on the
+    // bidder's account. Same-account admission for every listing is then a
+    // pure set check - resolving each offline owner's account instead cost a
+    // synchronous CharacterDatabase round trip per listing, turning a full
     // scan into thousands of serial queries on the world thread.
+    //
+    // The lookup stays before the mutex on purpose: the AH mutex is taken with
+    // try_lock, so a round trip underneath it would make every other bot skip
+    // its AH turn outright, and would block MirrorAh, which waits properly.
+    // Keeping it outside means paying for it on attempts that then lose the
+    // try_lock and do nothing, so the result is cached - but only for
+    // siblingsRefreshSeconds, never for the whole session. Bots are packed
+    // several to an account and character CREATION adds to one mid-session
+    // (`.bot create`, or the random-bot factory topping up a partially full
+    // account); since the core only rejects a same-account bid when the owner
+    // is OFFLINE, a set that missed an ONLINE sibling would let a bot bid on
+    // its own account's auction, the exact case this set exists to prevent.
+    // (Logging a bot in does not change the set - only rows in `characters`
+    // do - so `.bot add` on an existing character is not a staleness source.)
+    uint32 const bidder = bot->GetGUIDLow();
+    time_t const now = time(nullptr);
+    bool const cached = bidderSiblings.loaded && bidderSiblings.bidderGuidLow == bidder;
+    // now >= siblingsLoadedAt guards a backwards clock step, which would
+    // otherwise read as "fresh" and freeze the cache for the size of the jump.
+    if (cached && now >= siblingsLoadedAt && now - siblingsLoadedAt < siblingsRefreshSeconds)
+        return true;
+
     uint32 const account = bot->GetSession()->GetAccountId();
-    bidderSiblings = living::AuctionBidderSiblings::Load(bot->GetGUIDLow(),
+    living::AuctionBidderSiblings refreshed = living::AuctionBidderSiblings::Load(bidder,
         [account]() -> std::optional<std::vector<uint32>>
         {
             // The bidder's own character row exists on this account, so a null
@@ -72,11 +93,36 @@ bool AhBidAction::PrepareAction()
             return guids;
         });
 
-    if (!bidderSiblings.loaded)
-        sLog.outError("AhBidAction: sibling lookup failed for account %u; failing the whole bid action closed for %s",
-            account, bot->GetName());
+    if (refreshed.loaded)
+    {
+        bidderSiblings = std::move(refreshed);
+        siblingsLoadedAt = now;
+        return true;
+    }
 
-    return bidderSiblings.loaded;
+    // A refresh that fails keeps the set already in hand: it was really read
+    // from the database, so it is a better admission filter than rejecting
+    // every owner, and holding it for one more interval backs off instead of
+    // re-querying on every attempt through a database outage. Characters
+    // cannot be created while the database is down, so the retained set
+    // cannot go wrong in the way that matters. Logged because bidding
+    // continues on a set of growing age and this is the only signal of it;
+    // the backoff rate-limits this to one line per interval per bot.
+    if (cached)
+    {
+        siblingsLoadedAt = now;
+        sLog.outError("AhBidAction: sibling refresh failed for account %u; reusing the previously loaded set for %s",
+            account, bot->GetName());
+        return true;
+    }
+
+    // Nothing usable was ever loaded for this bidder: Rejects fails closed for
+    // every owner, so fail the whole action rather than bid blind.
+    bidderSiblings = std::move(refreshed);
+    sLog.outError("AhBidAction: sibling lookup failed for account %u; failing the whole bid action closed for %s",
+        account, bot->GetName());
+
+    return false;
 }
 
 bool AhAction::ExecuteCommand(Player* requester, std::string text, Unit* auctioneer)

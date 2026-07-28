@@ -61,10 +61,19 @@ namespace ai
         virtual bool ExecuteCommand(Player* requester, std::string text, Unit* auctioneer);
         bool BidItem(Player* requester, AuctionEntry* auction, uint32 price, Unit* auctioneer, bool isBuyout, std::string reason = "");
 
-        // The bidder account's character GUIDs, loaded ONCE per action by
-        // PrepareAction and reused by every scan, pre-bid revalidation and the
-        // BidItem packet boundary - admission is a pure set membership check,
-        // never a per-auction account lookup.
+        // The bidder account's character GUIDs, loaded by PrepareAction and
+        // reused by every attempt, scan, pre-bid revalidation and BidItem
+        // packet boundary within the refresh window - admission is a pure set
+        // membership check, never a per-auction account lookup.
         living::AuctionBidderSiblings bidderSiblings;
+        time_t siblingsLoadedAt = 0;
+
+        // Bots are packed several to an account and character creation can put
+        // a new one on this account mid-session, so the set is re-read on this
+        // interval. The core only rejects a same-account bid when the owner is
+        // OFFLINE, which makes this set the only thing standing between an
+        // ONLINE sibling and a self-deal - it must not go stale for a whole
+        // session. One query a minute per bidding bot, versus one per attempt.
+        static constexpr time_t siblingsRefreshSeconds = 60;
     };
 }
