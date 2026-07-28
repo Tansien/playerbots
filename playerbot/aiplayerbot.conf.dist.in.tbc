@@ -1180,9 +1180,16 @@ AiPlayerbot.LLMDefaultPromptsFile = llm_character_card.txt
 # AiPlayerbot.TweakValue = 0
 
 # Living Realm (Phase 0). Master switch for the optional persistent-population
-# layer described in docs/design/0001-living-realm.md. Disabled by default:
-# legacy Playerbots behavior is fully preserved and no Living Realm database
-# schema is required.
+# layer described in docs/design/0001-living-realm.md. Disabled by default: no
+# Living Realm database schema is required, and the flag restores the legacy
+# runtime role classification that autonomous behavior and LFG rely on.
+#
+# It gates runtime role classification, not every Phase 0 change. Premade
+# talent-path filtering applies regardless: a requested role is now matched by
+# spec CAPABILITY (a Feral druid path counts as TANK|DPS) instead of by exact
+# equality with the path's one legacy role, and an explicit
+# AiPlayerbot.PremadeSpecRole annotation narrows that further (the TBC feral
+# cat/tank paths ship with one). Setting this to 0 does not restore either.
 AiPlayerbot.LivingRealm.Enabled = 0
 
 # Living Realm population profile. Only "organic" is defined; any other value is
