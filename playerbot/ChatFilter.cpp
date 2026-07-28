@@ -1186,8 +1186,9 @@ public:
 
             std::set<uint32> questIds = ChatHelper::ExtractAllQuestIds(questString);
 
-            if (questIds.empty() && Qualified::isValidNumberString(questString))
-                questIds.insert(stoi(questString));
+            int32 parsedQuestId = 0;
+            if (questIds.empty() && Qualified::parseNumberString(questString, parsedQuestId) && parsedQuestId > 0)
+                questIds.insert(uint32(parsedQuestId));
             else
             {
                 for (auto& questId : questIds)

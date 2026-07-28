@@ -373,10 +373,9 @@ std::list<GuidPosition> ActiveQuestObjectivesValue::Calculate()
 
 bool NeedForQuestValue::Calculate()
 {
-	if (!Qualified::isValidNumberString(getQualifier()))
+	int32 entry = 0;
+	if (!Qualified::parseNumberString(getQualifier(), entry))
 		return false;
-
-	int32 entry = stoi(getQualifier());
 
 	const PlayerTravelInfo& info(bot);
 

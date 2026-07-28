@@ -1009,11 +1009,15 @@ uint32 ChatHelper::parseGender(const std::string& text)
         return GENDER_MALE;
     else if (boost::iequals(text, "female"))
         return GENDER_FEMALE;
-    else if (Qualified::isValidNumberString(text))
+    else
     {
-        uint8 gender = static_cast<uint32>(stoi(text));
-        if (gender == GENDER_MALE || gender == GENDER_FEMALE)
-            return gender;
+        int32 parsed = 0;
+        if (Qualified::parseNumberString(text, parsed) && parsed >= 0 && parsed <= 0xFF)
+        {
+            uint8 gender = uint8(parsed);
+            if (gender == GENDER_MALE || gender == GENDER_FEMALE)
+                return gender;
+        }
     }
 
     return GENDER_NONE;
@@ -1035,11 +1039,15 @@ Team ChatHelper::parseTeam(const std::string& text)
         return ALLIANCE;
     else if (boost::iequals(text, "horde"))
         return HORDE;
-    else if (Qualified::isValidNumberString(text))
+    else
     {
-        uint8 team = static_cast<uint32>(stoi(text));
-        if (team == ALLIANCE || team == HORDE)
-            return (Team)team;
+        int32 parsed = 0;
+        if (Qualified::parseNumberString(text, parsed) && parsed >= 0 && parsed <= 0xFF)
+        {
+            uint8 team = uint8(parsed);
+            if (team == ALLIANCE || team == HORDE)
+                return (Team)team;
+        }
     }
 
     return TEAM_BOTH_ALLOWED;

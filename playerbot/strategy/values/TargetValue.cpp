@@ -230,10 +230,9 @@ GuidPosition ClosestEntryValue::Calculate()
     // Implement the logic to calculate the closest entry target
     WorldPosition botPos(bot);
 
-    if (!Qualified::isValidNumberString(qualifier))
+    int32 entry = 0;
+    if (!Qualified::parseNumberString(qualifier, entry))
         return GuidPosition();
-
-    int32 entry = stoi(qualifier);
 
     if (entry > 0)
     {

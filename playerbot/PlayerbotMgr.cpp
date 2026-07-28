@@ -2103,8 +2103,9 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         std::string key = arg.substr(0, eqPos);
         std::string value = arg.substr(eqPos + 1);
 
-        if (key == "size" && Qualified::isValidNumberString(value))
-            groupSize = stoi(value);
+        int32 parsedSize = 0;
+        if (key == "size" && Qualified::parseNumberString(value, parsedSize))
+            groupSize = parsedSize;
         else
             passThroughParam += key + "=" + value + " ";
     }
