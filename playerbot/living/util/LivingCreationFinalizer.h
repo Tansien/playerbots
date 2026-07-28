@@ -216,16 +216,15 @@ namespace living
             uint32_t const guid = record.guid;
             uint64_t const token = record.token;
             tokenToGuid[token] = guid;
-            Record& stored = records[guid];
-            stored = std::move(record);
+            records[guid] = std::move(record);
             if (!ops.requestVerify || !ops.requestVerify(guid))
             {
                 // Enqueue failure: feed a QueryFailed outcome through the
                 // record's own mailbox so the bounded verify-retry path owns
-                // it (one attempt consumed per pump, then quarantine).
-                stored.hasPendingOutcome = true;
-                stored.pendingOutcome = RowVerifyOutcome::QueryFailed;
-                stored.pendingKind = CreationCallbackKind::Verify;
+                // it (one attempt consumed per pump, then quarantine). Posting
+                // through the shared writer rather than assigning the record
+                // directly keeps admission from skipping a guard added there.
+                StoreRecordOutcome(guid, RowVerifyOutcome::QueryFailed, CreationCallbackKind::Verify);
             }
             return token;
         }
@@ -237,13 +236,7 @@ namespace living
         // already terminal).
         void OnCallbackResult(uint32_t guid, RowVerifyOutcome outcome, CreationCallbackKind kind)
         {
-            auto it = records.find(guid);
-            if (it == records.end())
-                return;
-
-            it->second.hasPendingOutcome = true;
-            it->second.pendingOutcome = outcome;
-            it->second.pendingKind = kind;
+            StoreRecordOutcome(guid, outcome, kind);
         }
 
         // Consumes every stored callback outcome and drives every lifecycle
@@ -367,9 +360,16 @@ namespace living
             uint64_t expiresAtPump = 0;
         };
 
-        // Feeds an outcome into a record's mailbox from PUMP context (retry
-        // request enqueue failures): consumed on the NEXT pump, which paces
-        // the bounded retries one attempt per tick.
+        // The single mailbox writer: every POST of the pending-outcome triple
+        // in this class goes through here - Begin when the first verify cannot
+        // be enqueued, the pump-side enqueue failures, and OnCallbackResult on
+        // the SQL-callback path. (Begin also INSTALLS the record, which assigns
+        // a whole Record and so writes the triple wholesale; every caller hands
+        // it an empty mailbox.) From pump context the stored outcome is
+        // consumed on the NEXT pump, which paces the bounded retries one
+        // attempt per tick. Routing every post through one implementation means
+        // an overwrite guard or generation stamp added here cannot be bypassed
+        // by another caller.
         void StoreRecordOutcome(uint32_t guid, RowVerifyOutcome outcome, CreationCallbackKind kind)
         {
             auto it = records.find(guid);
