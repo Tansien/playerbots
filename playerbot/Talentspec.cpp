@@ -12,6 +12,7 @@ bool TalentSpec::CheckTalentLink(std::string link, std::ostringstream* out) {
     std::string validChar = "-";
     std::string validNums = "012345";
     int nums = 0;
+    int separators = 0;
 
     for (char& c : link) {
         if (validChar.find(c) == std::string::npos && validNums.find(c) == std::string::npos)
@@ -21,6 +22,19 @@ bool TalentSpec::CheckTalentLink(std::string link, std::ostringstream* out) {
         }
         if (validNums.find(c) != std::string::npos)
             nums++;
+        else
+            separators++;
+    }
+
+    // A link addresses three trees, so it holds at most two separators.
+    // ReadTalents consumes at most two before the first digit and at most two
+    // after each digit, so a third leaves the cursor parked on a '-' and the
+    // rank conversion below runs on it. That threw out of the `talents` chat
+    // command, which has no exception boundary.
+    if (separators > 2)
+    {
+        *out << "talent link is invalid. It may hold at most two '-' separators, as in 0-0-0.";
+        return false;
     }
 
     if (nums == 0) {
@@ -258,7 +272,10 @@ void TalentSpec::ReadTalents(std::string link) {
         {
             chr = link.substr(pos, 1);
 
-            if (chr == " " || chr == "#")
+            // Anything that is not a digit ends the link: the two documented
+            // terminators, and defensively a separator the leading/trailing
+            // handling did not consume. stoi would throw on that.
+            if (chr.empty() || chr[0] < '0' || chr[0] > '9')
             {
                 terminated = true;
                 break;
