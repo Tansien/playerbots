@@ -391,19 +391,77 @@ ChangeTalentsAction::TalentSelectionResult ChangeTalentsAction::SelectTalents(Pl
         }
         else
         {
-            specId = PickPremadePath(paths, sRandomPlayerbotMgr.IsRandomBot(bot))->id;
-            TalentSpec newSpec = *GetBestPremadeSpec(bot, specId);
-            specLink = newSpec.GetTalentLink();
-            newSpec.CropTalents(bot);
-            newSpec.ApplyTalents(bot, out);
-            selection.applied = true;
-            if (bot->GetPlayerbotAI())
-                bot->GetPlayerbotAI()->UpdateTalentSpec();
+            // getPremadePaths admits a path on spec CAPABILITY - a Feral druid
+            // path counts as TANK|DPS - while creation verifies the CONCRETE
+            // role of the build that actually got applied. For an ambiguous tab
+            // the first pick can therefore be a cat build answering a tank
+            // request, which used to destroy the half-built character and retry
+            // the whole creation. Walk the remaining candidates instead.
+            //
+            // Re-applying is safe and absolute: a TalentSpec carries the entire
+            // class tree (TalentSpec::GetTalents fills every talent at rank 0),
+            // so ApplyTalents strips every rank the incoming spec does not take
+            // before learning its own. Each attempt fully replaces the last.
+            std::vector<TalentPath*> candidates = paths;
+            std::string appliedSpecText;
+            size_t attempts = 0;
+            bool roleSatisfied = false;
+
+            while (!candidates.empty())
+            {
+                TalentPath* const picked =
+                    PickPremadePath(candidates, sRandomPlayerbotMgr.IsRandomBot(bot));
+
+                specId = picked->id;
+                TalentSpec newSpec = *GetBestPremadeSpec(bot, specId);
+                specLink = newSpec.GetTalentLink();
+                newSpec.CropTalents(bot);
+                newSpec.ApplyTalents(bot, out);
+                appliedSpecText = newSpec.formatSpec(cls);
+                selection.applied = true;
+                if (bot->GetPlayerbotAI())
+                    bot->GetPlayerbotAI()->UpdateTalentSpec();
+                ++attempts;
+
+                if (role == BotRoles::BOT_ROLE_NONE)
+                {
+                    roleSatisfied = true;
+                    break;
+                }
+
+                // Same resolution the caller verifies with, so agreement here
+                // means agreement there.
+                uint8 const appliedRoles = living::ResolveTalentPathRoles(
+                    static_cast<uint8>(AiFactory::GetAppliedSpecRole(bot)), picked->role);
+                if (living::RolesSatisfy(appliedRoles, static_cast<uint8>(role)))
+                {
+                    roleSatisfied = true;
+                    break;
+                }
+
+                // This path cannot produce the requested role. Drop it and try
+                // the next; if none can, the last applied build is kept and the
+                // caller decides, exactly as before.
+                for (auto it = candidates.begin(); it != candidates.end(); ++it)
+                {
+                    if (*it == picked)
+                    {
+                        candidates.erase(it);
+                        break;
+                    }
+                }
+            }
 
             if (paths.size() > 1)
                 *out << "Found " << paths.size() << " possible specs to choose from. ";
 
-            *out << "Apply spec " << "|h|cffffffff" << getPremadePath(cls, specId)->name << " " << newSpec.formatSpec(cls);
+            // On the exhausted path the last attempt failed too, so it counts.
+            size_t const rejected = roleSatisfied ? attempts - 1 : attempts;
+            if (rejected > 0)
+                *out << "Skipped " << rejected << (rejected == 1 ? " spec that" : " specs that")
+                     << " could not produce the requested role. ";
+
+            *out << "Apply spec " << "|h|cffffffff" << getPremadePath(cls, specId)->name << " " << appliedSpecText;
         }
     }
 
