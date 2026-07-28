@@ -3396,15 +3396,8 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
                 // tab is not a role.
                 if (!talents.applied || (static_cast<uint32>(talents.selectedRoles) & options.role) == 0)
                 {
-                    sObjectAccessor.RemoveObject(newBot);
-                    delete newBot;
-                    delete botSession;
-                    sRandomPlayerbotMgr.ForgetEventCache(botGuid);
-                    ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
-                    result.guid = ObjectGuid();
-                    result.status = living::BotCreateStatus::RetryableFailure;
-                    result.messages.push_back("Talent selection did not produce the requested role");
-                    return result;
+                    return tearDownTransient(living::BotCreateStatus::RetryableFailure,
+                        "Talent selection did not produce the requested role");
                 }
             }
 
@@ -3413,15 +3406,8 @@ BotCreationResult PlayerbotHolder::CreateBot(Player* master, CreateBotOptions co
             // persisted, exactly like every other creation event value.
             if (!living::EventValueFitsSchema("specLink", talents.specLink))
             {
-                sObjectAccessor.RemoveObject(newBot);
-                delete newBot;
-                delete botSession;
-                sRandomPlayerbotMgr.ForgetEventCache(botGuid);
-                ai::botCreationFinalizer.core.ReleaseAccountSlot(accountId); // pre-save failure
-                result.guid = ObjectGuid();
-                result.status = living::BotCreateStatus::RetryableFailure;
-                result.messages.push_back("Selected talent link exceeds the metadata schema limit");
-                return result;
+                return tearDownTransient(living::BotCreateStatus::RetryableFailure,
+                    "Selected talent link exceeds the metadata schema limit");
             }
         }
         else
