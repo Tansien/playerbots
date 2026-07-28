@@ -121,3 +121,7 @@ ipch
 
 botpch.pch
 /.vs
+
+# Transient git worktrees created for isolated agent runs. These are full
+# nested checkouts of this repository and must never be committed.
+.claude/worktrees/
