@@ -266,6 +266,21 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
     std::string specLink = sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink");
     uint8 cls = bot->getClass();
 
+    // A persisted specNo can outlive the configuration that produced it: a
+    // trimmed aiplayerbot.conf, a link newly rejected by CheckTalents, or a
+    // reload that renumbers the paths. getPremadePath then returns nullptr,
+    // GetBestPremadeSpec falls back to baseSpec - every class talent at rank
+    // zero - and applying that strips every talent the bot has learned. The
+    // stale specNo is never cleared, so the wipe repeats on every later pass.
+    // The name lookup below would have dereferenced the same nullptr.
+    TalentPath* currentPath = specNo > 0 ? getPremadePath(cls, specId) : nullptr;
+    if (specNo > 0 && (!currentPath || currentPath->talentSpec.empty()))
+    {
+        *out << "Stored spec is no longer configured; selecting a new one. ";
+        specNo = 0;
+        currentPath = nullptr;
+    }
+
     //Continue the current spec
     if (specNo > 0)
     {
@@ -276,7 +291,7 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
             bot->GetPlayerbotAI()->UpdateTalentSpec();
         if (newSpec.GetTalentPoints() > 0)
         {
-            *out << "Upgrading spec " << "|h|cffffffff" << getPremadePath(bot->getClass(), specId)->name << " (" << newSpec.formatSpec(cls) << ")";
+            *out << "Upgrading spec " << "|h|cffffffff" << currentPath->name << " (" << newSpec.formatSpec(cls) << ")";
         }
     }
     else if (!specLink.empty())
