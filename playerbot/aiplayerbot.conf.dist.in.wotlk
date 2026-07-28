@@ -768,10 +768,12 @@ AiPlayerbot.PremadeSpecGlyp.9.7.80 = Life Tap,Felguard,Quick Decay,Haunt|51514,C
 
 # Druid
 AiPlayerbot.PremadeSpecName.11.1 = Feral shred Pvp 
+AiPlayerbot.PremadeSpecRole.11.1 = dps
 AiPlayerbot.PremadeSpecLink.11.1.80 = -55020213232021205312301331051100550101
 AiPlayerbot.PremadeSpecGlyp.11.1.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.2 = Feral 1v1 Pvp
+AiPlayerbot.PremadeSpecRole.11.2 = dps
 AiPlayerbot.PremadeSpecLink.11.2.80 = -53020213032021205312303331351100550001
 AiPlayerbot.PremadeSpecGlyp.11.2.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221,Rebirth
 
@@ -784,10 +786,12 @@ AiPlayerbot.PremadeSpecLink.11.4.80 = 5532000120321--230033312031502221350013200
 AiPlayerbot.PremadeSpecGlyp.11.4.80 = Aquatic Form,Challenging Roar,Claw|1082,Dash,Entangling Roots,Focus,Growl,Hurricane,Mangle|33876,Maul,Moonfire|8921,Rip|1079,Savage Roar|52610,Shred|5221,Starfire|2912,Starfall|48505,Wrath|5176,Berserk|50334,Barkskin|22812,Innervate|29166,Rejuvenation|774,Regrowth|8936,Lifebloom|33763,Wild Growth|48438,Swiftmend|18562,Nourish|50464,Healing Touch|5185,Frenzied Regeneration|22842,Monsoon|42231,Rapid Rejuvenation|53251,the Wild,Thorns,Typhoon|50516,Unburdened Rebirth,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.5 = Feral dps Pve
+AiPlayerbot.PremadeSpecRole.11.5 = dps
 AiPlayerbot.PremadeSpecLink.11.5.80 = -550202132322010053120030312511005503012
 AiPlayerbot.PremadeSpecGlyp.11.5.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.6 = Feral Tank Pve
+AiPlayerbot.PremadeSpecRole.11.6 = tank
 AiPlayerbot.PremadeSpecLink.11.6.80 = -50123213032211035312030331351120350001
 AiPlayerbot.PremadeSpecGlyp.11.6.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221
 
@@ -1181,8 +1185,8 @@ AiPlayerbot.LLMDefaultPromptsFile = llm_character_card.txt
 # talent-path filtering applies regardless: a requested role is now matched by
 # spec CAPABILITY (a Feral druid path counts as TANK|DPS) instead of by exact
 # equality with the path's one legacy role, and an explicit
-# AiPlayerbot.PremadeSpecRole annotation narrows that further (the TBC feral
-# cat/tank paths ship with one). Setting this to 0 does not restore either.
+# AiPlayerbot.PremadeSpecRole annotation narrows that further (most feral druid
+# paths ship with one). Setting this to 0 does not restore either.
 AiPlayerbot.LivingRealm.Enabled = 0
 
 # Living Realm population profile. Only "organic" is defined; any other value is

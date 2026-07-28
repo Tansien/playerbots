@@ -739,6 +739,7 @@ AiPlayerbot.PremadeSpecLink.9.11.60 = 35000231122-001-5052005102005141
 
 # Druid
 AiPlayerbot.PremadeSpecName.11.0 = pve dps feral
+AiPlayerbot.PremadeSpecRole.11.0 = dps
 AiPlayerbot.PremadeSpecLink.11.0.60 = 014005301-5500021323202151-05
 AiPlayerbot.PremadeSpecName.11.1 = pve dps feral (dps/tank hybrid)
 AiPlayerbot.PremadeSpecLink.11.1.60 = 014005001-5050301323222151-05
@@ -754,6 +755,7 @@ AiPlayerbot.PremadeSpecLink.11.5.60 = 0140002-5002321-055103105315011
 AiPlayerbot.PremadeSpecName.11.6 = pvp dps resto
 AiPlayerbot.PremadeSpecLink.11.6.60 = 0140003-5000501-055103105315021
 AiPlayerbot.PremadeSpecName.11.7 = pvp dps feral (heart of the wild / ns)
+AiPlayerbot.PremadeSpecRole.11.7 = dps
 AiPlayerbot.PremadeSpecLink.11.7.60 = 01-500152130320214-05501310231
 AiPlayerbot.PremadeSpecName.11.8 = pvp dps balance (moonfury)
 AiPlayerbot.PremadeSpecLink.11.8.60 = 510050300250135--50502310401
@@ -4871,8 +4873,8 @@ AiPlayerbot.GearProgressionSystem.5.11.3.18 = 5976	# Tabard
 # talent-path filtering applies regardless: a requested role is now matched by
 # spec CAPABILITY (a Feral druid path counts as TANK|DPS) instead of by exact
 # equality with the path's one legacy role, and an explicit
-# AiPlayerbot.PremadeSpecRole annotation narrows that further (the TBC feral
-# cat/tank paths ship with one). Setting this to 0 does not restore either.
+# AiPlayerbot.PremadeSpecRole annotation narrows that further (most feral druid
+# paths ship with one). Setting this to 0 does not restore either.
 AiPlayerbot.LivingRealm.Enabled = 0
 
 # Living Realm population profile. Only "organic" is defined; any other value is

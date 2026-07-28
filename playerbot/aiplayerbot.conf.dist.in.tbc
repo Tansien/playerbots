@@ -801,9 +801,11 @@ AiPlayerbot.PremadeSpecName.11.10 = pvp resto (restokin)
 AiPlayerbot.PremadeSpecProb.11.10 = 44
 AiPlayerbot.PremadeSpecLink.11.10.70 = 514302012033130231--250033500315
 AiPlayerbot.PremadeSpecName.11.11 = pvp feral cat
+AiPlayerbot.PremadeSpecRole.11.11 = dps
 AiPlayerbot.PremadeSpecProb.11.11 = 44
 AiPlayerbot.PremadeSpecLink.11.11.70 = 01-503202132322125331151-05403001
 AiPlayerbot.PremadeSpecName.11.12 = pvp feral (mangler)
+AiPlayerbot.PremadeSpecRole.11.12 = dps
 AiPlayerbot.PremadeSpecProb.11.12 = 44
 AiPlayerbot.PremadeSpecLink.11.12.70 = 01-500232130322125331251-05503001
 
@@ -1188,8 +1190,8 @@ AiPlayerbot.LLMDefaultPromptsFile = llm_character_card.txt
 # talent-path filtering applies regardless: a requested role is now matched by
 # spec CAPABILITY (a Feral druid path counts as TANK|DPS) instead of by exact
 # equality with the path's one legacy role, and an explicit
-# AiPlayerbot.PremadeSpecRole annotation narrows that further (the TBC feral
-# cat/tank paths ship with one). Setting this to 0 does not restore either.
+# AiPlayerbot.PremadeSpecRole annotation narrows that further (most feral druid
+# paths ship with one). Setting this to 0 does not restore either.
 AiPlayerbot.LivingRealm.Enabled = 0
 
 # Living Realm population profile. Only "organic" is defined; any other value is
