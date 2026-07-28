@@ -1,6 +1,24 @@
 name: Ubuntu Build
 
-on: [push]
+# This workflow is the only thing that compiles the module (-DBUILD_PLAYERBOTS=ON),
+# so it must run on pull requests too. Without the pull_request trigger a PR that
+# does not compile against any core still shows a green check.
+#
+# Safe on fork PRs because every job runs on GitHub-hosted ephemeral runners: a
+# fork PR gets a fresh throwaway VM, a read-only token and no repository secrets,
+# so the worst a malicious PR can do is waste its own build minutes. Do not move
+# these jobs to persistent self-hosted runners while pull_request is a trigger --
+# a pull_request run executes the PR's own copy of this workflow, which a fork can
+# edit.
+on:
+  push:
+  pull_request:
+
+# Same-repo pull requests fire both triggers on the same commit. Grouping by ref
+# keeps that from paying for two identical three-core builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
@@ -78,7 +96,11 @@ jobs:
       contents: none
     needs: # make sure the notification is sent AFTER the jobs you want included have completed
       - build
-    if: failure()
+    # push only: secrets.DISCORD_WEBHOOK is not exposed to fork pull requests, and
+    # github.event.pusher / head_commit are push-event fields that are empty on a
+    # pull_request run -- so on a failing fork PR this job would post nothing and
+    # just add a second, confusing red check.
+    if: failure() && github.event_name == 'push'
 
     steps:
       - name: Setup Environmental Variables
