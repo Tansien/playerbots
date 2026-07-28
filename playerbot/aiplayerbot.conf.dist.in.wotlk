@@ -659,7 +659,7 @@ AiPlayerbot.PremadeSpecGlyp.5.6.80 = Power Word: Shield|17,Circle of Healing|348
 
 # Death Knight
 AiPlayerbot.PremadeSpecName.6.1 = Blood Pvp 
-AiPlayerbot.PremadeSpecLink.6.1.80 = 20450215333033132002231313513232
+AiPlayerbot.PremadeSpecLink.6.1.80 = 2045021533303313200223131351-3232
 AiPlayerbot.PremadeSpecGlyp.6.1.80 = Anti-Magic Shell,Chains of Ice,Howling Blast|49184,Hungering Cold|49203,Scourge Strike|55090,Unholy Blight|49194,Unbreakable Armor|51271,Frost Strike,Icy Touch,Obliterate,Plague Strike,Blood Strike,Death Grip,the Ghoul,Strangulate,Death and Decay,Pestilence,Raise Dead,Death's Embrace,Horn of Winter,Rune Strike,Bone Shield,Dancing Rune Weapon|49028,Dark Command,Disease,Vampiric Blood|55233,Death Strike,Heart Strike,Icebound Fortitude|49206,Blood Tap,Rune Tap,Dark Death,Corpse Explosion
 
 AiPlayerbot.PremadeSpecName.6.2 = Unholy Pvp 
@@ -671,7 +671,7 @@ AiPlayerbot.PremadeSpecLink.6.3.80 = 0325101303-32025351052203012001033101341
 AiPlayerbot.PremadeSpecGlyp.6.3.80 = Anti-Magic Shell,Chains of Ice,Hungering Cold|49203,Scourge Strike|55090,Unholy Blight|49194,Vampiric Blood|55233,Bone Shield,Blood Strike,Death Grip,Dark Command,the Ghoul,Strangulate,Death and Decay,Pestilence,Raise Dead,Death's Embrace,Horn of Winter,Rune Strike,Death Strike,Obliterate,Plague Strike,Frost Strike,Icy Touch,Howling Blast|49184,Unbreakable Armor|51271,Dancing Rune Weapon|49028,Icebound Fortitude|49206,Blood Tap,Rune Tap,Heart Strike,Dark Death,Corpse Explosion
 
 AiPlayerbot.PremadeSpecName.6.4 = Blood Pve
-AiPlayerbot.PremadeSpecLink.6.4.80 = 0355220530003313221020131351305-0052
+AiPlayerbot.PremadeSpecLink.6.4.80 = 0355220530003313221020131351-305-0052
 AiPlayerbot.PremadeSpecGlyp.6.4.80 = Anti-Magic Shell,Chains of Ice,Howling Blast|49184,Hungering Cold|49203,Scourge Strike|55090,Unholy Blight|49194,Unbreakable Armor|51271,Frost Strike,Icy Touch,Obliterate,Plague Strike,Blood Strike,Death Grip,the Ghoul,Strangulate,Death and Decay,Pestilence,Raise Dead,Death's Embrace,Horn of Winter,Rune Strike,Bone Shield,Dancing Rune Weapon|49028,Dark Command,Disease,Vampiric Blood|55233,Death Strike,Heart Strike,Icebound Fortitude|49206,Blood Tap,Rune Tap,Dark Death,Corpse Explosion
 
 AiPlayerbot.PremadeSpecName.6.5 = Unholy Pve
@@ -679,7 +679,7 @@ AiPlayerbot.PremadeSpecLink.6.5.80 = 23050202--2302003350032152003150003133151
 AiPlayerbot.PremadeSpecGlyp.6.5.80 = Anti-Magic Shell,Chains of Ice,Unbreakable Armor|51271,Frost Strike,Icy Touch,Obliterate,Plague Strike,Blood Strike,Death Grip,Dark Command,Strangulate,Death and Decay,Pestilence,Raise Dead,Death's Embrace,Horn of Winter,Rune Strike,Bone Shield,Dancing Rune Weapon|49028,Howling Blast|49184,Hungering Cold|49203,Vampiric Blood|55233,Death Strike,Scourge Strike|55090,Unholy Blight|49194,the Ghoul,Dark Death,Corpse Explosion,Icebound Fortitude|49206,Blood Tap,Rune Tap,Heart Strike
 
 AiPlayerbot.PremadeSpecName.6.6 = Frost Pve
-AiPlayerbot.PremadeSpecLink.6.6.80 = 03-32002350352203012300033101351230200305
+AiPlayerbot.PremadeSpecLink.6.6.80 = 03-32002350352203012300033101351-230200305
 AiPlayerbot.PremadeSpecGlyp.6.6.80 = Anti-Magic Shell,Chains of Ice,Hungering Cold|49203,Scourge Strike|55090,Unholy Blight|49194,Vampiric Blood|55233,Bone Shield,Blood Strike,Death Grip,Dark Command,the Ghoul,Strangulate,Death and Decay,Pestilence,Raise Dead,Death's Embrace,Horn of Winter,Rune Strike,Death Strike,Obliterate,Plague Strike,Frost Strike,Icy Touch,Howling Blast|49184,Unbreakable Armor|51271,Dancing Rune Weapon|49028,Icebound Fortitude|49206,Blood Tap,Rune Tap,Heart Strike,Dark Death,Corpse Explosion
 
 
@@ -767,11 +767,11 @@ AiPlayerbot.PremadeSpecGlyp.9.7.80 = Life Tap,Felguard,Quick Decay,Haunt|51514,C
 
 # Druid
 AiPlayerbot.PremadeSpecName.11.1 = Feral shred Pvp 
-AiPlayerbot.PremadeSpecLink.11.1.80 = -55020213232021205312301331051100550101
+AiPlayerbot.PremadeSpecLink.11.1.80 = -550202132320212053123013310511-00550101
 AiPlayerbot.PremadeSpecGlyp.11.1.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.2 = Feral 1v1 Pvp
-AiPlayerbot.PremadeSpecLink.11.2.80 = -53020213032021205312303331351100550001
+AiPlayerbot.PremadeSpecLink.11.2.80 = -530202130320212053123033313511-00550001
 AiPlayerbot.PremadeSpecGlyp.11.2.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.3 = Balance Pvp
@@ -783,11 +783,11 @@ AiPlayerbot.PremadeSpecLink.11.4.80 = 5532000120321--230033312031502221350013200
 AiPlayerbot.PremadeSpecGlyp.11.4.80 = Aquatic Form,Challenging Roar,Claw|1082,Dash,Entangling Roots,Focus,Growl,Hurricane,Mangle|33876,Maul,Moonfire|8921,Rip|1079,Savage Roar|52610,Shred|5221,Starfire|2912,Starfall|48505,Wrath|5176,Berserk|50334,Barkskin|22812,Innervate|29166,Rejuvenation|774,Regrowth|8936,Lifebloom|33763,Wild Growth|48438,Swiftmend|18562,Nourish|50464,Healing Touch|5185,Frenzied Regeneration|22842,Monsoon|42231,Rapid Rejuvenation|53251,the Wild,Thorns,Typhoon|50516,Unburdened Rebirth,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.5 = Feral dps Pve
-AiPlayerbot.PremadeSpecLink.11.5.80 = -550202132322010053120030312511005503012
+AiPlayerbot.PremadeSpecLink.11.5.80 = -550202132322010053120030312511-005503012
 AiPlayerbot.PremadeSpecGlyp.11.5.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221,Rebirth
 
 AiPlayerbot.PremadeSpecName.11.6 = Feral Tank Pve
-AiPlayerbot.PremadeSpecLink.11.6.80 = -50123213032211035312030331351120350001
+AiPlayerbot.PremadeSpecLink.11.6.80 = -501232130322110353120303313511-20350001
 AiPlayerbot.PremadeSpecGlyp.11.6.80 = Aquatic Form,Challenging Roar,Hurricane,Healing Touch,Lifebloom,Monsoon,Nourish,Regrowth,Rejuvenation,Wild Growth,Barkskin,Entangling Roots,Focus,Innervate|29166,Starfire|2912,Starfall|48505,Wrath|5176,Claw|1082,Rip|1079,Maul|6807,Mangle|33876,Berserk|50334,Savage Roar|52610,Shred|5221
 
 AiPlayerbot.PremadeSpecName.11.7 = Balance Pve
