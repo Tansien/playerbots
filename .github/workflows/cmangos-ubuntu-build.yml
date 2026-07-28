@@ -11,11 +11,15 @@ name: Ubuntu Build
 # a pull_request run executes the PR's own copy of this workflow, which a fork can
 # edit.
 on:
+  # push is limited to master so a branch that has an open PR is not built twice
+  # (a same-repo PR would otherwise fire push and pull_request on the same commit,
+  # and the two events do not share a concurrency group key). Feature branches are
+  # covered by their pull request; master is covered on merge.
   push:
+    branches:
+      - master
   pull_request:
 
-# Same-repo pull requests fire both triggers on the same commit. Grouping by ref
-# keeps that from paying for two identical three-core builds.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
@@ -29,7 +33,10 @@ env:
   BOOST_PLATFORM_VERSION: "22.04"
   COMPILER_CC: clang
   COMPILER_PP: clang++
-  CORE_REPO_OWNER: ${{github.repository_owner}}
+  # The core lives upstream. This was ${{github.repository_owner}}, which on any
+  # fork resolves to the fork owner and checks out a repository that does not
+  # exist -- so every build job failed at checkout with "Repository not found".
+  CORE_REPO_OWNER: cmangos
 
 jobs:
   build:
@@ -45,17 +52,24 @@ jobs:
             EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
 
     steps:
-      - name: Checkout
+      - name: Checkout CMaNGOS ${{matrix.version}} core
         uses: actions/checkout@v4
         with:
-          repository: ${{github.repository_owner}}/mangos-${{matrix.version}}
+          repository: ${{env.CORE_REPO_OWNER}}/mangos-${{matrix.version}}
           ref: master
-          path: ${{env.REPO_DIR}}
+          path: core
+
+      - name: Checkout playerbots
+        # Must live inside the core tree (the core adds it via add_subdirectory),
+        # and must be checked out AFTER the core so the core checkout cannot wipe
+        # it. Without this the job builds whatever FetchContent pulls from
+        # upstream -- i.e. not the code under review.
+        uses: actions/checkout@v4
+        with:
+          path: core/src/modules/PlayerBots
 
       - name: Create Build Environment
         run: |
-          echo "GITHUB_SHORT_REV=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "ARCHIVE_FILENAME=${{ github.event.repository.name }}-$(git rev-parse --short HEAD).zip" >> $GITHUB_ENV
           echo "CC=${{env.COMPILER_CC}}" >> $GITHUB_ENV
           echo "CXX=${{env.COMPILER_PP}}" >> $GITHUB_ENV
           cmake -E make_directory ${{ env.BUILD_DIR }}
@@ -80,7 +94,17 @@ jobs:
       - name: Configure
         env:
           BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
-        run: cmake -DBoost_ARCHITECTURE=-x64 -DCMAKE_INSTALL_PREFIX=/home/runner/work ${{matrix.EXTRA_BUILD}} -B ${{env.BUILD_DIR}} -S ${{env.REPO_DIR}}
+        # FETCHCONTENT_SOURCE_DIR_PLAYERBOTS pins the module to the checkout above;
+        # without it FetchContent replaces it with upstream master and the build
+        # silently tests the wrong code.
+        run: >
+          cmake
+          -DBoost_ARCHITECTURE=-x64
+          -DCMAKE_INSTALL_PREFIX=/home/runner/work
+          ${{matrix.EXTRA_BUILD}}
+          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
+          -B ${{env.BUILD_DIR}}
+          -S ${{env.REPO_DIR}}/core
 
       - name: Build
         env:
@@ -88,37 +112,3 @@ jobs:
         run: |
             cmake --build ${{env.BUILD_DIR}} --config ${{env.BUILD_TYPE}}
             cmake --install ${{env.BUILD_DIR}}
-
-  notify:
-    name: Send Notification to Discord on Failure
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: none
-    needs: # make sure the notification is sent AFTER the jobs you want included have completed
-      - build
-    # push only: secrets.DISCORD_WEBHOOK is not exposed to fork pull requests, and
-    # github.event.pusher / head_commit are push-event fields that are empty on a
-    # pull_request run -- so on a failing fork PR this job would post nothing and
-    # just add a second, confusing red check.
-    if: failure() && github.event_name == 'push'
-
-    steps:
-      - name: Setup Environmental Variables
-        run: |
-          echo "GIT_BRANCH=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-          echo "GIT_SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-8`" >> $GITHUB_ENV
-
-      - name: Notify
-        uses: rjstone/discord-webhook-notify@v1.1.1
-        with:
-          severity: error
-          description: |
-            **Linux Build Failed**
-          details: |
-            - **Branch:** ${{env.GIT_BRANCH}}
-            - **Pusher:** ${{github.event.pusher.name}}
-            - **Author:** ${{github.event.head_commit.author.name}}
-            - **Commit:** [${{github.repository}}/${{env.GIT_SHORT_SHA}}](${{github.server_url}}/${{ github.repository }}/commit/${{github.sha}})
-            - **Build Log:** [actions/runs/${{github.run_id}}](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}})
-          footer: CMaNGOS Developers Notified!
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
