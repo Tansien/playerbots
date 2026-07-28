@@ -1063,11 +1063,17 @@ uint32 ChatHelper::parseClass(const std::string& text)
         if (NormalizeChatToken(className) == normalized)
             return classId;
 
-    if (Qualified::isValidNumberString(normalized))
+    // Range check before the lookup. 'classes' is keyed by uint8, so
+    // classes.count(id) narrowed a uint32 id down to a byte: "257" matched
+    // class 1 and passed validation, while the un-narrowed 257 was returned.
+    // Callers store that in a uint8 and silently got a warrior instead of an
+    // "invalid class" rejection.
+    int32 id = 0;
+    if (Qualified::parseNumberString(normalized, id) && id >= 0 && id <= 0xFF)
     {
-        uint32 id = static_cast<uint32>(stoi(normalized));
-        if (classes.count(id))
-            return id;
+        const uint8 classId = static_cast<uint8>(id);
+        if (classes.count(classId))
+            return classId;
     }
 
     return 0;
@@ -1086,11 +1092,15 @@ uint32 ChatHelper::parseRace(const std::string& text)
         if (NormalizeChatToken(raceName) == normalized)
             return raceId;
 
-    if (Qualified::isValidNumberString(normalized))
+    // Same narrowing bug as parseClass: 'races' is keyed by uint8, so an id
+    // above 255 wrapped into a valid race for the lookup and was then returned
+    // unwrapped.
+    int32 id = 0;
+    if (Qualified::parseNumberString(normalized, id) && id >= 0 && id <= 0xFF)
     {
-        uint32 id = static_cast<uint32>(stoi(normalized));
-        if (races.count(id))
-            return id;
+        const uint8 raceId = static_cast<uint8>(id);
+        if (races.count(raceId))
+            return raceId;
     }
 
     return 0;
