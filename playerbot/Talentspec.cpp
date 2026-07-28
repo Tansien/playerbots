@@ -238,6 +238,9 @@ void TalentSpec::ReadTalents(std::string link) {
     int pos = 0;
     int tab = 0;
     std::string chr;
+    bool terminated = false;
+
+    unreadLinkChars = 0;
 
     if (link.substr(pos, 1) == "-") {
         pos++;
@@ -256,7 +259,10 @@ void TalentSpec::ReadTalents(std::string link) {
             chr = link.substr(pos, 1);
 
             if (chr == " " || chr == "#")
+            {
+                terminated = true;
                 break;
+            }
 
             entry.rank = stoi(chr);
             points += entry.rank;
@@ -278,6 +284,15 @@ void TalentSpec::ReadTalents(std::string link) {
         if (pos > link.size() - 1)
             break;
     };
+
+    // If the parser stopped while there is still link left, the tree it was
+    // reading ran out of talents before the segment ran out of digits. Because
+    // the tab only advances on a '-', everything from here on - the surplus
+    // digits and every following tree - is dropped. Record the amount so the
+    // caller can report the malformed link instead of silently handing out an
+    // under-specced build.
+    if (!terminated && pos < (int)link.size())
+        unreadLinkChars = uint32(link.size() - pos);
 }
 
 //Returns only a specific tree from a talent list.

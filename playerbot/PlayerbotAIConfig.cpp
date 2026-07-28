@@ -1168,6 +1168,20 @@ void PlayerbotAIConfig::LoadTalentSpecs()
 
                         TalentSpec linkSpec(&classSpecs[cls].baseSpec, specLink);
 
+                        // A talent link only moves on to the next tree at a '-'
+                        // separator. If a segment is longer than the tree it
+                        // describes, the surplus digits - the points meant for
+                        // the following trees - are dropped and the bot ends up
+                        // with fewer talents than it has points for. Report it
+                        // rather than let it pass unnoticed.
+                        if (linkSpec.unreadLinkChars > 0)
+                        {
+                            sLog.outErrorDb("Premade spec link for class %u spec %u (\"%s\") level %u is malformed, probably a missing '-' tree separator: %s",
+                                cls, spec, specName.c_str(), level, specLink.c_str());
+                            sLog.outErrorDb("The last %u character(s) lie outside the talent tree being read and were discarded; only %u of %u talent points are applied.",
+                                linkSpec.unreadLinkChars, linkSpec.points, TalentSpec::LeveltoPoints(level));
+                        }
+
                         if (!linkSpec.CheckTalents(TalentSpec::LeveltoPoints(level), &out))
                         {
                             sLog.outErrorDb("Error with premade spec: %s", specLink.c_str());
