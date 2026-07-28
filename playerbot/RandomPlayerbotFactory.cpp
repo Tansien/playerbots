@@ -303,6 +303,14 @@ uint8 RandomPlayerbotFactory::GetRandomRace(uint8 cls, Team team)
     return 0;
 }
 
+void RandomPlayerbotFactory::ReturnFreeName(NameRaceAndGender raceAndGender, std::string const& name)
+{
+    if (name.empty())
+        return;
+
+    freeNames[raceAndGender].push_back(name);
+}
+
 bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 {
     std::lock_guard<std::mutex> lock(nameMutex);
@@ -425,6 +433,7 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     if (!player || !session)
     {
         sLog.outError("BOTS: Unable to create session or player for random acc %d - name: \"%s\"; race: %u; class: %u", accountId, name.c_str(), race, cls);
+        ReturnFreeName(raceAndGender, name);
         return false;
     }
     if (!player->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender,
@@ -444,6 +453,7 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         // becomes load-bearing in both directions.
         delete player;
         delete session;
+        ReturnFreeName(raceAndGender, name);
         sLog.outError("Unable to create random bot for account %d - name: \"%s\"; race: %u; class: %u",
                 accountId, name.c_str(), race, cls);
         return false;
@@ -456,6 +466,7 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         // destructor may reach through m_session - same ordering rule as above.
         delete player;
         delete session;
+        ReturnFreeName(raceAndGender, name);
         sLog.outError("Unable to create random bot for account %d - allocated guid %u has pending lifecycle ownership or residue",
             accountId, botGuid);
         return false;

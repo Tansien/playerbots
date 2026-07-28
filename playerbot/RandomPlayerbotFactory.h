@@ -88,6 +88,14 @@ class RandomPlayerbotFactory
         static void EnsureNamesInitialized();
     private:
         static std::string CreateRandomArenaTeamName();
+
+        // Returns a name drawn from freeNames to the pool. A name is free
+        // exactly when no `characters` row holds it (the pool is rebuilt from
+        // ai_playerbot_names LEFT JOIN characters), so every creation failure
+        // that gives up BEFORE the character is persisted must put its name
+        // back or the pool drains for the lifetime of the process.
+        // Callers must already hold nameMutex.
+        static void ReturnFreeName(NameRaceAndGender raceAndGender, std::string const& name);
         static std::unordered_map<NameRaceAndGender, std::vector<std::string>> freeNames;
         static std::unordered_map<NameRaceAndGender, std::vector<std::string>> allNames;
         static std::mutex nameMutex;
