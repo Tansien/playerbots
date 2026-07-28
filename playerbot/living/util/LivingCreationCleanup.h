@@ -80,79 +80,93 @@ namespace living
 
         void Pump(CreationCleanupOps const& ops)
         {
-            for (auto it = singles.begin(); it != singles.end();)
+            // `singles` and `batches` are vectors, and every ops callback below
+            // can re-enter AdoptSingle/AdoptBatch (deleteCharacter reaches bot
+            // teardown, which abandons whatever creation work that bot owned).
+            // A push_back there reallocates and would dangle a held iterator,
+            // so both loops index instead and re-subscript after every call.
+            // `guids` is a std::set, whose iterators survive insertion, so it
+            // keeps its iterator loop.
+            for (size_t i = 0; i < singles.size();)
             {
-                if (it->token)
+                if (singles[i].token)
                 {
                     CreationPollResult const poll = ops.pollSingle
-                        ? ops.pollSingle(it->token, false) : CreationPollResult{};
+                        ? ops.pollSingle(singles[i].token, false) : CreationPollResult{};
                     if (poll.status == CreationPollStatus::Pending)
                     {
-                        ++it; // still being created: keep owning it
+                        ++i; // still being created: keep owning it
                         continue;
                     }
 
                     if (poll.status != CreationPollStatus::Created || !poll.guid)
                     {
                         if (ops.pollSingle)
-                            ops.pollSingle(it->token, true);
-                        it = singles.erase(it);
+                            ops.pollSingle(singles[i].token, true);
+                        singles.erase(singles.begin() + static_cast<std::ptrdiff_t>(i));
                         continue;
                     }
 
                     // Transfer terminal ownership out of the expiring poll
                     // surface before retrying the durable deletion boundary.
-                    it->guid = poll.guid;
+                    singles[i].guid = poll.guid;
                     if (ops.pollSingle)
-                        ops.pollSingle(it->token, true);
-                    it->token = 0;
+                        ops.pollSingle(singles[i].token, true);
+                    singles[i].token = 0;
                 }
 
-                if (!ops.deleteCharacter || !ops.deleteCharacter(it->guid))
+                if (!ops.deleteCharacter || !ops.deleteCharacter(singles[i].guid))
                 {
-                    ++it;
+                    ++i;
                     continue;
                 }
 
-                it = singles.erase(it);
+                singles.erase(singles.begin() + static_cast<std::ptrdiff_t>(i));
             }
 
-            for (auto it = batches.begin(); it != batches.end();)
+            for (size_t i = 0; i < batches.size();)
             {
-                if (it->token)
+                if (batches[i].token)
                 {
                     BatchPollResult const poll = ops.pollBatch
-                        ? ops.pollBatch(it->token, false) : BatchPollResult{};
+                        ? ops.pollBatch(batches[i].token, false) : BatchPollResult{};
                     if (poll.status == BatchPollStatus::Pending)
                     {
-                        ++it; // a live batch may still finalize/act on members: never touch its GUIDs
+                        ++i; // a live batch may still finalize/act on members: never touch its GUIDs
                         continue;
                     }
 
                     if (poll.status != BatchPollStatus::Complete)
                     {
-                        it = batches.erase(it);
+                        batches.erase(batches.begin() + static_cast<std::ptrdiff_t>(i));
                         continue;
                     }
 
-                    it->pendingGuids.insert(poll.finalizedGuids.begin(), poll.finalizedGuids.end());
+                    batches[i].pendingGuids.insert(poll.finalizedGuids.begin(), poll.finalizedGuids.end());
                     if (ops.pollBatch)
-                        ops.pollBatch(it->token, true);
-                    it->token = 0;
+                        ops.pollBatch(batches[i].token, true);
+                    batches[i].token = 0;
                 }
 
-                for (auto guid = it->pendingGuids.begin(); guid != it->pendingGuids.end();)
+                // Snapshot the guids and erase by value. The set's own
+                // iterators would actually survive a reallocation of `batches`
+                // (moving a std::set transfers its nodes, LWG 2321) - what
+                // dangled before was the enclosing VECTOR iterator in
+                // `it->pendingGuids`. Re-subscripting batches[i] is what fixes
+                // that; the snapshot additionally keeps this loop from
+                // depending on the node-transfer guarantee at all.
+                std::vector<uint32_t> const pending(batches[i].pendingGuids.begin(),
+                    batches[i].pendingGuids.end());
+                for (uint32_t guid : pending)
                 {
-                    if (ops.deleteCharacter && ops.deleteCharacter(*guid))
-                        guid = it->pendingGuids.erase(guid);
-                    else
-                        ++guid;
+                    if (ops.deleteCharacter && ops.deleteCharacter(guid))
+                        batches[i].pendingGuids.erase(guid);
                 }
 
-                if (it->pendingGuids.empty())
-                    it = batches.erase(it);
+                if (batches[i].pendingGuids.empty())
+                    batches.erase(batches.begin() + static_cast<std::ptrdiff_t>(i));
                 else
-                    ++it;
+                    ++i;
             }
 
             for (auto it = guids.begin(); it != guids.end();)

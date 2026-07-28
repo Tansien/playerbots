@@ -747,3 +747,63 @@ LIVING_TEST(abandoned_cleanup_copies_terminal_guids_until_deletion_ownership_sec
     LIVING_CHECK(cleanup.PendingBatches() == 0);
     LIVING_CHECK(registry.Poll(batchToken, false).status == BatchPollStatus::Unknown); // acknowledged now
 }
+
+LIVING_TEST(cleanup_pump_survives_adoption_from_inside_delete_callback)
+{
+    // deleteCharacter re-enters the owner. In production that is not exotic:
+    // it runs DeleteBot -> LogoutPlayerBot -> ~PlayerbotAI -> ~TestAction ->
+    // TestContext::Reset, which hands whatever creation work that bot owned
+    // back to this same owner via Adopt*. Those adoptions push_back onto the
+    // very vectors Pump is walking, so a held iterator is reallocated out from
+    // under the loop. Pump must index instead, visit every adopted token
+    // exactly once, and drain.
+    AbandonedCreationCleanup cleanup;
+    std::vector<uint32_t> deleted;
+    std::vector<uint64_t> polled;
+
+    // Enough entries that the vector is forced to grow mid-walk.
+    for (uint32_t guid = 801; guid <= 806; ++guid)
+        cleanup.AdoptGuid(guid);
+
+    uint64_t nextToken = 9000;
+    int adoptionsLeft = 6;
+
+    CreationCleanupOps ops;
+    ops.pollSingle = [&](uint64_t token, bool acknowledge) -> CreationPollResult
+    {
+        if (!acknowledge) // Pump peeks, then acks the same token
+            polled.push_back(token);
+        CreationPollResult result;
+        result.status = CreationPollStatus::Created;
+        result.guid = static_cast<uint32_t>(token); // delete it, then release
+        return result;
+    };
+    ops.deleteCharacter = [&](uint32_t guid)
+    {
+        deleted.push_back(guid);
+        if (adoptionsLeft > 0)
+        {
+            --adoptionsLeft;
+            cleanup.AdoptSingle(nextToken++); // reentrant push_back
+        }
+        return true;
+    };
+
+    cleanup.AdoptSingle(nextToken++);
+    cleanup.Pump(ops);
+
+    // Every token adopted, including those adopted DURING the pump, was polled
+    // exactly once and its character deleted exactly once.
+    LIVING_CHECK(polled.size() == 7);
+    std::set<uint64_t> const distinctPolled(polled.begin(), polled.end());
+    LIVING_CHECK(distinctPolled.size() == polled.size());
+
+    std::set<uint32_t> const distinctDeleted(deleted.begin(), deleted.end());
+    LIVING_CHECK(distinctDeleted.size() == deleted.size());
+
+    // Nothing is left owned: the six standalone guids plus all seven singles.
+    LIVING_CHECK(deleted.size() == 13);
+    LIVING_CHECK(cleanup.PendingSingles() == 0);
+    LIVING_CHECK(cleanup.PendingGuids() == 0);
+    LIVING_CHECK(cleanup.Empty());
+}
