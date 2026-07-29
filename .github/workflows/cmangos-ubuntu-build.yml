@@ -31,7 +31,12 @@ concurrency:
   # Keyed on the PR number, not github.head_ref: two PRs from different forks
   # that share a branch name (patch-1, master, dev) would otherwise collide and
   # cancel each other, producing a red check unrelated to the PR's own code.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # PR runs share a group (per PR number) so a new push supersedes the old run.
+  # Everything else falls back to github.run_id, which is unique per run, so each
+  # master push gets its own group: grouping them on github.ref would let a third
+  # push evict the queued second one even with cancel-in-progress false, leaving
+  # an intermediate merge commit permanently unvalidated.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   # Only collapse redundant PR runs. Cancelling a push build would leave a merge
   # commit on master permanently unvalidated when two PRs merge back to back.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
