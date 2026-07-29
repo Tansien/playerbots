@@ -71,7 +71,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Boost
-        uses: MarkusJx/install-boost@51b5604fed63e1e8f76d4b564002e9e7cdcce63a # v2.4.5
+        uses: MarkusJx/install-boost@8ba8b2fac59ef3d91a838bb4aa53ceabd33d1aa3 # v2.5.1
         id: install-boost
         with:
           boost_version: ${{ env.BOOST_VERSION }}
@@ -125,7 +125,7 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
-        run: brew install boost openssl mysql-client
+        run: brew install boost openssl@3 mysql-client icu4c
 
       - name: Verify the module under test is this checkout
         run: |
@@ -141,7 +141,10 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           -DBUILD_PLAYERBOTS=ON
           -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
-          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+          -DICU_ROOT="$(brew --prefix icu4c)"
+          -DMYSQL_INCLUDE_DIR="$(brew --prefix mysql-client)/include/mysql"
+          -DMYSQL_LIBRARY="$(brew --prefix mysql-client)/lib/libmysqlclient.dylib"
           -B build
           -S core
 
