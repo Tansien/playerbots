@@ -1,0 +1,149 @@
+name: Cross-platform Build
+
+# Compiler-diversity coverage for the module, on GitHub-hosted runners.
+#
+# Why this is a separate file from cmangos-ubuntu-build.yml:
+# - That workflow runs on this repository's PERSISTENT self-hosted pool, so it is
+#   gated to same-repository pull requests: a pull_request run executes the PR's
+#   own copy of the workflow, which a fork can edit. Fork PRs are skipped there.
+# - These jobs run on GitHub-hosted EPHEMERAL runners, where that risk does not
+#   exist: a fork PR gets a throwaway VM, a read-only token and no secrets. So
+#   they need no same-repo guard and DO give fork pull requests real compile
+#   coverage.
+# - Standard GitHub-hosted runners are free for public repositories on every OS,
+#   so this costs nothing. (Larger runners are always billed - do not switch to
+#   them without deciding to pay.)
+#
+# Scope: ONE core (classic) per platform, deliberately. The module source is
+# identical across classic/tbc/wotlk; what differs here is the COMPILER, so a
+# second and third core would triple the runtime for almost no extra signal.
+# The three-core matrix stays on the Linux workflow.
+#
+# What each platform is actually for:
+# - windows: MSVC is a genuinely different frontend and catches a class Linux
+#   never sees - two-phase name lookup, narrowing conversions, missing includes,
+#   min/max macros leaking from windows.h.
+# - macos: AppleClang + libc++ (vs Clang + libstdc++ on Linux), which is also the
+#   configuration the module is developed and locally built against.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BUILD_TYPE: Release
+  # Keep in sync with the classic pin in cmangos-ubuntu-build.yml. Pinned for the
+  # same reason: tracking cmangos master breaks CI on upstream API changes with no
+  # commit of ours involved.
+  CORE_REF_CLASSIC: de8f72993b9e1faa1bf92dd5505f3daec5cea3ce
+  BOOST_VERSION: "1.83.0"
+
+jobs:
+  windows:
+    name: Build classic (windows / msvc)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout CMaNGOS classic core
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          repository: cmangos/mangos-classic
+          ref: ${{ env.CORE_REF_CLASSIC }}
+          path: core
+          persist-credentials: false
+
+      - name: Checkout playerbots
+        # Must live inside the core tree (the core adds it via add_subdirectory),
+        # and after the core so the core checkout cannot wipe it.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          path: core/src/modules/PlayerBots
+          persist-credentials: false
+
+      - name: Install Boost
+        uses: MarkusJx/install-boost@51b5604fed63e1e8f76d4b564002e9e7cdcce63a # v2.4.5
+        id: install-boost
+        with:
+          boost_version: ${{ env.BOOST_VERSION }}
+          platform_version: "2022"
+          toolset: msvc
+
+      - name: Verify the module under test is this checkout
+        shell: bash
+        run: |
+          expected="${{ github.sha }}"
+          actual="$(git -C core/src/modules/PlayerBots rev-parse HEAD)"
+          echo "expected $expected"
+          echo "actual   $actual"
+          [ "$actual" = "$expected" ] || { echo "::error::Module tree is not the commit under test."; exit 1; }
+
+      - name: Configure
+        env:
+          BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
+        # FETCHCONTENT_SOURCE_DIR_PLAYERBOTS pins the module to the checkout above;
+        # without it FetchContent repoints the tree at upstream master and the job
+        # goes green having compiled the wrong code.
+        shell: bash
+        run: >
+          cmake
+          -DBUILD_PLAYERBOTS=ON
+          -DBoost_NO_BOOST_CMAKE=ON
+          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
+          -B build
+          -S core
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+  macos:
+    name: Build classic (macos / appleclang)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout CMaNGOS classic core
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          repository: cmangos/mangos-classic
+          ref: ${{ env.CORE_REF_CLASSIC }}
+          path: core
+          persist-credentials: false
+
+      - name: Checkout playerbots
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          path: core/src/modules/PlayerBots
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: brew install boost openssl mysql-client
+
+      - name: Verify the module under test is this checkout
+        run: |
+          expected="${{ github.sha }}"
+          actual="$(git -C core/src/modules/PlayerBots rev-parse HEAD)"
+          echo "expected $expected"
+          echo "actual   $actual"
+          [ "$actual" = "$expected" ] || { echo "::error::Module tree is not the commit under test."; exit 1; }
+
+      - name: Configure
+        run: >
+          cmake
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DBUILD_PLAYERBOTS=ON
+          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+          -B build
+          -S core
+
+      - name: Build
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
