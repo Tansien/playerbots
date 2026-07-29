@@ -1,78 +1,80 @@
 name: Ubuntu Build
 
-# This workflow is the only thing that compiles the module (-DBUILD_PLAYERBOTS=ON),
-# so it must run on pull requests too. Without the pull_request trigger a PR that
-# does not compile against any core still shows a green check.
-#
-# Safe on fork PRs because every job runs on GitHub-hosted ephemeral runners: a
-# fork PR gets a fresh throwaway VM, a read-only token and no repository secrets,
-# so the worst a malicious PR can do is waste its own build minutes. Do not move
-# these jobs to persistent self-hosted runners while pull_request is a trigger --
-# a pull_request run executes the PR's own copy of this workflow, which a fork can
-# edit.
+# CI policy for this fork:
+# - All jobs run on self-hosted Ubuntu 26.04 runners only, pinned to this
+#   repository's runner pool (labels: [self-hosted, linux, playerbots]).
+#   No GitHub-hosted runners and no macOS/Windows jobs. If no self-hosted runner is
+#   online, jobs stay queued; do not switch back to GitHub-hosted runners.
+# - Trust boundary: the persistent self-hosted runners execute trusted refs only.
+#   Triggers are push (master), pull_request and manual workflow_dispatch. The
+#   pull_request trigger is gated by a job-level `if` to SAME-REPOSITORY pull
+#   requests, because a pull_request run executes the PR's own copy of this
+#   workflow, which a fork can edit -- a fork PR must never reach these runners.
+#   Fork PRs are therefore skipped, not failed: review the diff (including
+#   workflow changes!) first, then validate it with workflow_dispatch. Keep the
+#   Actions fork-approval policy at "all external contributors" and prefer
+#   ephemeral/JIT runner registration as additional layers.
+# - The build job is the ONLY thing that compiles the module (-DBUILD_PLAYERBOTS=ON).
+#   Before this trigger existed, a pull request ran no check that compiled a single
+#   line of it, so a PR that did not build still showed a green check.
+# - Core refs are PINNED. Tracking cmangos master breaks this workflow on any
+#   upstream API change with no commit of ours involved -- and it does today:
+#   against current mangos-tbc master, BankAction.cpp fails with "too few
+#   arguments to function call, expected at least 6, have 5". Bump the pins
+#   deliberately, in their own commit, so upstream drift is never mistaken for a
+#   regression in a pull request.
+# - The Living Realm host-test job belongs with the living/ sources and the
+#   BUILD_PLAYERBOTS_LIVING_TESTS option, which do not exist on master yet; it is
+#   added by the change that introduces them, not here.
+# - No Discord (or any other) notification steps.
+# - Build state: each job configures and builds under RUNNER_TEMP, which the runner
+#   recreates per job, so no CMake cache or artifact survives between runs.
+# - Runners are provisioned by the repository owner and are expected to provide the
+#   normal CMaNGOS build dependencies: git, cmake (>= 3.16), g++ or clang++,
+#   libboost-all-dev, libssl-dev, libmysqlclient-dev/default-libmysqlclient-dev, and
+#   libicu-dev (on 26.04 the mysql client library links ICU, so the dev package is
+#   required at link time).
+
 on:
-  # push is limited to master so a branch that has an open PR is not built twice
-  # (a same-repo PR would otherwise fire push and pull_request on the same commit,
-  # and the two events do not share a concurrency group key). Feature branches are
-  # covered by their pull request; master is covered on merge.
   push:
     branches:
       - master
+  # Same-repo pull requests only -- see the job-level `if`. Without this trigger
+  # nothing compiled the module on a PR at all, which is the gap this closes.
   pull_request:
-  # Lets a maintainer validate a branch with no open PR, or re-run after a core
-  # pin bump / infrastructure fix, without pushing an empty commit.
   workflow_dispatch:
 
-# Read-only is the floor for anything added to this file later.
 permissions:
   contents: read
 
 concurrency:
-  # Keyed on the PR number, not github.head_ref: two PRs from different forks
-  # that share a branch name (patch-1, master, dev) would otherwise collide and
-  # cancel each other, producing a red check unrelated to the PR's own code.
-  # PR runs share a group (per PR number) so a new push supersedes the old run.
-  # Everything else falls back to github.run_id, which is unique per run, so each
-  # master push gets its own group: grouping them on github.ref would let a third
-  # push evict the queued second one even with cancel-in-progress false, leaving
-  # an intermediate merge commit permanently unvalidated.
+  # PR runs group per PR number so a new push supersedes the old run. Everything
+  # else falls back to github.run_id (unique per run) so each master push keeps
+  # its own group: grouping them on github.ref would let a third push evict the
+  # queued second one, leaving an intermediate merge commit unvalidated.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  # Only collapse redundant PR runs. Cancelling a push build would leave a merge
-  # commit on master permanently unvalidated when two PRs merge back to back.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
-  BUILD_DIR: ${{github.workspace}}/bin/builddir
-  BOOST_VERSION: "1.83.0"
-  BOOST_PLATFORM_VERSION: "22.04"
-  COMPILER_CC: clang
-  COMPILER_PP: clang++
-  # The core lives upstream. This was ${{github.repository_owner}}, which on any
-  # fork resolves to the fork owner and checks out a repository that does not
-  # exist -- so every build job failed at checkout with "Repository not found".
-  CORE_REPO_OWNER: cmangos
 
 jobs:
   build:
-    # Explicit name: an include-only matrix names jobs from EVERY key, so this
-    # would otherwise render as "build (classic, de8f7299...)" and every core-ref
-    # bump would rename the check, breaking any branch-protection rule requiring it.
-    name: build (${{ matrix.version }})
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
+    # Named from matrix.version only: an include-only matrix otherwise names jobs
+    # from EVERY key, rendering as "Build (classic, de8f7299...)", so each core-ref
+    # bump would rename the check and break any branch-protection rule needing it.
+    name: Build ${{ matrix.version }}
+    # A pull_request run executes the PR's OWN copy of this workflow, which a
+    # fork can edit -- that is why fork PRs must never reach these persistent
+    # runners. Same-repo PRs are trusted (writers only). Review a fork PR's diff,
+    # including this file, then validate it with workflow_dispatch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, playerbots]
 
     strategy:
       fail-fast: false
       matrix:
-        # Core refs are PINNED. Tracking cmangos master makes this workflow break
-        # on any upstream API change with no commit of ours involved -- and it is
-        # already broken that way today: against current mangos-tbc master,
-        # BankAction.cpp fails with "too few arguments to function call, expected
-        # at least 6, have 5". Bump these deliberately, in their own commit, so an
-        # upstream break is never confused with a regression in a pull request.
+        # Pinned CMaNGOS core baselines from docs/design/0001-living-realm-implementation-contract.md (A.1).
         include:
           - version: classic
             core_ref: de8f72993b9e1faa1bf92dd5505f3daec5cea3ce
@@ -81,88 +83,71 @@ jobs:
           - version: wotlk
             core_ref: 57a34d33fb8cb1822258c690c583cc9be8d04708
 
-    env:
-      EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
-
     steps:
-      - name: Checkout CMaNGOS ${{matrix.version}} core
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - name: Runner preflight (require Ubuntu 26.04)
+        run: |
+          if [ ! -r /etc/os-release ]; then
+            echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
+            exit 1
+          fi
+          . /etc/os-release
+          if [ "${ID}" != "ubuntu" ] || [ "${VERSION_ID}" != "26.04" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu 26.04, got: ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
+            exit 1
+          fi
+          echo "Runner OS: ${PRETTY_NAME}"
+
+      - name: Checkout CMaNGOS ${{ matrix.version }} core
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          repository: ${{env.CORE_REPO_OWNER}}/mangos-${{matrix.version}}
-          ref: ${{matrix.core_ref}}
+          repository: cmangos/mangos-${{ matrix.version }}
+          ref: ${{ matrix.core_ref }}
           path: core
           persist-credentials: false
 
       - name: Checkout playerbots
-        # Must live inside the core tree (the core adds it via add_subdirectory),
-        # and must be checked out AFTER the core so the core checkout cannot wipe
-        # it. Without this the job builds whatever FetchContent pulls from
-        # upstream -- i.e. not the code under review.
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        # Must live inside the core tree (the core adds it via add_subdirectory);
+        # checked out after the core so the core checkout cannot wipe it.
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           path: core/src/modules/PlayerBots
           persist-credentials: false
 
-      - name: Create Build Environment
-        run: |
-          echo "CC=${{env.COMPILER_CC}}" >> $GITHUB_ENV
-          echo "CXX=${{env.COMPILER_PP}}" >> $GITHUB_ENV
-          cmake -E make_directory ${{ env.BUILD_DIR }}
-
-      - name: Install Boost
-        uses: MarkusJx/install-boost@51b5604fed63e1e8f76d4b564002e9e7cdcce63a # v2.4.5
-        id: install-boost
-        with:
-          # REQUIRED: Specify the required boost version
-          # A list of supported versions can be found here:
-          # https://github.com/MarkusJx/prebuilt-boost/blob/main/versions-manifest.json
-          boost_version: ${{env.BOOST_VERSION}}
-          # OPTIONAL: Specify a platform version
-          platform_version: ${{env.BOOST_PLATFORM_VERSION}}
-          # OPTIONAL: Specify a toolset
-          toolset: gcc
-          # OPTIONAL: Specify an architecture
-          arch: x86
-          # NOTE: If a boost version matching all requirements cannot be found,
-          # this build step will fail
-
       - name: Configure
-        env:
-          BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
-        # FETCHCONTENT_SOURCE_DIR_PLAYERBOTS pins the module to the checkout above;
-        # without it FetchContent replaces it with upstream master and the build
-        # silently tests the wrong code.
+        # FETCHCONTENT_SOURCE_DIR_PLAYERBOTS pins the module to this checkout;
+        # without it FetchContent would update the directory to upstream master.
+        # Build/install dirs live under RUNNER_TEMP so nothing is reused across runs.
         run: >
           cmake
-          -DBoost_ARCHITECTURE=-x64
-          -DCMAKE_INSTALL_PREFIX=/home/runner/work
-          ${{env.EXTRA_BUILD}}
-          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${{github.workspace}}/core/src/modules/PlayerBots"
-          -B ${{env.BUILD_DIR}}
-          -S ${{github.workspace}}/core
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DBUILD_PLAYERBOTS=ON
+          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
+          -DCMAKE_INSTALL_PREFIX="${RUNNER_TEMP}/run-${{ matrix.version }}"
+          -B "${RUNNER_TEMP}/build-${{ matrix.version }}"
+          -S core
 
-      # The whole value of this workflow is that a green check means THIS commit
-      # compiled. The core declares PlayerBots via FetchContent with
-      # GIT_TAG master, so if FETCHCONTENT_SOURCE_DIR_PLAYERBOTS is ever dropped,
-      # typo'd or renamed upstream, the update step silently repoints the tree at
-      # cmangos/playerbots master and the job goes green having built the wrong
-      # code. Assert the tree is still ours before spending time compiling it.
+      # A green check must mean THIS commit compiled. The core declares PlayerBots
+      # via FetchContent with GIT_TAG master, so if the source-dir override is ever
+      # dropped, typo'd or renamed upstream, the update step silently repoints the
+      # tree at cmangos/playerbots master and the job goes green having built the
+      # wrong code. Assert before spending a full core build on it.
       - name: Verify the module under test is this checkout
         shell: bash
         run: |
-          expected="${{github.sha}}"
-          actual="$(git -C "${{github.workspace}}/core/src/modules/PlayerBots" rev-parse HEAD)"
+          expected="${{ github.sha }}"
+          actual="$(git -C "${GITHUB_WORKSPACE}/core/src/modules/PlayerBots" rev-parse HEAD)"
           echo "expected $expected"
           echo "actual   $actual"
           if [ "$actual" != "$expected" ]; then
             echo "::error::Module tree is not the commit under test - FetchContent replaced it."
-            git -C "${{github.workspace}}/core/src/modules/PlayerBots" remote -v
+            git -C "${GITHUB_WORKSPACE}/core/src/modules/PlayerBots" remote -v
             exit 1
           fi
 
       - name: Build
-        env:
-          MAKEFLAGS: "-j8"
-        run: |
-            cmake --build ${{env.BUILD_DIR}} --config ${{env.BUILD_TYPE}}
-            cmake --install ${{env.BUILD_DIR}}
+        run: cmake --build "${RUNNER_TEMP}/build-${{ matrix.version }}" -j "$(nproc)"
+
+      - name: Install
+        # Validates the install rules (binaries plus the configured
+        # aiplayerbot.conf.dist) like the pre-fork workflow did.
+        run: cmake --install "${RUNNER_TEMP}/build-${{ matrix.version }}"
