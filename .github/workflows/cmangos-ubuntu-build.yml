@@ -40,23 +40,36 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
 
     strategy:
+      fail-fast: false
       matrix:
-        version: [classic, tbc, wotlk]
+        # Core refs are PINNED. Tracking cmangos master makes this workflow break
+        # on any upstream API change with no commit of ours involved -- and it is
+        # already broken that way today: against current mangos-tbc master,
+        # BankAction.cpp fails with "too few arguments to function call, expected
+        # at least 6, have 5". Bump these deliberately, in their own commit, so an
+        # upstream break is never confused with a regression in a pull request.
         include:
-          - os: ubuntu-22.04
-            EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
+          - version: classic
+            core_ref: de8f72993b9e1faa1bf92dd5505f3daec5cea3ce
+          - version: tbc
+            core_ref: e107b53c175e47d7e5b3496181353f5a6349be43
+          - version: wotlk
+            core_ref: 57a34d33fb8cb1822258c690c583cc9be8d04708
+
+    env:
+      EXTRA_BUILD: "-DBUILD_PLAYERBOTS=ON"
 
     steps:
       - name: Checkout CMaNGOS ${{matrix.version}} core
         uses: actions/checkout@v4
         with:
           repository: ${{env.CORE_REPO_OWNER}}/mangos-${{matrix.version}}
-          ref: master
+          ref: ${{matrix.core_ref}}
           path: core
 
       - name: Checkout playerbots
@@ -101,7 +114,7 @@ jobs:
           cmake
           -DBoost_ARCHITECTURE=-x64
           -DCMAKE_INSTALL_PREFIX=/home/runner/work
-          ${{matrix.EXTRA_BUILD}}
+          ${{env.EXTRA_BUILD}}
           -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
           -B ${{env.BUILD_DIR}}
           -S ${{env.REPO_DIR}}/core
