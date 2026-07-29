@@ -19,15 +19,26 @@ on:
     branches:
       - master
   pull_request:
+  # Lets a maintainer validate a branch with no open PR, or re-run after a core
+  # pin bump / infrastructure fix, without pushing an empty commit.
+  workflow_dispatch:
+
+# Read-only is the floor for anything added to this file later.
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
+  # Keyed on the PR number, not github.head_ref: two PRs from different forks
+  # that share a branch name (patch-1, master, dev) would otherwise collide and
+  # cancel each other, producing a red check unrelated to the PR's own code.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only collapse redundant PR runs. Cancelling a push build would leave a merge
+  # commit on master permanently unvalidated when two PRs merge back to back.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
-  REPO_DIR : ${{github.workspace}}
   BUILD_DIR: ${{github.workspace}}/bin/builddir
   BOOST_VERSION: "1.83.0"
   BOOST_PLATFORM_VERSION: "22.04"
@@ -40,6 +51,10 @@ env:
 
 jobs:
   build:
+    # Explicit name: an include-only matrix names jobs from EVERY key, so this
+    # would otherwise render as "build (classic, de8f7299...)" and every core-ref
+    # bump would rename the check, breaking any branch-protection rule requiring it.
+    name: build (${{ matrix.version }})
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -66,20 +81,22 @@ jobs:
 
     steps:
       - name: Checkout CMaNGOS ${{matrix.version}} core
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
         with:
           repository: ${{env.CORE_REPO_OWNER}}/mangos-${{matrix.version}}
           ref: ${{matrix.core_ref}}
           path: core
+          persist-credentials: false
 
       - name: Checkout playerbots
         # Must live inside the core tree (the core adds it via add_subdirectory),
         # and must be checked out AFTER the core so the core checkout cannot wipe
         # it. Without this the job builds whatever FetchContent pulls from
         # upstream -- i.e. not the code under review.
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
         with:
           path: core/src/modules/PlayerBots
+          persist-credentials: false
 
       - name: Create Build Environment
         run: |
@@ -88,7 +105,7 @@ jobs:
           cmake -E make_directory ${{ env.BUILD_DIR }}
 
       - name: Install Boost
-        uses: MarkusJx/install-boost@v2.4.5
+        uses: MarkusJx/install-boost@51b5604fed63e1e8f76d4b564002e9e7cdcce63a # v2.4.5
         id: install-boost
         with:
           # REQUIRED: Specify the required boost version
@@ -115,9 +132,28 @@ jobs:
           -DBoost_ARCHITECTURE=-x64
           -DCMAKE_INSTALL_PREFIX=/home/runner/work
           ${{env.EXTRA_BUILD}}
-          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${GITHUB_WORKSPACE}/core/src/modules/PlayerBots"
+          -DFETCHCONTENT_SOURCE_DIR_PLAYERBOTS="${{github.workspace}}/core/src/modules/PlayerBots"
           -B ${{env.BUILD_DIR}}
-          -S ${{env.REPO_DIR}}/core
+          -S ${{github.workspace}}/core
+
+      # The whole value of this workflow is that a green check means THIS commit
+      # compiled. The core declares PlayerBots via FetchContent with
+      # GIT_TAG master, so if FETCHCONTENT_SOURCE_DIR_PLAYERBOTS is ever dropped,
+      # typo'd or renamed upstream, the update step silently repoints the tree at
+      # cmangos/playerbots master and the job goes green having built the wrong
+      # code. Assert the tree is still ours before spending time compiling it.
+      - name: Verify the module under test is this checkout
+        shell: bash
+        run: |
+          expected="${{github.sha}}"
+          actual="$(git -C "${{github.workspace}}/core/src/modules/PlayerBots" rev-parse HEAD)"
+          echo "expected $expected"
+          echo "actual   $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Module tree is not the commit under test - FetchContent replaced it."
+            git -C "${{github.workspace}}/core/src/modules/PlayerBots" remote -v
+            exit 1
+          fi
 
       - name: Build
         env:
