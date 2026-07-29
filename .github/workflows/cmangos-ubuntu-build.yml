@@ -23,9 +23,6 @@ name: Ubuntu Build
 #   arguments to function call, expected at least 6, have 5". Bump the pins
 #   deliberately, in their own commit, so upstream drift is never mistaken for a
 #   regression in a pull request.
-# - The Living Realm host-test job belongs with the living/ sources and the
-#   BUILD_PLAYERBOTS_LIVING_TESTS option, which do not exist on master yet; it is
-#   added by the change that introduces them, not here.
 # - No Discord (or any other) notification steps.
 # - Build state: each job configures and builds under RUNNER_TEMP, which the runner
 #   recreates per job, so no CMake cache or artifact survives between runs.
@@ -59,6 +56,64 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  living-tests:
+    name: Living Realm host tests (${{ matrix.lane }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, playerbots]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: release
+            cmake_args: "-DCMAKE_BUILD_TYPE=Release"
+          - lane: asan-ubsan
+            # -fno-sanitize-recover=undefined makes a UBSan finding fail the job
+            # rather than print and continue. The suite is pure computation, so
+            # this costs seconds and catches the overflow/OOB class this module
+            # has shipped before.
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=Debug
+              -DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined
+              -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+
+    steps:
+      - name: Runner preflight (require Ubuntu 26.04)
+        run: |
+          if [ ! -r /etc/os-release ]; then
+            echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
+            exit 1
+          fi
+          . /etc/os-release
+          if [ "${ID}" != "ubuntu" ] || [ "${VERSION_ID}" != "26.04" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu 26.04, got: ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
+            exit 1
+          fi
+          echo "Runner OS: ${PRETTY_NAME}"
+
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Configure
+        run: cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON ${{ matrix.cmake_args }} -B "$RUNNER_TEMP/build-living-${{ matrix.lane }}" -S .
+
+      - name: Build
+        run: cmake --build "$RUNNER_TEMP/build-living-${{ matrix.lane }}" -j "$(nproc)"
+
+      - name: Test
+        # --no-tests=error: ctest exits 0 when NO tests are registered, so a suite
+        # that silently stopped registering would otherwise report a green build.
+        env:
+          # LeakSanitizer is off deliberately: this configuration was validated
+          # without it, so enabling it here would gate every PR on a check that
+          # has never run green. Turn it on in its own change once the suite is
+          # confirmed leak-clean on Linux.
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir "$RUNNER_TEMP/build-living-${{ matrix.lane }}" --output-on-failure --no-tests=error
+
   build:
     # Named from matrix.version only: an include-only matrix otherwise names jobs
     # from EVERY key, rendering as "Build (classic, de8f7299...)", so each core-ref
