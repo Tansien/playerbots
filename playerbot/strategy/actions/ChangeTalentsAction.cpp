@@ -55,29 +55,36 @@ bool ChangeTalentsAction::Execute(Event& event)
             if (botSpec.CheckTalentLink(param, &out))
             {
                 TalentSpec newSpec(bot, param);
+                bool const linkComplete = newSpec.unreadLinkChars == 0;
+                if (newSpec.unreadLinkChars > 0)
+                {
+                    out << "talent link is invalid. " << newSpec.unreadLinkChars
+                        << " character(s) could not be read; check the tree separators.";
+                }
                 std::string specLink = newSpec.GetTalentLink();
 
-                if (crop)
+                if (linkComplete && crop)
                 {
                     newSpec.CropTalents(bot);
                     out << "becomes: " << newSpec.GetTalentLink();
                 }
 
-                if (shift)
+                if (linkComplete && shift)
                 {
                     TalentSpec botSpec(bot);
                     newSpec.ShiftTalents(&botSpec, bot);
                     out << "becomes: " << newSpec.GetTalentLink();
                 }
 
-                if (newSpec.CheckTalents(bot, &out))
+                if (linkComplete && newSpec.CheckTalents(bot, &out))
                 {
                     newSpec.ApplyTalents(bot, &out);
                     sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", 0);
                     sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 1, specLink);
                 }
 
-                ai->UpdateTalentSpec();
+                if (linkComplete)
+                    ai->UpdateTalentSpec();
             }
             else
             {

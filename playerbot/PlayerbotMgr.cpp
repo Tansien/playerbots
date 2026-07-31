@@ -2126,9 +2126,10 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         std::string key = arg.substr(0, eqPos);
         std::string value = arg.substr(eqPos + 1);
 
-        int32 parsedSize = 0;
-        if (key == "size" && Qualified::parseNumberString(value, parsedSize))
+        if (key == "size")
         {
+            int32 parsedSize = 0;
+
             // groupSize is a uint8, so the range must be checked BEFORE the
             // narrowing: size=-1 became 255 and drove up to 2550 creation
             // attempts, and size=256 became 0. Same bug class already fixed
@@ -2137,7 +2138,7 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             // accepts. A literal rather than MAX_RAID_SIZE because that symbol
             // is not otherwise used in this module and cannot be compile-
             // checked in this environment.
-            if (parsedSize < 1 || parsedSize > 40)
+            if (!Qualified::parseNumberString(value, parsedSize) || parsedSize < 1 || parsedSize > 40)
             {
                 messages.push_back("Unsupported group size '" + value + "'");
                 return messages;
@@ -2198,23 +2199,20 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         paramStr << "level=" << masterLevel << " class=" << ChatHelper::formatClass(cls) << " group=" << master->GetName() << " " << passThroughParam; //Passthrough will override.
 
         auto result = HandleCreate(master, paramStr.str(), security);
+        bool const created = !result.empty() && result.front().find("Bot created:") != std::string::npos;
         messages.splice(messages.end(), result);
 
-        if (!messages.empty())
+        if (created)
         {
-            auto lastMsg = messages.front();
-            if (lastMsg.find("Bot created:") != std::string::npos)
-            {
-                classesCreated[cls]++;
-                botsCreated++;
-                currentGroupSize++;
-            }
+            classesCreated[cls]++;
+            botsCreated++;
+            currentGroupSize++;
+
+            allowedClassNr[0][role]--;
+
+            if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
+                allowedClassNr[cls][role]--;
         }
-    
-        allowedClassNr[0][role]--; 
-        
-        if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
-            allowedClassNr[cls][role]--;
     }
 
     std::ostringstream debugInfo;
