@@ -57,12 +57,15 @@ bool CleanQuestLogAction::Execute(Event& event)
     uint8 totalQuests = 0;
 
     DropQuestType(requester, totalQuests); //Count the total quests
-     
+
+    //Drop failed quests. Unconditional: the counting pass used to do this on
+    //every call as a side effect of the bug fixed here, and it ran before this
+    //threshold was evaluated, so gating it on the threshold would leave failed
+    //quests holding slots whenever the log is between 4 and 6 slots from full.
+    DropQuestType(requester, totalQuests, MAX_QUEST_LOG_SIZE, true, true);
+
     if (MAX_QUEST_LOG_SIZE - totalQuests > 6)
-    {
-        DropQuestType(requester, totalQuests, MAX_QUEST_LOG_SIZE, true, true); //Drop failed quests
         return true;
-    }
 
     if (AI_VALUE(bool, "can fight equal")) //Only drop gray quests when able to fight proper lvl quests.
     {
