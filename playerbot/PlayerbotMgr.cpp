@@ -1906,15 +1906,17 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
             // Raw stoul threw on a non-numeric or oversized value, and "-1"
             // wrapped to a huge unsigned that went on to SetLevel.
             int32 parsedLevel = 0;
-            if (!Qualified::parseNumberString(value, parsedLevel)
-                || parsedLevel < 1
-                || uint32(parsedLevel) > sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+            if (!Qualified::parseNumberString(value, parsedLevel) || parsedLevel < 1)
             {
                 messages.push_back("Unsupported level '" + value + "'");
                 return;
             }
 
-            level = uint32(parsedLevel);
+            // Clamp rather than reject above the cap: SetLevel already clamped
+            // internally, and the test generator asks for levelMin + 10, which
+            // overshoots the realm max on purpose for end-game instances.
+            uint32 const maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
+            level = uint32(parsedLevel) > maxLevel ? maxLevel : uint32(parsedLevel);
         }
         else if (key == "role")
             role = ChatHelper::parseRole(value);
