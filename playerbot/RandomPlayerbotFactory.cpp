@@ -886,6 +886,8 @@ void RandomPlayerbotFactory::CreateRandomBots()
 		std::mt19937 rng(rnd()); // Mersenne Twister RNG
 		std::shuffle(shuffledKeys.begin(), shuffledKeys.end(), rng);
 
+	        uint32 const createdBefore = created;
+
 	        for (const auto& key : shuffledKeys)
 	        {
 	            if (created >= maxAllowed)
@@ -913,16 +915,15 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	                if (--remaining[key] == 0)
 	                    remaining.erase(key);
 	            }
-	            else
-	            {
-	                // This loop only advances on success, so a key that cannot be
-	                // created has to be dropped or the world thread spins on it
-	                // forever - re-shuffling and re-failing without end. Give up on
-	                // the class/race instead, the way the non-fixed branch below
-	                // simply moves on.
-	                remaining.erase(key);
-	            }
 	        }
+
+	        // A whole pass that created nothing will keep creating nothing: the
+	        // keys and the name pools are unchanged, so the loop would re-shuffle
+	        // and re-fail forever, spinning the world thread. Stop this account
+	        // instead, leaving `remaining` untouched so the next account still
+	        // tries and the "left uncreated" report below stays accurate.
+	        if (created == createdBefore)
+	            break;
 	    }
 	}
 	else
