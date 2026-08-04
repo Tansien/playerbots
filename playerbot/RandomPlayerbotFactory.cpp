@@ -269,13 +269,23 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     auto it = freeNames.find(raceAndGender);
     if (it == freeNames.end() || it->second.empty())
     {
-        // nameMutex is ALREADY held above, and CreateRandomBotName locks the same
-        // non-recursive mutex, so calling it here self-deadlocked the world thread.
-        // It could not have helped in any case: it re-tests this exact empty-pool
-        // condition and returns "". Despite the old comment there is no
-        // suffix-generation fallback to reach.
-        sLog.outError("No more names left for random bots for race/gender %u; add rows to ai_playerbot_names",
-            static_cast<uint8>(raceAndGender));
+        // The rolled gender has no names left. Try the other one before giving up -
+        // the old code's comment promised exactly this ("First try other gender")
+        // but called CreateRandomBotName, which locks the same non-recursive
+        // nameMutex this function already holds and so self-deadlocked the world
+        // thread; it also just re-tested this same empty-pool condition and
+        // returned "", so there was nothing to reach. Checking both genders here
+        // also makes failure depend on the race alone rather than on the gender
+        // roll, which is what lets the caller treat a failure as conclusive.
+        gender = (gender == GENDER_MALE) ? GENDER_FEMALE : GENDER_MALE;
+        raceAndGender = CombineRaceAndGender(gender, race);
+        it = freeNames.find(raceAndGender);
+    }
+
+    if (it == freeNames.end() || it->second.empty())
+    {
+        sLog.outError("No more names left for random bots for race %u (both genders); add rows to ai_playerbot_names",
+            static_cast<uint32>(race));
         return false;
     }
     else
