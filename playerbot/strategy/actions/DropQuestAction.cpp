@@ -115,22 +115,19 @@ void CleanQuestLogAction::DropQuestType(Player* requester, uint8 &numQuest, uint
         if (!questId)
             continue;
 
-        //Counting pass: count every occupied slot and drop nothing. Failed and
+        Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
+        if (!quest)
+            continue;
+
+        //Counting pass: count every countable slot and drop nothing. Failed and
         //class specific quests hold a slot too, and dropping one here decremented
         //a counter that had not counted it, wrapping the uint8 to 255 - after
         //which every later pass saw a full log and pruned until it wrapped back.
-        //Counted before the template lookup: a slot whose quest has been removed
-        //from the world DB still occupies the slot even though it cannot be
-        //dropped through the message below.
         if (wantNum == 100)
         {
             numQuest++;
             continue;
         }
-
-        Quest const* quest = sObjectMgr.GetQuestTemplate(questId);
-        if (!quest)
-            continue;
 
         if (bot->GetQuestStatus(questId) != QUEST_STATUS_FAILED)
         {
