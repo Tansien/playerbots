@@ -1,5 +1,9 @@
 #include "Config/Config.h"
 
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
@@ -4505,8 +4509,11 @@ static bool ParseFloatToken(const std::string& str, float& result)
         return false;
 
     char* end = nullptr;
+    errno = 0;
     float const value = std::strtof(str.c_str(), &end);
-    if (end != str.c_str() + str.size() || !std::isfinite(value))
+    // ERANGE covers underflow too: "1e-1000" would otherwise be accepted as a
+    // finite 0 and silently overwrite a coefficient, where stof rejected it.
+    if (errno == ERANGE || end != str.c_str() + str.size() || !std::isfinite(value))
         return false;
 
     result = value;
