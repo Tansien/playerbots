@@ -932,11 +932,12 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
 	        // Nothing here can make progress once the name pools are exhausted, so
 	        // without a bound the loop re-shuffles and re-fails forever, spinning
-	        // the world thread. A single barren pass is not proof of that though -
-	        // CreateRandomBot re-rolls the gender each call, so one pass over a
-	        // short `remaining` can fail on the coin flip alone. Require several in
-	        // a row. `remaining` is deliberately left untouched, so the next
-	        // account still tries and the "left uncreated" report stays accurate.
+	        // the world thread. Name exhaustion is conclusive on the first pass now
+	        // that both genders are checked, but a pass can also fail for reasons a
+	        // later one survives - a drawn name is consumed even when Player::Create
+	        // then rejects it - so require a few barren passes rather than one.
+	        // `remaining` is deliberately left untouched, so the next account still
+	        // tries and the "left uncreated" report stays accurate.
 	        if (created != createdBefore)
 	            fruitlessPasses = 0;
 	        else if (++fruitlessPasses >= 8)
