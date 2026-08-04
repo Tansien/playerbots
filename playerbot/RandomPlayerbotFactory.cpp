@@ -269,12 +269,14 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     auto it = freeNames.find(raceAndGender);
     if (it == freeNames.end() || it->second.empty())
     {
-        // Try fallback: generate new name with suffix if all names exhausted
-        // First try other gender
-        std::string baseName = CreateRandomBotName(raceAndGender);
-        if (baseName.empty())
-            return false;
-        name = baseName;
+        // nameMutex is ALREADY held above, and CreateRandomBotName locks the same
+        // non-recursive mutex, so calling it here self-deadlocked the world thread.
+        // It could not have helped in any case: it re-tests this exact empty-pool
+        // condition and returns "". Despite the old comment there is no
+        // suffix-generation fallback to reach.
+        sLog.outError("No more names left for random bots for race/gender %u; add rows to ai_playerbot_names",
+            static_cast<uint8>(raceAndGender));
+        return false;
     }
     else
     {
