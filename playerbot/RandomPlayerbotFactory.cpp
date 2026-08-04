@@ -829,6 +829,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     sLog.outString("Creating random bot characters...");
     uint32 botsCreated = 0;
+    uint32 botsAttempted = 0;
     BarGoLink bar1(sPlayerbotAIConfig.randomBotAccountCount*
 #ifdef MANGOSBOT_TWO
         10
@@ -874,6 +875,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	    uint32 maxAllowed = 9 - count;
 #endif
 	    uint32 created = 0;
+	    uint32 fruitlessPasses = 0;
 
 	    while (!remaining.empty() && created < maxAllowed)
 	    {
@@ -907,6 +909,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	                continue;
 #endif
 
+	            botsAttempted++;
 	            if (factory.CreateRandomBot(cls, race))
 	            {
 	                created++;
@@ -917,12 +920,16 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	            }
 	        }
 
-	        // A whole pass that created nothing will keep creating nothing: the
-	        // keys and the name pools are unchanged, so the loop would re-shuffle
-	        // and re-fail forever, spinning the world thread. Stop this account
-	        // instead, leaving `remaining` untouched so the next account still
-	        // tries and the "left uncreated" report below stays accurate.
-	        if (created == createdBefore)
+	        // Nothing here can make progress once the name pools are exhausted, so
+	        // without a bound the loop re-shuffles and re-fails forever, spinning
+	        // the world thread. A single barren pass is not proof of that though -
+	        // CreateRandomBot re-rolls the gender each call, so one pass over a
+	        // short `remaining` can fail on the coin flip alone. Require several in
+	        // a row. `remaining` is deliberately left untouched, so the next
+	        // account still tries and the "left uncreated" report stays accurate.
+	        if (created != createdBefore)
+	            fruitlessPasses = 0;
+	        else if (++fruitlessPasses >= 8)
 	            break;
 	    }
 	}
@@ -944,6 +951,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
                     // Counted only when it actually happened: the increment used to
                     // run before the call and ignore the result, so an exhausted
                     // name pool was still reported as a created character.
+                    botsAttempted++;
                     if (factory.CreateRandomBot(rclss))
                         botsCreated++;
                     bar1.step();
@@ -979,7 +987,12 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     if (!botsCreated)
     {
-	    sLog.outString("No new random bots needed. Accounts: %zu, bots: %d.", sPlayerbotAIConfig.randomBotAccounts.size(), totalRandomBotChars);
+	    // "Needed" and "attempted but every one failed" are different states, and
+	    // now that a failed creation is no longer counted they both reach here.
+	    if (botsAttempted)
+	        sLog.outError("No random bots could be created: all %u attempt(s) failed. Accounts: %zu, bots: %d.", botsAttempted, sPlayerbotAIConfig.randomBotAccounts.size(), totalRandomBotChars);
+	    else
+	        sLog.outString("No new random bots needed. Accounts: %zu, bots: %d.", sPlayerbotAIConfig.randomBotAccounts.size(), totalRandomBotChars);
 
         return;
     }
