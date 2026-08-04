@@ -304,7 +304,12 @@ std::set<uint32> ChatHelper::ExtractAllQuestIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 7)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 7), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -320,7 +325,12 @@ std::set<uint32> ChatHelper::ExtractAllItemIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 6)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 6), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -336,7 +346,12 @@ std::set<uint32> ChatHelper::ExtractAllSkillIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 7)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 7), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -352,7 +367,12 @@ std::set<uint32> ChatHelper::ExtractAllFactionIds(const std::string& text)
     for (std::sregex_iterator i = begin; i != end; ++i)
     {
         std::smatch match = *i;
-        ids.insert(std::stoi(match.str().erase(0, 9)));
+        // The regex bounds the character set but not the length, so a forged
+        // link with a long digit run threw out_of_range before any caller
+        // could range-check the id.
+        int32 linkId = 0;
+        if (Qualified::parseNumberString(match.str().erase(0, 9), linkId) && linkId > 0)
+            ids.insert(uint32(linkId));
     }
 
     return ids;
@@ -406,12 +426,13 @@ std::vector<uint32> ChatHelper::parseItemsUnordered(const std::string& text, boo
             continue;
         }
 
-        if (isNumeric(itemStr))
+        int32 parsedItemId = 0;
+        if (Qualified::parseNumberString(itemStr, parsedItemId) && parsedItemId > 0)
         {
-            const uint32 itemID = std::stoi(itemStr);
+            const uint32 itemID = uint32(parsedItemId);
             if (!validate || sObjectMgr.GetItemPrototype(itemID) != nullptr)
             {
-                itemIds.push_back(std::stoi(itemStr));
+                itemIds.push_back(itemID);
             }
         }
     }
@@ -1009,11 +1030,15 @@ uint32 ChatHelper::parseGender(const std::string& text)
         return GENDER_MALE;
     else if (boost::iequals(text, "female"))
         return GENDER_FEMALE;
-    else if (Qualified::isValidNumberString(text))
+    else
     {
-        uint8 gender = static_cast<uint32>(stoi(text));
-        if (gender == GENDER_MALE || gender == GENDER_FEMALE)
-            return gender;
+        int32 parsed = 0;
+        if (Qualified::parseNumberString(text, parsed) && parsed >= 0 && parsed <= 0xFF)
+        {
+            uint8 gender = uint8(parsed);
+            if (gender == GENDER_MALE || gender == GENDER_FEMALE)
+                return gender;
+        }
     }
 
     return GENDER_NONE;
@@ -1035,11 +1060,15 @@ Team ChatHelper::parseTeam(const std::string& text)
         return ALLIANCE;
     else if (boost::iequals(text, "horde"))
         return HORDE;
-    else if (Qualified::isValidNumberString(text))
+    else
     {
-        uint8 team = static_cast<uint32>(stoi(text));
-        if (team == ALLIANCE || team == HORDE)
-            return (Team)team;
+        int32 parsed = 0;
+        if (Qualified::parseNumberString(text, parsed) && parsed >= 0 && parsed <= 0xFF)
+        {
+            uint8 team = uint8(parsed);
+            if (team == ALLIANCE || team == HORDE)
+                return (Team)team;
+        }
     }
 
     return TEAM_BOTH_ALLOWED;
@@ -1063,11 +1092,17 @@ uint32 ChatHelper::parseClass(const std::string& text)
         if (NormalizeChatToken(className) == normalized)
             return classId;
 
-    if (Qualified::isValidNumberString(normalized))
+    // Range check before the lookup. 'classes' is keyed by uint8, so
+    // classes.count(id) narrowed a uint32 id down to a byte: "257" matched
+    // class 1 and passed validation, while the un-narrowed 257 was returned.
+    // Callers store that in a uint8 and silently got a warrior instead of an
+    // "invalid class" rejection.
+    int32 id = 0;
+    if (Qualified::parseNumberString(normalized, id) && id >= 0 && id <= 0xFF)
     {
-        uint32 id = static_cast<uint32>(stoi(normalized));
-        if (classes.count(id))
-            return id;
+        const uint8 classId = static_cast<uint8>(id);
+        if (classes.count(classId))
+            return classId;
     }
 
     return 0;
@@ -1086,11 +1121,15 @@ uint32 ChatHelper::parseRace(const std::string& text)
         if (NormalizeChatToken(raceName) == normalized)
             return raceId;
 
-    if (Qualified::isValidNumberString(normalized))
+    // Same narrowing bug as parseClass: 'races' is keyed by uint8, so an id
+    // above 255 wrapped into a valid race for the lookup and was then returned
+    // unwrapped.
+    int32 id = 0;
+    if (Qualified::parseNumberString(normalized, id) && id >= 0 && id <= 0xFF)
     {
-        uint32 id = static_cast<uint32>(stoi(normalized));
-        if (races.count(id))
-            return id;
+        const uint8 raceId = static_cast<uint8>(id);
+        if (races.count(raceId))
+            return raceId;
     }
 
     return 0;

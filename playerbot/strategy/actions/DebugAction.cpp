@@ -3535,10 +3535,11 @@ bool DebugAction::HandleFind(Event& event, Player* requester, const std::string&
     if (link.empty())
         return false;
 
-    if (!Qualified::isValidNumberString(link))
+    int32 parsedEntry = 0;
+    if (!Qualified::parseNumberString(link, parsedEntry) || parsedEntry < 0)
         return false;
 
-    uint32 entry = stoi(link);
+    uint32 entry = uint32(parsedEntry);
 
     Creature* creature = nullptr;
     MaNGOS::NearestCreatureEntryWithLiveStateInObjectRangeCheck creature_check(*bot, entry, true, false, 1000.0f, true);

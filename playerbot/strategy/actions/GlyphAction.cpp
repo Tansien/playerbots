@@ -47,8 +47,17 @@ bool GlyphAction::Execute(Event& event)
             std::string removeSlots = param.substr(7);
 
             for (auto& token : getMultiQualifiers(removeSlots, " "))
-            {               
-                if (isValidNumberString(token))
+            {
+                // This test used to be inverted: a well-formed slot number was
+                // rejected as "not a valid slot number", and everything else
+                // fell through to stoi, which throws on a non-numeric token.
+                // So neither branch worked - `glyph remove 1` errored out and
+                // `glyph remove x` terminated the world. Parse once, and bound
+                // against the glyph vector rather than against `glyphs`, which
+                // is the output being accumulated and is still empty here.
+                int32 slot = 0;
+                if (!parseNumberString(token, slot)
+                    || slot < 0 || size_t(slot) >= equipedGlyphs.size())
                 {
                     std::ostringstream out;
                     out << token << " is not a valid slot number";
@@ -56,14 +65,8 @@ bool GlyphAction::Execute(Event& event)
                     return false;
                 }
 
-                uint8 slotId = stoi(token);
-
-                if (slotId > glyphs.size())
-                    glyphs.push_back(0);
-                else
-                    glyphs.push_back(equipedGlyphs[slotId]);
-
-                glyphsSlots.push_back(slotId);
+                glyphs.push_back(equipedGlyphs[slot]);
+                glyphsSlots.push_back(uint8(slot));
             }
         }
         else //Remove all glyphs
@@ -86,8 +89,17 @@ bool GlyphAction::Execute(Event& event)
                 continue;
 
             glyphs.push_back(id);
-            if (param.find("|r ") != std::string::npos && isValidNumberString(param.substr(param.find("|r ") + 3)))
-                glyphsSlots.push_back(stoi(param.substr(param.find("|r ") + 3)));
+
+            // Same reason as above: an oversized decimal passes a syntax check
+            // and then throws inside stoi. 99 is the existing "no slot given"
+            // sentinel, so an unusable number falls back to auto-detection
+            // rather than taking the command down.
+            int32 linkSlot = 0;
+            size_t const slotPos = param.find("|r ");
+            if (slotPos != std::string::npos
+                && parseNumberString(param.substr(slotPos + 3), linkSlot)
+                && linkSlot >= 0 && linkSlot < 99)
+                glyphsSlots.push_back(uint8(linkSlot));
             else
                 glyphsSlots.push_back(99);
         }
@@ -180,7 +192,11 @@ void GlyphAction::Set(uint32 itemId, uint8 wantedSlotId, std::ostringstream& msg
 
     std::vector<uint32> equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
     uint8 useSlotId = wantedSlotId;
-    bool detectSlot = wantedSlotId > equipedGlyphs.size();
+    // >=, not >: a slot equal to the count is one past the end of the glyph
+    // array. With six slots, an explicit suffix of 6 skipped auto-detection
+    // here, passed the "no free slot" test below for the same reason, and
+    // reached ApplyGlyph/SetGlyph out of range.
+    bool detectSlot = wantedSlotId >= equipedGlyphs.size();
 
     if (!detectSlot && EquipedGlyphsValue::GetGlyphSlotTypeFromSlot(useSlotId, bot->GetLevel()) == GlyphSlotType::LOCKED_SLOT)
     {
@@ -211,7 +227,7 @@ void GlyphAction::Set(uint32 itemId, uint8 wantedSlotId, std::ostringstream& msg
 
     placeholders["%slot"] = std::to_string(useSlotId);
 
-    if (useSlotId > equipedGlyphs.size())
+    if (useSlotId >= equipedGlyphs.size())
     {
         msg << BOT_TEXT2("No free slot available for %glyph", placeholders);
         return;
@@ -335,7 +351,9 @@ bool AutoSetGlyphAction::Execute(Event& event)
             useSlot = newSlot;
         }
 
-        if (useSlot > equipedGlyphs.size())
+        // >= for the same reason as Set(): equipedGlyphs[useSlot] below is an
+        // out-of-bounds WRITE when useSlot equals the slot count.
+        if (useSlot >= equipedGlyphs.size())
             continue;
 
         newGlyphs.push_back(itemId);

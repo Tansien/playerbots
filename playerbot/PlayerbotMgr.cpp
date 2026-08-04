@@ -1238,7 +1238,13 @@ std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const 
         return "Self-bot is disabled";
     }
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    // This had no validation at all: an "always=<value>" override went
+    // straight into stoull.
+    uint64 rawGuid = 0;
+    if (!Qualified::parseUInt64String(param, rawGuid))
+        return "Always: Error parsing " + param;
+
+    ObjectGuid guid = ObjectGuid(rawGuid);
     uint32 accountId = sObjectMgr.GetPlayerAccountIdByGUID(guid);
     std::string alwaysName;    
 
@@ -1809,10 +1815,14 @@ std::string PlayerbotHolder::HandleBotAddLogin(Player* bot, Player* master, cons
     if (bot)
         return "Player already logged in";
 
-    if (!Qualified::isValidNumberString(param))
+    // The command parser lets a user-supplied "add=<value>" override the GUID
+    // it resolved, so this string is untrusted: a syntax check alone still
+    // threw out_of_range in stoull on an oversized number.
+    uint64 rawGuid = 0;
+    if (!Qualified::parseUInt64String(param, rawGuid))
         return "Add: Error parsing " + param;
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    ObjectGuid guid = ObjectGuid(rawGuid);
 
     uint32 guildId = Player::GetGuildIdFromDB(guid);
     uint32 masterAccountId = master ? master->GetSession()->GetAccountId() : 0;
@@ -1892,7 +1902,22 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
         else if (key == "gender")
             gender = ChatHelper::parseGender(value);
         else if (key == "level")
-            level = std::stoul(value);
+        {
+            // Raw stoul threw on a non-numeric or oversized value, and "-1"
+            // wrapped to a huge unsigned that went on to SetLevel.
+            int32 parsedLevel = 0;
+            if (!Qualified::parseNumberString(value, parsedLevel) || parsedLevel < 1)
+            {
+                messages.push_back("Unsupported level '" + value + "'");
+                return;
+            }
+
+            // Clamp rather than reject above the cap: SetLevel already clamped
+            // internally, and the test generator asks for levelMin + 10, which
+            // overshoots the realm max on purpose for end-game instances.
+            uint32 const maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
+            level = uint32(parsedLevel) > maxLevel ? maxLevel : uint32(parsedLevel);
+        }
         else if (key == "role")
             role = ChatHelper::parseRole(value);
         else if (key == "login")
@@ -2103,8 +2128,26 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         std::string key = arg.substr(0, eqPos);
         std::string value = arg.substr(eqPos + 1);
 
-        if (key == "size" && Qualified::isValidNumberString(value))
-            groupSize = stoi(value);
+        if (key == "size")
+        {
+            int32 parsedSize = 0;
+
+            // groupSize is a uint8, so the range must be checked BEFORE the
+            // narrowing: size=-1 became 255 and drove up to 2550 creation
+            // attempts, and size=256 became 0. Same bug class already fixed
+            // in SetValueAction.
+            // 40 is the largest raid, matching the sizes InviteToGroupAction
+            // accepts. A literal rather than MAX_RAID_SIZE because that symbol
+            // is not otherwise used in this module and cannot be compile-
+            // checked in this environment.
+            if (!Qualified::parseNumberString(value, parsedSize) || parsedSize < 1 || parsedSize > 40)
+            {
+                messages.push_back("Unsupported group size '" + value + "'");
+                return messages;
+            }
+
+            groupSize = uint8(parsedSize);
+        }
         else
             passThroughParam += key + "=" + value + " ";
     }
@@ -2116,6 +2159,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     uint32 maxTries = 10*groupSize;
 
     uint32 botsCreated = 0;
+    // The role budget is no longer spent on a failed create, so it can no longer
+    // end the loop when every create fails. Bound the failures separately, at the
+    // same order as the budget that used to do it, instead of letting a repeatable
+    // failure run all 10*groupSize attempts and echo 10*groupSize error lines.
+    uint32 failures = 0;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     std::map<uint8, uint32> classesCreated;
 
@@ -2158,23 +2206,22 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
         paramStr << "level=" << masterLevel << " class=" << ChatHelper::formatClass(cls) << " group=" << master->GetName() << " " << passThroughParam; //Passthrough will override.
 
         auto result = HandleCreate(master, paramStr.str(), security);
+        bool const created = !result.empty() && result.front().find("Bot created:") != std::string::npos;
         messages.splice(messages.end(), result);
 
-        if (!messages.empty())
+        if (created)
         {
-            auto lastMsg = messages.front();
-            if (lastMsg.find("Bot created:") != std::string::npos)
-            {
-                classesCreated[cls]++;
-                botsCreated++;
-                currentGroupSize++;
-            }
+            classesCreated[cls]++;
+            botsCreated++;
+            currentGroupSize++;
+
+            allowedClassNr[0][role]--;
+
+            if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
+                allowedClassNr[cls][role]--;
         }
-    
-        allowedClassNr[0][role]--; 
-        
-        if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
-            allowedClassNr[cls][role]--;
+        else if (++failures >= groupSize)
+            break;
     }
 
     std::ostringstream debugInfo;
@@ -2466,10 +2513,11 @@ std::string PlayerbotHolder::HandleBotDelete(Player* bot, Player* master, const 
     ObjectGuid guid;
     if (!bot)
     {
-        if (!Qualified::isValidNumberString(param))
-            return "Add: Error parsing " + param;
+        uint64 rawGuid = 0;
+        if (!Qualified::parseUInt64String(param, rawGuid))
+            return "Delete: Error parsing " + param;
 
-        guid = ObjectGuid(uint64(std::stoull(param)));
+        guid = ObjectGuid(rawGuid);
     }
     else
     {

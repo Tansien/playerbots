@@ -55,29 +55,36 @@ bool ChangeTalentsAction::Execute(Event& event)
             if (botSpec.CheckTalentLink(param, &out))
             {
                 TalentSpec newSpec(bot, param);
+                bool const linkComplete = newSpec.unreadLinkChars == 0;
+                if (newSpec.unreadLinkChars > 0)
+                {
+                    out << "talent link is invalid. " << newSpec.unreadLinkChars
+                        << " character(s) could not be read; check the tree separators.";
+                }
                 std::string specLink = newSpec.GetTalentLink();
 
-                if (crop)
+                if (linkComplete && crop)
                 {
                     newSpec.CropTalents(bot);
                     out << "becomes: " << newSpec.GetTalentLink();
                 }
 
-                if (shift)
+                if (linkComplete && shift)
                 {
                     TalentSpec botSpec(bot);
                     newSpec.ShiftTalents(&botSpec, bot);
                     out << "becomes: " << newSpec.GetTalentLink();
                 }
 
-                if (newSpec.CheckTalents(bot, &out))
+                if (linkComplete && newSpec.CheckTalents(bot, &out))
                 {
                     newSpec.ApplyTalents(bot, &out);
                     sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", 0);
                     sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 1, specLink);
                 }
 
-                ai->UpdateTalentSpec();
+                if (linkComplete)
+                    ai->UpdateTalentSpec();
             }
             else
             {
@@ -262,9 +269,34 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
     }
 
     uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
-    uint32 specId = specNo ? specNo - 1 : 0;
+    int32 specId = specNo ? int32(specNo) - 1 : -1;
     std::string specLink = sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink");
     uint8 cls = bot->getClass();
+
+    // A persisted specNo can outlive the configuration that produced it: a
+    // trimmed aiplayerbot.conf, a link newly rejected by CheckTalents, or a
+    // reload that renumbers the paths.
+    //
+    // The id must be compared explicitly. getPremadePath falls back to the
+    // FIRST configured path when the id is absent and only returns nullptr
+    // when the class has no paths at all, so a null check alone catches only
+    // the rare empty-class case. In the common one - a single path removed,
+    // the rest still present - it silently hands back path 0, the wrong build
+    // is applied, and specId + 1 re-persists the stale id at the end of this
+    // function, so the mismatch survives every later pass.
+    //
+    // When the class has no paths at all, GetBestPremadeSpec instead falls
+    // back to baseSpec, every class talent at rank zero, and applying that
+    // strips every talent the bot has learned. The name lookup below would
+    // have dereferenced the same nullptr.
+    TalentPath* currentPath = specNo > 0 ? getPremadePath(cls, specId) : nullptr;
+    if (specNo > 0 && (!currentPath || currentPath->id != specId || currentPath->talentSpec.empty()))
+    {
+        *out << "Stored spec is no longer configured; selecting a new one. ";
+        specNo = 0;
+        specId = -1;
+        currentPath = nullptr;
+    }
 
     //Continue the current spec
     if (specNo > 0)
@@ -276,7 +308,7 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
             bot->GetPlayerbotAI()->UpdateTalentSpec();
         if (newSpec.GetTalentPoints() > 0)
         {
-            *out << "Upgrading spec " << "|h|cffffffff" << getPremadePath(bot->getClass(), specId)->name << " (" << newSpec.formatSpec(cls) << ")";
+            *out << "Upgrading spec " << "|h|cffffffff" << currentPath->name << " (" << newSpec.formatSpec(cls) << ")";
         }
     }
     else if (!specLink.empty())
@@ -383,16 +415,27 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
 //Returns a pre-made talent spec that best suits the bots current talents. 
 TalentSpec* ChangeTalentsAction::GetBestPremadeSpec(Player* bot, int specId)
 {
+    // getPremadePath returns nullptr when the class has no premade paths
+    // configured at all, and every caller dereferences what we return, so the
+    // fallback below has to stay reachable and has to be safe.
     TalentPath* path = getPremadePath(bot->getClass(), specId);
-    for (auto& spec : path->talentSpec)
+    if (path)
     {
-        if (spec.points >= bot->CalculateTalentsPoints())
-            return &spec;
-    }
-    if (path->talentSpec.size())
-        return &path->talentSpec.back();
+        for (auto& spec : path->talentSpec)
+        {
+            if (spec.points >= bot->CalculateTalentsPoints())
+                return &spec;
+        }
 
-    return &sPlayerbotAIConfig.classSpecs[bot->getClassMask()].baseSpec;
+        if (path->talentSpec.size())
+            return &path->talentSpec.back();
+    }
+
+    // classSpecs is 'ClassSpecs classSpecs[MAX_CLASSES]', indexed by class id.
+    // getClassMask() is a bitmask - 1 << (class - 1), so up to 1024 - and using
+    // it here read far past the end of the array for every class above the
+    // fourth.
+    return &sPlayerbotAIConfig.classSpecs[bot->getClass()].baseSpec;
 }
 
 bool AutoSetTalentsAction::Execute(Event& event)

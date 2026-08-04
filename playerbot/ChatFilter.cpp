@@ -1110,7 +1110,11 @@ public:
         if (message.find("@random=") == 0)
         {
             std::string num = message.substr(message.find("=") + 1, message.find(" ") - message.find("=")-1);            
-            if (urand(0, 100) < stoul(num))
+            int32 chance = 0;
+            if (!Qualified::parseNumberString(num, chance) || chance < 0 || chance > 100)
+                return message;
+
+            if (urand(0, 100) < uint32(chance))
                 return ChatFilter::Filter(message);
 
             return message;
@@ -1123,7 +1127,11 @@ public:
         if (message.find("@fixedrandom=") == 0)
         {
             std::string num = message.substr(message.find("=") + 1, message.find(" ") - message.find("=") - 1);
-            if (ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER) < stoul(num))
+            int32 fixedChance = 0;
+            if (!Qualified::parseNumberString(num, fixedChance) || fixedChance < 0 || fixedChance > 100)
+                return message;
+
+            if (ai->GetFixedBotNumber(BotTypeNumber::CHATFILTER_NUMBER) < uint32(fixedChance))
                 return ChatFilter::Filter(message);
 
             return message;
@@ -1186,15 +1194,22 @@ public:
 
             std::set<uint32> questIds = ChatHelper::ExtractAllQuestIds(questString);
 
-            if (questIds.empty() && Qualified::isValidNumberString(questString))
-                questIds.insert(stoi(questString));
+            int32 parsedQuestId = 0;
+            if (questIds.empty() && Qualified::parseNumberString(questString, parsedQuestId) && parsedQuestId > 0)
+                questIds.insert(uint32(parsedQuestId));
             else
             {
                 for (auto& questId : questIds)
                 {
                     Quest const* questTemplate = sObjectMgr.GetQuestTemplate(questId);
-                    if (questTemplate)
-                        replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
+
+                    // BOTH replacements need the template. The second sat
+                    // outside the guard, so an in-range id with no quest row
+                    // reached formatQuest(nullptr), which dereferences it.
+                    if (!questTemplate)
+                        continue;
+
+                    replaceCaseInsensitive(message, " " + ChatHelper::formatQuest(questTemplate), "");
                     replaceCaseInsensitive(message, ChatHelper::formatQuest(questTemplate), "");
                 }
             }

@@ -27,6 +27,16 @@ class TalentSpec {
         };
 
         uint32 points = 0;
+
+        // Number of trailing characters of the last parsed talent link that
+        // ReadTalents could not consume. ReadTalents only moves on to the next
+        // talent tree when it sees a '-' separator, so a segment with more
+        // digits than the tree has talents leaves the parser stuck on that tree
+        // and the rest of the link - including the whole of the following trees
+        // - is dropped. Anything counted here was silently discarded; see
+        // PlayerbotAIConfig::LoadTalentSpecs, which reports it.
+        uint32 unreadLinkChars = 0;
+
         std::vector<TalentListEntry> talents;
 
         TalentSpec() {};

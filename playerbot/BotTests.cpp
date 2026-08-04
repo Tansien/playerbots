@@ -954,10 +954,11 @@ void LogAnalysis::AnalysePid()
         if (tokens[0][0] == '.')
             tokens[0] = "0" + tokens[0];
 
-        if (!Qualified::isValidNumberString(tokens[0]))
+        int32 parsedRunTime = 0;
+        if (!Qualified::parseNumberString(tokens[0], parsedRunTime))
             continue;
 
-        runTime = stoi(tokens[0]);
+        runTime = parsedRunTime;
 
         if ((uint32)stoi(tokens[7]) > maxBots)
         {

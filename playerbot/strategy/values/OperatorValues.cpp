@@ -52,13 +52,15 @@ namespace ai
 
         uint32 value1, value2;
 
-        if (isValidNumberString(values[0]))
-            value1 = stoi(values[0]);
+        int32 parsed = 0;
+
+        if (parseNumberString(values[0], parsed))
+            value1 = uint32(parsed);
         else
             value1 = AI_VALUE(uint32, values[0]);
 
-        if (isValidNumberString(values[1]))
-            value2 = stoi(values[1]);
+        if (parseNumberString(values[1], parsed))
+            value2 = uint32(parsed);
         else
             value2 = AI_VALUE(uint32, values[1]);
 

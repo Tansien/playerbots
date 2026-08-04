@@ -14,8 +14,10 @@ using namespace ai;
 
 inline std::string GetTravelPurposeName(std::string purpose)
 {
-    if (Qualified::isValidNumberString(purpose) && TravelDestinationPurposeName.find(TravelDestinationPurpose(stoi(purpose))) != TravelDestinationPurposeName.end())
-        return TravelDestinationPurposeName.at(TravelDestinationPurpose(stoi(purpose)));
+    int32 parsedPurpose = 0;
+    if (Qualified::parseNumberString(purpose, parsedPurpose)
+        && TravelDestinationPurposeName.find(TravelDestinationPurpose(parsedPurpose)) != TravelDestinationPurposeName.end())
+        return TravelDestinationPurposeName.at(TravelDestinationPurpose(parsedPurpose));
 
     if (purpose.empty())
         return "quest";
@@ -1480,15 +1482,19 @@ bool FocusTravelTargetAction::Execute(Event& event)
 
     if (questIds.empty() && !text.empty())
     {
-        if (Qualified::isValidNumberString(text))
-            questIds.insert(stoi(text));
+        int32 parsedQuestId = 0;
+        if (Qualified::parseNumberString(text, parsedQuestId) && parsedQuestId > 0)
+            questIds.insert(uint32(parsedQuestId));
         else
         {
             std::vector<std::string> qualifiers = Qualified::getMultiQualifiers(text, ",");
 
+            // This inserted stoi(text) rather than the qualifier it had just
+            // validated, so a comma-separated list inserted the whole string
+            // once per element instead of each id in it.
             for (auto& qualifier : qualifiers)
-                if (Qualified::isValidNumberString(qualifier))
-                    questIds.insert(stoi(text));
+                if (Qualified::parseNumberString(qualifier, parsedQuestId) && parsedQuestId > 0)
+                    questIds.insert(uint32(parsedQuestId));
         }
     }
 
