@@ -14,7 +14,7 @@ This repository is the Playerbots module for CMaNGOS Classic, TBC, and WotLK. Ex
 
 Classic behavior is the first acceptance target, but all three expansion builds must remain green. Put expansion-specific identifiers and behavior behind `MANGOSBOT_ZERO`, `MANGOSBOT_ONE`, or `MANGOSBOT_TWO` at the narrowest boundary.
 
-Living Realm is opt-in and off by default (`AiPlayerbot.LivingRealm.Enabled = 0`); no Living Realm schema or runtime path may be required when it is disabled. Do not turn a proposed design into runtime behavior outside the requested implementation scope.
+Living Realm is always on in this fork: there is no enable/disable flag and no legacy-only mode to preserve. Do not turn a proposed design into runtime behavior outside the requested implementation scope.
 
 ## Architectural direction
 

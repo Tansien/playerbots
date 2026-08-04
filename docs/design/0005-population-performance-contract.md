@@ -129,4 +129,4 @@ Classic/TBC/WotLK compilation.
 - overload reduces work in the specified order without unsafe logout or
   fabricated progression;
 - foreground/background labels match observed current-core behavior; and
-- disabled Living Realm and 0.1-without-Director behavior remain unchanged.
+- 0.1-without-Director behavior remains unchanged.

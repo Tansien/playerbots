@@ -83,10 +83,8 @@ prohibited in 0.1 because they cannot be reconciled as one bounded action.
 
 On startup, Organic mode validates all relevant keys and emits an
 effective-policy report containing configured value, effective value,
-classification, enforcement point, and reason. Strict mode blocks startup on
-every conflict. Non-strict mode may apply a documented runtime override only
-when the result remains fail closed. The operator file is never silently
-rewritten.
+classification, enforcement point, and reason. Startup blocks on every
+conflict. The operator file is never silently rewritten.
 
 Mandatory 0.1 outcomes include:
 
@@ -129,7 +127,6 @@ future adoption mode requires its own proof and migration design.
 | Unsupported route/action postcondition | Block/invalidate goal; do not improvise |
 | Worker/queue unavailable | Defer or safe idle; no fabrication |
 | Managed reset partially complete | Resume/repair managed operation or block; never use raw legacy reset |
-| Operator asks to return to legacy | Require explicit config change and clean restart |
 
 ## 5. Telemetry
 
@@ -148,8 +145,8 @@ table. No policy or lifecycle decision depends solely on a log event.
 Required tests:
 
 - one policy test for every row in 0002A;
-- startup reports for valid, overridden, conflicting, unknown, missing-schema,
-  disabled, mixed-population, and `AsyncBotLogin=false` configurations;
+- startup reports for valid, conflicting, unknown, missing-schema,
+  mixed-population, and `AsyncBotLogin=false` configurations;
 - fresh-provenance bootstrap/reset/delete/recreate tests;
 - attempts through config, runtime, console, hotfix, quest sync, world buff,
   enchant, transport, revive, cheat, and recovery paths;

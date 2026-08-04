@@ -72,8 +72,7 @@ fabrication.
    by the world thread.
 4. Organic safety is enforced by a central policy boundary, not only a config
    combination.
-5. Organic mode fails closed and MUST NOT fall back to legacy behavior. Returning
-   to legacy behavior requires an explicit config change and clean restart.
+5. Organic mode fails closed and MUST NOT fall back to legacy behavior.
 6. Database writes and world mutations do not claim cross-domain atomicity or
    exactly-once execution.
 7. A synthetic world mutation MUST NOT run until its `REQUESTED` record is
@@ -83,12 +82,10 @@ fabrication.
    remain on the world thread.
 9. Goals, commitments, safety, operator intent, and future encounter behavior
    compose through owned layers; no owner removes behavior required by another.
-10. With `AiPlayerbot.LivingRealm.Enabled = 0`, no Living Realm schema, login
-    predicate, policy override, overlay, or runtime mutation is required.
-11. Player-owned alternate bots are excluded unless separately enabled.
-12. LLM output is never authoritative for movement, combat, spending, inventory,
+10. Player-owned alternate bots are excluded unless separately enabled.
+11. LLM output is never authoritative for movement, combat, spending, inventory,
     quests, groups, or progression.
-13. Test-only fixture bots are not Organic characters and cannot enter the
+12. Test-only fixture bots are not Organic characters and cannot enter the
     production population, economy, provenance, or fairness accounting.
 
 ## 4. Sources of truth

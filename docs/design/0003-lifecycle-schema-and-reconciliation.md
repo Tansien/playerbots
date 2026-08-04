@@ -166,9 +166,6 @@ Startup accepts exactly the supported clean version. `APPLYING`, `FAILED`,
 missing, or newer unsupported versions block managed startup. Roll-forward is
 the default recovery; destructive automatic rollback is not provided.
 
-When Living Realm is disabled, missing tables are acceptable and no Living Realm
-queries are issued. Enabling requires clean schema.
-
 ## A.4 Deterministic startup matrix
 
 | Persisted desire/state | Actual observation | Commitment/window | Result |
