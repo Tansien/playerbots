@@ -2654,8 +2654,15 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                 for (GroupReference* gref = bot->GetGroup()->GetFirstMember(); gref; gref = gref->next())
                 {
                     Player* member = gref->getSource();
-                    PlayerbotAI* ai = bot->GetPlayerbotAI();
-                    if (ai && bot != member)
+                    // This tested the TELEPORTING bot's own AI, which is never
+                    // null, and then mutated the member: a real player grouped
+                    // with a bot had their homebind rewritten and was teleported,
+                    // and only afterwards did the Reset below dereference their
+                    // null AI. Test the member's own AI, before any mutation -
+                    // and a non-null AI is not enough, because a connected human
+                    // running self-bot AI has one too.
+                    PlayerbotAI* memberAi = member ? member->GetPlayerbotAI() : nullptr;
+                    if (memberAi && !memberAi->IsRealPlayer() && bot != member)
                     {
                         if (member->IsTaxiFlying())
                             member->GetMotionMaster()->MovementExpired();
@@ -2665,7 +2672,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                         member->GetMotionMaster()->Clear();
                         member->TeleportTo(loc.mapid, x, y, z, 0);
                         member->SendHeartBeat();
-                        member->GetPlayerbotAI()->Reset(true);
+                        memberAi->Reset(true);
                     }
 
                 }
@@ -2987,7 +2994,6 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
         return;
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleport");
-    std::vector<WorldLocation> locs;
 
     std::list<Unit*> targets;
     float range = sPlayerbotAIConfig.randomBotTeleportDistance;
@@ -2995,25 +3001,15 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
     MaNGOS::UnitListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(targets, u_check);
     Cell::VisitAllObjects(bot, searcher, range);
 
-    if (!targets.empty())
-    {
-        for (std::list<Unit *>::iterator i = targets.begin(); i != targets.end(); ++i)
-        {
-            Unit* unit = *i;
-            bot->SetPosition(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), 0);
-            FleeManager manager(bot, sPlayerbotAIConfig.sightDistance, 0, true);
-            float rx, ry, rz;
-            if (manager.CalculateDestination(&rx, &ry, &rz))
-            {
-                WorldLocation loc(bot->GetMapId(), rx, ry, rz);
-                locs.push_back(loc);
-            }
-        }
-    }
-    else
-    {
+    // With units nearby, this used to walk them and SetPosition() the LIVE player
+    // onto each one in turn, purely to seed a FleeManager whose destinations were
+    // pushed into a vector that was then dropped. The loop relocated nothing on
+    // purpose and everything by accident: the bot was left standing wherever the
+    // last unit happened to be - a raw move with no teleport packet - and the
+    // Refresh() below can resurrect it there. The dead calculation goes with the
+    // move. The branch stays: the empty case still falls back to a level teleport.
+    if (targets.empty())
         RandomTeleportForLevel(bot, true);
-    }
 
     pmo.reset();
 
