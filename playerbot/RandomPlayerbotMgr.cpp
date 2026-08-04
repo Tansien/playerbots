@@ -4516,7 +4516,9 @@ static bool ParseFloatToken(const std::string& str, float& result)
 std::list<std::string> RandomPlayerbotMgr::HandleConsolePid(std::string param)
 {
     std::list<std::string> messages;
-    std::string pids = param.substr(4);
+    // substr throws std::out_of_range once pos exceeds size, so this threw before
+    // reaching any of the parsing below: 'pid 0.5' leaves a two-character param.
+    std::string pids = param.size() >= 4 ? param.substr(4) : "";
     std::vector<std::string> pid = Qualified::getMultiQualifiers(pids, " ");
 
     if (pid.size() == 0)
