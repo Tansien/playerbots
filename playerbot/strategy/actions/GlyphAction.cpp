@@ -38,7 +38,11 @@ bool GlyphAction::Execute(Event& event)
             if (AvailableGlyphsValue::GetGlyphSlotTypeFromSlot(glyphSlot, bot->GetLevel()) != GlyphSlotType::LOCKED_SLOT)
                 glyphsSlots.push_back(glyphSlot);
     }
-    else if (param.find("remove") == 0)
+    // Exact grammar: "remove" or "remove <slot>...". A bare prefix match meant
+    // any word starting with "remove" entered this branch, and anything seven
+    // characters or shorter then took the remove-all path below - so a mistyped
+    // "glyph removed" silently wiped every equiped glyph.
+    else if (param == "remove" || param.compare(0, 7, "remove ") == 0)
     {
         std::vector<uint32> equipedGlyphs = AI_VALUE(std::vector<uint32>, "equiped glyphs");
 
