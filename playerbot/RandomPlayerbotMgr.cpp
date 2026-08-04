@@ -2658,9 +2658,11 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                     // null, and then mutated the member: a real player grouped
                     // with a bot had their homebind rewritten and was teleported,
                     // and only afterwards did the Reset below dereference their
-                    // null AI. Test the member's own AI, before any mutation.
+                    // null AI. Test the member's own AI, before any mutation -
+                    // and a non-null AI is not enough, because a connected human
+                    // running self-bot AI has one too.
                     PlayerbotAI* memberAi = member ? member->GetPlayerbotAI() : nullptr;
-                    if (memberAi && bot != member)
+                    if (memberAi && !memberAi->IsRealPlayer() && bot != member)
                     {
                         if (member->IsTaxiFlying())
                             member->GetMotionMaster()->MovementExpired();
