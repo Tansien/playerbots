@@ -344,6 +344,10 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     // race/gender rather than something to substitute a default for.
     if (faces.empty() || hairs.empty())
     {
+        // Put the name back. It was drawn above and would otherwise be lost for
+        // the lifetime of the process, draining the pool towards exhaustion on a
+        // tuple that can never be created. nameMutex is still held here.
+        it->second.push_back(name);
         sLog.outError("Unable to create random bot for account %d - no appearance data for race %u gender %u",
             accountId, race, gender);
         return false;
