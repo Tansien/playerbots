@@ -299,7 +299,7 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     if (name.empty())
         return false;
 
-    std::vector<uint8> skinColors, facialHairTypes;
+    std::vector<uint8> facialHairTypes;
     std::vector<std::pair<uint8,uint8>> faces, hairs;
     for (CharSectionsMap::const_iterator itr = sCharSectionMap.begin(); itr != sCharSectionMap.end(); ++itr)
     {
@@ -310,9 +310,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 #ifndef MANGOSBOT_TWO
         switch (entry->BaseSection)
         {
-        case SECTION_TYPE_SKIN:
-            skinColors.push_back(entry->ColorIndex);
-            break;
         case SECTION_TYPE_FACE:
             faces.push_back(std::pair<uint8,uint8>(entry->VariationIndex, entry->ColorIndex));
             break;
@@ -326,9 +323,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 #else
         switch (entry->BaseSection)
         {
-        case SECTION_TYPE_SKIN:
-            skinColors.push_back(entry->Color);
-            break;
         case SECTION_TYPE_FACE:
             faces.push_back(std::pair<uint8, uint8>(entry->VariationIndex, entry->Color));
             break;
@@ -342,17 +336,35 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 #endif
     }
 
-    uint8 skinColor = skinColors[urand(0, skinColors.size() - 1)];
+    // A race/gender with no CharSections rows for this build leaves these empty,
+    // and size() - 1 on an empty vector is SIZE_MAX: urand then returned a
+    // multi-billion index and the read went out of bounds. This is the crash the
+    // removed TODO recorded. Both halves of each pair are passed to
+    // Player::Create below, so an empty vector here is a genuinely unusable
+    // race/gender rather than something to substitute a default for.
+    if (faces.empty() || hairs.empty())
+    {
+        // Put the name back. It was drawn above and would otherwise be lost for
+        // the lifetime of the process, draining the pool towards exhaustion on a
+        // tuple that can never be created. nameMutex is still held here.
+        it->second.push_back(name);
+        sLog.outError("Unable to create random bot for account %d - no appearance data for race %u gender %u",
+            accountId, race, gender);
+        return false;
+    }
+
     std::pair<uint8,uint8> face = faces[urand(0, faces.size() - 1)];
     std::pair<uint8,uint8> hair = hairs[urand(0, hairs.size() - 1)];
 
 	bool excludeCheck = (race == RACE_TAUREN) || (gender == GENDER_FEMALE && race != RACE_NIGHTELF && race != RACE_UNDEAD);
 #ifndef MANGOSBOT_TWO
-	uint8 facialHair = excludeCheck ? 0 : facialHairTypes[urand(0, facialHairTypes.size() - 1)];
+	// excludeCheck only names the races that must NOT have facial hair; it does
+	// not imply the vector is populated, so the emptiness test is still needed.
+	uint8 facialHair = (excludeCheck || facialHairTypes.empty())
+		? 0 : facialHairTypes[urand(0, facialHairTypes.size() - 1)];
 #else
 	uint8 facialHair = 0;
 #endif
-	//TODO vector crash on cmangos TWO when creating one of the first bot characters, need a fix
 
 	WorldSession* session = new WorldSession(accountId, NULL, SEC_PLAYER,
 
