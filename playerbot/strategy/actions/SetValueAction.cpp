@@ -107,8 +107,10 @@ bool SetValueAction::Execute(Event& event)
             ai->TellPlayer(requester, "Prefered guild size reset to random:", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             value = std::to_string((uint8)ai->GetGuilderType());
         }
+        else
+            value = std::to_string(type);
 
-        ai->TellPlayer(requester, "Prefered guild size set to " + std::to_string(type), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester, "Prefered guild size set to " + value, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return true;
     }
     else if (param.find("rpg style ") == 0)
@@ -134,8 +136,10 @@ bool SetValueAction::Execute(Event& event)
             ai->TellPlayer(requester, "Prefered rpg style reset to random:", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             value = std::to_string((uint8)ai->GetFixedBotNumber(BotTypeNumber::RPG_STYLE_NUMBER, 100));
         }
+        else
+            value = std::to_string(style);
 
-        ai->TellPlayer(requester, "Prefered rpg style set to " + std::to_string(style), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester, "Prefered rpg style set to " + value, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return true;
     }
 

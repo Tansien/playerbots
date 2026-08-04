@@ -2157,6 +2157,11 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
     uint32 maxTries = 10*groupSize;
 
     uint32 botsCreated = 0;
+    // The role budget is no longer spent on a failed create, so it can no longer
+    // end the loop when every create fails. Bound the failures separately, at the
+    // same order as the budget that used to do it, instead of letting a repeatable
+    // failure run all 10*groupSize attempts and echo 10*groupSize error lines.
+    uint32 failures = 0;
     uint32 continue_role = 0, continue_race = 0, continue_class = 0;
     std::map<uint8, uint32> classesCreated;
 
@@ -2213,6 +2218,8 @@ std::list<std::string> PlayerbotHolder::HandleGroup(Player* master, const std::s
             if (allowedClassNr[cls].find(role) != allowedClassNr[cls].end())
                 allowedClassNr[cls][role]--;
         }
+        else if (++failures >= groupSize)
+            break;
     }
 
     std::ostringstream debugInfo;
