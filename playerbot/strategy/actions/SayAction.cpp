@@ -904,7 +904,10 @@ bool ChatReplyAction::HandleLFGQuestsReply(Player* bot, ChatChannelSource chatCh
     std::set<uint32> matchingQuestIds;
     for (auto botQuestId : botQuestIds)
     {
-        if (messageQuestIds.count(botQuestId) != 0)
+        // Only ids that still resolve: the reply below formats every match, so a
+        // set holding nothing formattable would answer with an empty quest list
+        // and still consume the message.
+        if (messageQuestIds.count(botQuestId) != 0 && sObjectMgr.GetQuestTemplate(botQuestId))
         {
             matchingQuestIds.insert(botQuestId);
         }
@@ -925,9 +928,8 @@ bool ChatReplyAction::HandleLFGQuestsReply(Player* bot, ChatChannelSource chatCh
         placeholders["%quest_links"] = "";
         for (auto matchingQuestId : matchingQuestIds)
         {
-            // An id matched here can still have no template to format.
-            if (Quest const* quest = sObjectMgr.GetQuestTemplate(matchingQuestId))
-                placeholders["%quest_links"] += bot->GetPlayerbotAI()->GetChatHelper()->formatQuest(quest);
+            Quest const* quest = sObjectMgr.GetQuestTemplate(matchingQuestId);
+            placeholders["%quest_links"] += bot->GetPlayerbotAI()->GetChatHelper()->formatQuest(quest);
         }
 
         switch (chatChannelSource)
