@@ -16,6 +16,74 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
 
+# ---- Living Realm host-side tests ----
+# The Living Realm host tests (docs/design/0001-living-realm-implementation-contract.md
+# A.4) compile against standard C++ only, with no CMaNGOS core, and build in a
+# STANDALONE configuration of this directory:
+#     cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -B build -S <this directory>
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+  # 3.26 is what the documented standalone gate needs at run time: ctest
+  # --test-dir (3.20) and --no-tests=error (3.26). Under a core build this
+  # branch is dead and the core's own minimum governs.
+  cmake_minimum_required(VERSION 3.26)
+  project(PlayerbotsLivingTests CXX)
+  set(PLAYERBOTS_STANDALONE ON)
+else()
+  set(PLAYERBOTS_STANDALONE OFF)
+endif()
+
+option(BUILD_PLAYERBOTS_LIVING_TESTS "Build the standalone host-side playerbots_living_tests CTest executable" OFF)
+
+if(PLAYERBOTS_STANDALONE AND NOT BUILD_PLAYERBOTS_LIVING_TESTS)
+  message(FATAL_ERROR "Standalone configuration builds only the Living Realm host tests: "
+    "pass -DBUILD_PLAYERBOTS_LIVING_TESTS=ON, or configure through a CMaNGOS core with -DBUILD_PLAYERBOTS=ON.")
+endif()
+
+if(BUILD_PLAYERBOTS_LIVING_TESTS AND NOT PLAYERBOTS_STANDALONE)
+  # No pinned core calls enable_testing() at its top level, so a test registered
+  # from this subdirectory would build but be invisible to ctest at the core
+  # build root: "No tests were found!!!" still exits 0, a silently green mode.
+  # Host tests therefore only build standalone.
+  message(FATAL_ERROR "BUILD_PLAYERBOTS_LIVING_TESTS builds the host tests standalone: "
+    "configure this directory directly, e.g. cmake -DBUILD_PLAYERBOTS_LIVING_TESTS=ON -B build -S <module directory>.")
+endif()
+
+# Pure Living Realm production sources: standard C++ only, independent of
+# CMaNGOS headers and live game objects. This single list feeds BOTH the module
+# library below and the standalone host-test executable; every new non-test
+# playerbot/living/ source directory must append its explicit glob here
+# (AGENTS.md). Empty until the first such directory lands.
+set(PLAYERBOTS_LIVING_SRCS)
+
+if(BUILD_PLAYERBOTS_LIVING_TESTS)
+  enable_testing()
+
+  file(GLOB Playerbot_Living_Tests ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/tests/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/tests/*.h)
+
+  add_executable(playerbots_living_tests ${PLAYERBOTS_LIVING_SRCS} ${Playerbot_Living_Tests})
+  set_target_properties(playerbots_living_tests PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  # Tests include living headers the same way the module does, rooted at the
+  # repository directory (e.g. "playerbot/living/policy/...").
+  target_include_directories(playerbots_living_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_test(NAME playerbots_living_tests COMMAND playerbots_living_tests)
+
+  # End-to-end proof that a failing test turns the run red: the runner injects
+  # one deliberately failing test, and the wrapper script requires exit code
+  # exactly 1 plus the reported and counted failure in the output. (WILL_FAIL
+  # would accept ANY non-zero exit -- a usage error or a sanitizer abort would
+  # satisfy it without exercising failure accounting at all.)
+  add_test(NAME playerbots_living_tests_detect_failure
+    COMMAND ${CMAKE_COMMAND}
+      -DRUNNER=$<TARGET_FILE:playerbots_living_tests>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/tests/VerifyFailureDetection.cmake)
+endif()
+
+if(PLAYERBOTS_STANDALONE)
+  return()
+endif()
+# ---- end Living Realm host-side tests ----
+
 set(LIBRARY_NAME playerbots)
 
 #Add PCH Files
@@ -117,6 +185,13 @@ file(GLOB Playerbot_DeathKnight ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/strategy/d
 file(GLOB Playerbot_Tests ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/strategy/tests/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/strategy/tests/*.h)
     source_group("Player Bot\\Strategies\\Tests" FILES ${Playerbot_Tests})
     LIST(APPEND LIBRARY_SRCS ${Playerbot_Tests})
+
+#Living Realm pure sources (shared with the standalone host-test target above;
+#the host-test-only sources under playerbot/living/tests/ stay out of the module)
+if(PLAYERBOTS_LIVING_SRCS)
+    source_group("Player Bot\\Living" FILES ${PLAYERBOTS_LIVING_SRCS})
+    LIST(APPEND LIBRARY_SRCS ${PLAYERBOTS_LIVING_SRCS})
+endif()
 
 # Define ENABLE_PLAYERBOTS if need
 if (BUILD_PLAYERBOTS)

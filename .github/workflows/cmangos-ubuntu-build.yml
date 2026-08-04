@@ -23,9 +23,8 @@ name: Ubuntu Build
 #   arguments to function call, expected at least 6, have 5". Bump the pins
 #   deliberately, in their own commit, so upstream drift is never mistaken for a
 #   regression in a pull request.
-# - The Living Realm host-test job belongs with the living/ sources and the
-#   BUILD_PLAYERBOTS_LIVING_TESTS option, which do not exist on master yet; it is
-#   added by the change that introduces them, not here.
+# - The living-tests job builds and runs the host-side playerbots_living_tests
+#   suite standalone (no core checkout): a release lane and an ASan/UBSan lane.
 # - No Discord (or any other) notification steps.
 # - Build state: each job configures and builds under RUNNER_TEMP, which the runner
 #   recreates per job, so no CMake cache or artifact survives between runs.
@@ -59,6 +58,71 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  living-tests:
+    name: Living Realm host tests (${{ matrix.lane }})
+    # Same trust boundary as the build job below: fork PRs must never reach the
+    # persistent self-hosted runners.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, playerbots]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: release
+            build_type: Release
+            cxx_flags: ""
+            link_flags: ""
+          - lane: asan-ubsan
+            # -fno-sanitize-recover=all makes any UBSan finding fail the run
+            # instead of printing and continuing. The suite is pure computation,
+            # so the sanitizer cost is seconds.
+            build_type: Debug
+            cxx_flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+            link_flags: "-fsanitize=address,undefined"
+
+    steps:
+      - name: Runner preflight (require Ubuntu 26.04)
+        run: |
+          if [ ! -r /etc/os-release ]; then
+            echo "::error::/etc/os-release not readable; this workflow only supports Ubuntu Linux runners"
+            exit 1
+          fi
+          . /etc/os-release
+          if [ "${ID}" != "ubuntu" ] || [ "${VERSION_ID}" != "26.04" ]; then
+            echo "::error::Self-hosted runner must be Ubuntu 26.04, got: ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
+            exit 1
+          fi
+          echo "Runner OS: ${PRETTY_NAME}"
+
+      - name: Checkout playerbots
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Configure
+        # The sanitizer flag values contain spaces, so each is quoted here from
+        # its own matrix key; interpolating one combined argument string would
+        # word-split inside -DCMAKE_CXX_FLAGS and break the cmake command line.
+        run: >
+          cmake
+          -DBUILD_PLAYERBOTS_LIVING_TESTS=ON
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link_flags }}"
+          -B "$RUNNER_TEMP/build-living-${{ matrix.lane }}"
+          -S .
+
+      - name: Build
+        run: cmake --build "$RUNNER_TEMP/build-living-${{ matrix.lane }}" -j "$(nproc)"
+
+      - name: Test
+        # --no-tests=error: ctest exits 0 when no tests are registered, so a
+        # suite that silently stopped registering would otherwise show green.
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir "$RUNNER_TEMP/build-living-${{ matrix.lane }}" --output-on-failure --no-tests=error
+
   build:
     # Named from matrix.version only: an include-only matrix otherwise names jobs
     # from EVERY key, rendering as "Build (classic, de8f7299...)", so each core-ref
