@@ -54,9 +54,15 @@ endif()
 # playerbot/living/ source directory must append its explicit glob here
 # (AGENTS.md).
 file(GLOB Playerbot_Living_Policy ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/policy/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/policy/*.h)
+file(GLOB Playerbot_Living_Events ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/events/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/events/*.h)
+file(GLOB Playerbot_Living_Snapshots ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/snapshots/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/snapshots/*.h)
+file(GLOB Playerbot_Living_Testing ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/testing/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/testing/*.h)
 
 set(PLAYERBOTS_LIVING_SRCS
     ${Playerbot_Living_Policy}
+    ${Playerbot_Living_Events}
+    ${Playerbot_Living_Snapshots}
+    ${Playerbot_Living_Testing}
 )
 
 if(BUILD_PLAYERBOTS_LIVING_TESTS)
