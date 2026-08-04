@@ -26,10 +26,19 @@ ItemQualifier::ItemQualifier(std::string qualifier, bool linkQualifier) : itemId
     if (numbers.empty())
         return;
 
-    if (!std::all_of(numbers[0].begin(), numbers[0].end(), ::isdigit))
+    // Inbound chat reaches this constructor through ChatFilter BEFORE the
+    // security check in PlayerbotAI::HandleCommand, and nothing on that path
+    // catches: every stoi below threw std::invalid_argument on a non-numeric
+    // field and std::out_of_range past INT_MAX. all_of(isdigit) did not help
+    // either - it is true for an EMPTY string, so a ":5" qualifier still
+    // reached stoi(""). Parse without throwing instead; an unparsable field
+    // keeps its zero-initialized value, which is what an absent field already
+    // produced.
+    int32 parsed = 0;
+    if (!Qualified::parseNumberString(numbers[0], parsed) || parsed < 0)
         return;
 
-    itemId = stoi(numbers[0]);
+    itemId = uint32(parsed);
 
 #ifdef MANGOSBOT_ZERO
     uint32 propertyPosition = linkQualifier ? 2 : 6;
@@ -37,25 +46,26 @@ ItemQualifier::ItemQualifier(std::string qualifier, bool linkQualifier) : itemId
     uint32 propertyPosition = linkQualifier ? 6 : 6;
 #endif
 
-    if (numbers.size() > 1 && !numbers[1].empty())
-        enchantId = stoi(numbers[1]);
+    if (numbers.size() > 1 && Qualified::parseNumberString(numbers[1], parsed) && parsed >= 0)
+        enchantId = uint32(parsed);
 
-    if (numbers.size() > propertyPosition && !numbers[propertyPosition].empty())
-        randomPropertyId = stoi(numbers[propertyPosition]);
+    // Signed on purpose: a negative id denotes a random suffix.
+    if (numbers.size() > propertyPosition)
+        Qualified::parseNumberString(numbers[propertyPosition], randomPropertyId);
 
 #ifndef MANGOSBOT_ZERO
     uint8 gemPosition = linkQualifier ? 2 : 2;
 
     if (numbers.size() > gemPosition + 3)
     {
-        if (!numbers[gemPosition].empty())
-            gem1 = stoi(numbers[gemPosition]);
-        if (!numbers[gemPosition + 1].empty())
-            gem2 = stoi(numbers[gemPosition + 1]);
-        if (!numbers[gemPosition + 2].empty())
-            gem3 = stoi(numbers[gemPosition + 2]);
-        if (!numbers[gemPosition + 3].empty())
-            gem4 = stoi(numbers[gemPosition + 3]);
+        if (Qualified::parseNumberString(numbers[gemPosition], parsed) && parsed >= 0)
+            gem1 = uint32(parsed);
+        if (Qualified::parseNumberString(numbers[gemPosition + 1], parsed) && parsed >= 0)
+            gem2 = uint32(parsed);
+        if (Qualified::parseNumberString(numbers[gemPosition + 2], parsed) && parsed >= 0)
+            gem3 = uint32(parsed);
+        if (Qualified::parseNumberString(numbers[gemPosition + 3], parsed) && parsed >= 0)
+            gem4 = uint32(parsed);
     }
 #endif
 }
