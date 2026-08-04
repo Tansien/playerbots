@@ -269,12 +269,24 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     auto it = freeNames.find(raceAndGender);
     if (it == freeNames.end() || it->second.empty())
     {
-        // Try fallback: generate new name with suffix if all names exhausted
-        // First try other gender
-        std::string baseName = CreateRandomBotName(raceAndGender);
-        if (baseName.empty())
-            return false;
-        name = baseName;
+        // The rolled gender has no names left. Try the other one before giving up -
+        // the old code's comment promised exactly this ("First try other gender")
+        // but called CreateRandomBotName, which locks the same non-recursive
+        // nameMutex this function already holds and so self-deadlocked the world
+        // thread; it also just re-tested this same empty-pool condition and
+        // returned "", so there was nothing to reach. Checking both genders here
+        // also makes failure depend on the race alone rather than on the gender
+        // roll, which is what lets the caller treat a failure as conclusive.
+        gender = (gender == GENDER_MALE) ? GENDER_FEMALE : GENDER_MALE;
+        raceAndGender = CombineRaceAndGender(gender, race);
+        it = freeNames.find(raceAndGender);
+    }
+
+    if (it == freeNames.end() || it->second.empty())
+    {
+        sLog.outError("No more names left for random bots for race %u (both genders); add rows to ai_playerbot_names",
+            static_cast<uint32>(race));
+        return false;
     }
     else
     {
@@ -827,6 +839,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     sLog.outString("Creating random bot characters...");
     uint32 botsCreated = 0;
+    uint32 botsAttempted = 0;
     BarGoLink bar1(sPlayerbotAIConfig.randomBotAccountCount*
 #ifdef MANGOSBOT_TWO
         10
@@ -872,6 +885,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	    uint32 maxAllowed = 9 - count;
 #endif
 	    uint32 created = 0;
+	    uint32 fruitlessPasses = 0;
 
 	    while (!remaining.empty() && created < maxAllowed)
 	    {
@@ -883,6 +897,8 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	        std::random_device rnd;
 		std::mt19937 rng(rnd()); // Mersenne Twister RNG
 		std::shuffle(shuffledKeys.begin(), shuffledKeys.end(), rng);
+
+	        uint32 const createdBefore = created;
 
 	        for (const auto& key : shuffledKeys)
 	        {
@@ -903,6 +919,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	                continue;
 #endif
 
+	            botsAttempted++;
 	            if (factory.CreateRandomBot(cls, race))
 	            {
 	                created++;
@@ -912,6 +929,19 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	                    remaining.erase(key);
 	            }
 	        }
+
+	        // Nothing here can make progress once the name pools are exhausted, so
+	        // without a bound the loop re-shuffles and re-fails forever, spinning
+	        // the world thread. Name exhaustion is conclusive on the first pass now
+	        // that both genders are checked, but a pass can also fail for reasons a
+	        // later one survives - a drawn name is consumed even when Player::Create
+	        // then rejects it - so require a few barren passes rather than one.
+	        // `remaining` is deliberately left untouched, so the next account still
+	        // tries and the "left uncreated" report stays accurate.
+	        if (created != createdBefore)
+	            fruitlessPasses = 0;
+	        else if (++fruitlessPasses >= 8)
+	            break;
 	    }
 	}
 	else
@@ -929,8 +959,12 @@ void RandomPlayerbotFactory::CreateRandomBots()
 #endif
                 {
                     uint8 rclss = factory.GetRandomClass();
-                    botsCreated++;
-                    factory.CreateRandomBot(rclss);
+                    // Counted only when it actually happened: the increment used to
+                    // run before the call and ignore the result, so an exhausted
+                    // name pool was still reported as a created character.
+                    botsAttempted++;
+                    if (factory.CreateRandomBot(rclss))
+                        botsCreated++;
                     bar1.step();
                 }
             }
@@ -964,7 +998,12 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     if (!botsCreated)
     {
-	    sLog.outString("No new random bots needed. Accounts: %zu, bots: %d.", sPlayerbotAIConfig.randomBotAccounts.size(), totalRandomBotChars);
+	    // "Needed" and "attempted but every one failed" are different states, and
+	    // now that a failed creation is no longer counted they both reach here.
+	    if (botsAttempted)
+	        sLog.outError("No random bots could be created: all %u attempt(s) failed. Accounts: %zu, bots: %d.", botsAttempted, sPlayerbotAIConfig.randomBotAccounts.size(), totalRandomBotChars);
+	    else
+	        sLog.outString("No new random bots needed. Accounts: %zu, bots: %d.", sPlayerbotAIConfig.randomBotAccounts.size(), totalRandomBotChars);
 
         return;
     }
