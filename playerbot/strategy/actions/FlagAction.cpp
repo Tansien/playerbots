@@ -50,9 +50,16 @@ bool FlagAction::Execute(Event& event)
         return true;
     }
 
-    uint32 playerFlags;
+    uint32 playerFlags = 0;
     if (ss[0] == "cloak") playerFlags = PLAYER_FLAGS_HIDE_CLOAK;
-    if (ss[0] == "helm") playerFlags = PLAYER_FLAGS_HIDE_HELM;
+    else if (ss[0] == "helm") playerFlags = PLAYER_FLAGS_HIDE_HELM;
+    // Any other target left playerFlags uninitialized and then applied it to
+    // PLAYER_FLAGS below.
+    else
+    {
+        ai->TellError(requester, "Usage: flag cloak/helm/pvp/sheathe on/set/off/clear/toggle/?");
+        return false;
+    }
 
     if (clearFlag) bot->SetFlag(PLAYER_FLAGS, playerFlags);
     else if (setFlag) bot->RemoveFlag(PLAYER_FLAGS, playerFlags);
