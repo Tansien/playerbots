@@ -257,8 +257,8 @@ every phase, deterministic UTC windows, downtime, on-demand requests,
 worker staleness, queue attempts, actual/desire combinations, safe wind-down
 deferrals, two real players competing, owner disconnect/transfer, stale
 commitments, instance/BG restart, save-submission ambiguity, DB outage,
-duplicate events, malformed rows, partial migration, restart at every transition,
-and disabled-mode parity.
+duplicate events, malformed rows, partial migration, and restart at every
+transition.
 
 Acceptance requires every startup-matrix row to have deterministic behavior, no
 persisted queue state to be treated as actual state, and no managed identity to

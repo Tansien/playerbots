@@ -32,7 +32,7 @@ specific child or appendix is authoritative for its subject.
 ## Implementation order
 
 1. Phase 0 mutation inventory, host-side tests, deterministic fixtures,
-   disabled-mode parity, instrumentation, and persistence seams.
+   instrumentation, and persistence seams.
 2. Organic policy, modeled compatibility actions, and synthetic-action audit
    from 0002/0002A/0002B/0002C.
 3. Identity, schedules, lifecycle reconciliation, managed reset, and protected

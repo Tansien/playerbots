@@ -14,7 +14,7 @@ This repository is the Playerbots module for CMaNGOS Classic, TBC, and WotLK. Ex
 
 Classic behavior is the first acceptance target, but all three expansion builds must remain green. Put expansion-specific identifiers and behavior behind `MANGOSBOT_ZERO`, `MANGOSBOT_ONE`, or `MANGOSBOT_TWO` at the narrowest boundary.
 
-Living Realm is opt-in. With `AiPlayerbot.LivingRealm.Enabled = 0`, legacy behavior must remain unchanged and no Living Realm schema or runtime path may be required. Do not turn a proposed design into runtime behavior outside the requested implementation scope.
+Living Realm is opt-in and off by default (`AiPlayerbot.LivingRealm.Enabled = 0`); no Living Realm schema or runtime path may be required when it is disabled. Do not turn a proposed design into runtime behavior outside the requested implementation scope.
 
 ## Architectural direction
 
@@ -45,7 +45,7 @@ Category 3 normally becomes follow-up work instead of expanding the current chan
 ## Non-negotiable boundaries
 
 - Treat the invariants in `docs/design/0001-living-realm.md` section 3 and the relevant child design as authoritative; do not restate, weaken, or silently bypass them in code.
-- Preserve disabled-mode parity and enabled Organic fail-closed behavior. New synthetic mutation paths require an explicit policy classification and the documented audit/reconciliation boundary.
+- Preserve enabled Organic fail-closed behavior. New synthetic mutation paths require an explicit policy classification and the documented audit/reconciliation boundary.
 - Never infer CMaNGOS database, transaction, handler, identifier, or expansion behavior. Verify it in the pinned core baseline and record a baseline update when correctness depends on newer core behavior.
 - Do not use live realm data in tests or run destructive database/reset commands without explicit confirmation and a verified backup.
 

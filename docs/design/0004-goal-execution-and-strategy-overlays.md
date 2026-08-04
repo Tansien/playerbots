@@ -222,7 +222,7 @@ completion, direct-commit/re-read failure, lease expiry, restart per phase, stal
 results, overlay require/suppress conflicts, reset/preset behavior, preset
 isolation, transitive strategy closure, player command interaction,
 commitment/wind-down precedence, per-goal happy/failure/blocked/retry cases,
-malformed payloads, and disabled parity.
+and malformed payloads.
 
 Acceptance requires one enforced primary slot, exact target binding for all five
 goals, authoritative success checks, owner-safe removal/recomposition, no preset

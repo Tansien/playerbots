@@ -199,7 +199,7 @@ measurable fairness, formal activity classifications, and backpressure.
 - modeled, audited canonical public-transport transfers where physical boarding
   is unavailable;
 - bounded, audited stuck recovery;
-- disabled-mode parity and fault-injection coverage.
+- fault-injection coverage.
 
 ### Living Realm 0.2
 

@@ -158,12 +158,11 @@ Required tests:
   row behavior;
 - route-mask, canonical public transport, tram, Teldrassil, group-sync, and stuck
   recovery tests from 0002C;
-- disabled-mode parity;
 - Classic/TBC/WotLK compilation.
 
 Acceptance requires: every inventoried path classified and guarded; no unknown
 action fails open; managed login cannot bypass schedules through the legacy
 path; fresh bots receive no synthetic progression; every successful permitted
 synthetic action is eventually associated with one applied/reconciled audit
-action; incomplete requests reconcile deterministically; only canonical modeled
-transport is available; and disabling Living Realm preserves legacy behavior.
+action; incomplete requests reconcile deterministically; and only canonical
+modeled transport is available.

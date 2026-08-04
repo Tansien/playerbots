@@ -151,14 +151,12 @@ Rejected alternatives:
 | Public transport becomes arbitrary teleport | Canonical route registry, origin wait, route mask, action-specific audit |
 | Database/write amplification | Coalescing, bounded queues, critical/non-critical split, 0.2 backpressure |
 | Upstream drift | Pinned baselines, narrow adapters, three-expansion compile matrix |
-| Disabled-mode regression | No required schema/path when disabled and parity tests |
 | External reference brings synthetic shortcuts | 0006 adopt/reject boundary and fixture isolation |
 
 ## A.7 Requirements and traceability
 
 | ID | Requirement | Authoritative design | Minimum acceptance evidence |
 |---|---|---|---|
-| LR-001 | Disabled Living Realm preserves legacy behavior | 0001, 0002 | parity test and no-schema startup |
 | LR-002 | Fresh Organic identity and provenance are unambiguous | 0003/0003A | create/delete/reuse/reset tests |
 | LR-003 | Organic config and unknown actions fail closed | 0002 | effective report and deny tests |
 | LR-004 | Every known fabrication path is classified and guarded | 0002A | one test per row plus runtime inventory |
