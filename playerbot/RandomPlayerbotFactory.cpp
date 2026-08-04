@@ -913,6 +913,15 @@ void RandomPlayerbotFactory::CreateRandomBots()
 	                if (--remaining[key] == 0)
 	                    remaining.erase(key);
 	            }
+	            else
+	            {
+	                // This loop only advances on success, so a key that cannot be
+	                // created has to be dropped or the world thread spins on it
+	                // forever - re-shuffling and re-failing without end. Give up on
+	                // the class/race instead, the way the non-fixed branch below
+	                // simply moves on.
+	                remaining.erase(key);
+	            }
 	        }
 	    }
 	}
@@ -931,8 +940,11 @@ void RandomPlayerbotFactory::CreateRandomBots()
 #endif
                 {
                     uint8 rclss = factory.GetRandomClass();
-                    botsCreated++;
-                    factory.CreateRandomBot(rclss);
+                    // Counted only when it actually happened: the increment used to
+                    // run before the call and ignore the result, so an exhausted
+                    // name pool was still reported as a created character.
+                    if (factory.CreateRandomBot(rclss))
+                        botsCreated++;
                     bar1.step();
                 }
             }
