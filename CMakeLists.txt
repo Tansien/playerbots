@@ -52,8 +52,12 @@ endif()
 # CMaNGOS headers and live game objects. This single list feeds BOTH the module
 # library below and the standalone host-test executable; every new non-test
 # playerbot/living/ source directory must append its explicit glob here
-# (AGENTS.md). Empty until the first such directory lands.
-set(PLAYERBOTS_LIVING_SRCS)
+# (AGENTS.md).
+file(GLOB Playerbot_Living_Policy ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/policy/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/playerbot/living/policy/*.h)
+
+set(PLAYERBOTS_LIVING_SRCS
+    ${Playerbot_Living_Policy}
+)
 
 if(BUILD_PLAYERBOTS_LIVING_TESTS)
   enable_testing()
