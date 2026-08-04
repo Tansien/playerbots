@@ -2994,7 +2994,6 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
         return;
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleport");
-    std::vector<WorldLocation> locs;
 
     std::list<Unit*> targets;
     float range = sPlayerbotAIConfig.randomBotTeleportDistance;
@@ -3002,33 +3001,15 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
     MaNGOS::UnitListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(targets, u_check);
     Cell::VisitAllObjects(bot, searcher, range);
 
-    if (!targets.empty())
-    {
-        for (std::list<Unit *>::iterator i = targets.begin(); i != targets.end(); ++i)
-        {
-            Unit* unit = *i;
-            // Calculate from the unit's position WITHOUT moving the live player.
-            // SetPosition relocated the bot onto each candidate in turn, leaving
-            // it standing at the last one, and the Refresh() below could then
-            // resurrect it there. FleeManager takes the start position
-            // explicitly for exactly this.
-            FleeManager manager(bot, sPlayerbotAIConfig.sightDistance, 0, true, WorldPosition(unit));
-            float rx, ry, rz;
-            if (manager.CalculateDestination(&rx, &ry, &rz))
-            {
-                WorldLocation loc(bot->GetMapId(), rx, ry, rz);
-                locs.push_back(loc);
-            }
-        }
-
-        // The candidates were computed and then dropped, so this path never
-        // relocated the bot - the stray SetPosition above was its only movement.
-        RandomTeleport(bot, locs, false);
-    }
-    else
-    {
+    // With units nearby, this used to walk them and SetPosition() the LIVE player
+    // onto each one in turn, purely to seed a FleeManager whose destinations were
+    // pushed into a vector that was then dropped. The loop relocated nothing on
+    // purpose and everything by accident: the bot was left standing wherever the
+    // last unit happened to be - a raw move with no teleport packet - and the
+    // Refresh() below can resurrect it there. The dead calculation goes with the
+    // move. The branch stays: the empty case still falls back to a level teleport.
+    if (targets.empty())
         RandomTeleportForLevel(bot, true);
-    }
 
     pmo.reset();
 
