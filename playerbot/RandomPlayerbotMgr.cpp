@@ -2654,8 +2654,13 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                 for (GroupReference* gref = bot->GetGroup()->GetFirstMember(); gref; gref = gref->next())
                 {
                     Player* member = gref->getSource();
-                    PlayerbotAI* ai = bot->GetPlayerbotAI();
-                    if (ai && bot != member)
+                    // This tested the TELEPORTING bot's own AI, which is never
+                    // null, and then mutated the member: a real player grouped
+                    // with a bot had their homebind rewritten and was teleported,
+                    // and only afterwards did the Reset below dereference their
+                    // null AI. Test the member's own AI, before any mutation.
+                    PlayerbotAI* memberAi = member ? member->GetPlayerbotAI() : nullptr;
+                    if (memberAi && bot != member)
                     {
                         if (member->IsTaxiFlying())
                             member->GetMotionMaster()->MovementExpired();
@@ -2665,7 +2670,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                         member->GetMotionMaster()->Clear();
                         member->TeleportTo(loc.mapid, x, y, z, 0);
                         member->SendHeartBeat();
-                        member->GetPlayerbotAI()->Reset(true);
+                        memberAi->Reset(true);
                     }
 
                 }
@@ -3000,8 +3005,12 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
         for (std::list<Unit *>::iterator i = targets.begin(); i != targets.end(); ++i)
         {
             Unit* unit = *i;
-            bot->SetPosition(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), 0);
-            FleeManager manager(bot, sPlayerbotAIConfig.sightDistance, 0, true);
+            // Calculate from the unit's position WITHOUT moving the live player.
+            // SetPosition relocated the bot onto each candidate in turn, leaving
+            // it standing at the last one, and the Refresh() below could then
+            // resurrect it there. FleeManager takes the start position
+            // explicitly for exactly this.
+            FleeManager manager(bot, sPlayerbotAIConfig.sightDistance, 0, true, WorldPosition(unit));
             float rx, ry, rz;
             if (manager.CalculateDestination(&rx, &ry, &rz))
             {
@@ -3009,6 +3018,10 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
                 locs.push_back(loc);
             }
         }
+
+        // The candidates were computed and then dropped, so this path never
+        // relocated the bot - the stray SetPosition above was its only movement.
+        RandomTeleport(bot, locs, false);
     }
     else
     {
