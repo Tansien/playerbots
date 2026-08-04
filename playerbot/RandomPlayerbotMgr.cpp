@@ -1,5 +1,9 @@
 #include "Config/Config.h"
 
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
@@ -4468,7 +4472,13 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleStats(std::string param)
     std::string msg = "Stats requested.";
     messages.push_back(msg);
 
-    ObjectGuid guid = ObjectGuid(uint64(std::stoull(param)));
+    // isValidNumberString is a syntax check and deliberately does not bound the
+    // magnitude, so stoull still threw std::out_of_range past UINT64_MAX.
+    uint64 rawGuid = 0;
+    if (!Qualified::parseUInt64String(param, rawGuid))
+        return {"Stats: Error parsing " + param};
+
+    ObjectGuid guid = ObjectGuid(rawGuid);
     activatePrintStatsThread(guid);
     return messages;
 }
@@ -4491,10 +4501,31 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleUpdate(std::string param
     return messages;
 }
 
+// Non-throwing float parse: the whole token must be consumed and the result
+// finite. There is no shared float equivalent of Qualified::parseNumberString.
+static bool ParseFloatToken(const std::string& str, float& result)
+{
+    if (str.empty())
+        return false;
+
+    char* end = nullptr;
+    errno = 0;
+    float const value = std::strtof(str.c_str(), &end);
+    // ERANGE covers underflow too: "1e-1000" would otherwise be accepted as a
+    // finite 0 and silently overwrite a coefficient, where stof rejected it.
+    if (errno == ERANGE || end != str.c_str() + str.size() || !std::isfinite(value))
+        return false;
+
+    result = value;
+    return true;
+}
+
 std::list<std::string> RandomPlayerbotMgr::HandleConsolePid(std::string param)
 {
     std::list<std::string> messages;
-    std::string pids = param.substr(4);
+    // substr throws std::out_of_range once pos exceeds size, so this threw before
+    // reaching any of the parsing below: 'pid 0.5' leaves a two-character param.
+    std::string pids = param.size() >= 4 ? param.substr(4) : "";
     std::vector<std::string> pid = Qualified::getMultiQualifiers(pids, " ");
 
     if (pid.size() == 0)
@@ -4503,9 +4534,20 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsolePid(std::string param)
         pid.push_back("0");
     if (pid.size() == 2)
         pid.push_back("0");
-    sRandomPlayerbotMgr.pid.adjust(stof(pid[0]), stof(pid[1]), stof(pid[2]));
 
-    std::string msg = "Pid set to p:" + std::to_string(stof(pid[0])) + " i:" + std::to_string(stof(pid[1])) + " d:" + std::to_string(stof(pid[2]));
+    // stof threw std::invalid_argument on any non-numeric token and
+    // std::out_of_range on an oversized one, and nothing catches, so a typo at
+    // the console terminated the world.
+    float p = 0.0f, i = 0.0f, d = 0.0f;
+    if (!ParseFloatToken(pid[0], p) || !ParseFloatToken(pid[1], i) || !ParseFloatToken(pid[2], d))
+    {
+        messages.push_back("Pid: Error parsing " + pids);
+        return messages;
+    }
+
+    sRandomPlayerbotMgr.pid.adjust(p, i, d);
+
+    std::string msg = "Pid set to p:" + std::to_string(p) + " i:" + std::to_string(i) + " d:" + std::to_string(d);
     messages.push_back(msg);
     return messages;
 }
@@ -4532,10 +4574,19 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleDiff(std::string param)
             diff.push_back("100");
         if (diff.size() == 1)
             diff.push_back(diff[0]);
-        sPlayerbotAIConfig.diffWithPlayer = stoi(diff[0]);
-        sPlayerbotAIConfig.diffEmpty = stoi(diff[1]);
+        // Unvalidated stoi: a non-numeric or oversized token threw out of the
+        // handler, and nothing on this path catches.
+        int32 withPlayer = 0, empty = 0;
+        if (!Qualified::parseNumberString(diff[0], withPlayer) || !Qualified::parseNumberString(diff[1], empty))
+        {
+            messages.push_back("Diff: Error parsing " + param);
+            return messages;
+        }
 
-        std::string msg = "Diff set to " + std::to_string(stoi(diff[0])) + " (player), " + std::to_string(stoi(diff[1])) + " (empty)";
+        sPlayerbotAIConfig.diffWithPlayer = withPlayer;
+        sPlayerbotAIConfig.diffEmpty = empty;
+
+        std::string msg = "Diff set to " + std::to_string(withPlayer) + " (player), " + std::to_string(empty) + " (empty)";
         messages.push_back(msg);
         return messages;
     }
