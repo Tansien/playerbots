@@ -3,6 +3,7 @@
 
 #include "Common.h"
 #include "PlayerbotAIBase.h"
+#include "playerbot/living/policy/OrganicPolicy.h"
 #include <mutex>
 
 class WorldPacket;
@@ -65,8 +66,8 @@ class RandomPlayerbotFactory
 	public:
         bool CreateRandomBot(uint8 cls, uint8 inputRace = 0);
         static void CreateRandomBots();
-        static void CreateRandomGuilds();
-        static void CreateRandomArenaTeams();
+        static void CreateRandomGuilds(living::OrganicSourceKind livingSource = living::OrganicSourceKind::RandomManager);
+        static void CreateRandomArenaTeams(living::OrganicSourceKind livingSource = living::OrganicSourceKind::RandomManager);
         static std::string CreateRandomGuildName();
         static bool isAvailableRace(uint8 cls, uint8 race);
         static bool isAvailableRole(uint8 cls, BotRoles role = BotRoles::BOT_ROLE_NONE);

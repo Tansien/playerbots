@@ -5214,7 +5214,7 @@ void PlayerbotFactory::InitGuild()
         return;
 
     if (sPlayerbotAIConfig.randomBotGuilds.size() < sPlayerbotAIConfig.randomBotGuildCount)
-        RandomPlayerbotFactory::CreateRandomGuilds();
+        RandomPlayerbotFactory::CreateRandomGuilds(livingSource);
 
     std::vector<uint32> guilds;
     for (std::list<uint32>::iterator i = sPlayerbotAIConfig.randomBotGuilds.begin(); i != sPlayerbotAIConfig.randomBotGuilds.end(); ++i)
@@ -5356,7 +5356,7 @@ void PlayerbotFactory::InitArenaTeam()
     // nested batch call records the one honest row for the whole operation --
     // recording here too would double-count a single fabrication.
     if (sPlayerbotAIConfig.randomBotArenaTeams.size() < sPlayerbotAIConfig.randomBotArenaTeamCount)
-        RandomPlayerbotFactory::CreateRandomArenaTeams();
+        RandomPlayerbotFactory::CreateRandomArenaTeams(livingSource);
 }
 #endif
 

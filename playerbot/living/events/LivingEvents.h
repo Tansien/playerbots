@@ -83,8 +83,10 @@ namespace living
         virtual void Emit(LivingEvent const& event) = 0;
     };
 
-    // In-memory sink for host tests. Not thread-safe: Phase 0 emission happens
-    // on the world thread only.
+    // In-memory sink for host tests. Not thread-safe by design: production
+    // emission can occur on the world thread AND on map-update worker threads,
+    // so any production sink must synchronize itself; this test sink is for
+    // single-threaded host suites only and must not be swapped into runtime use.
     class InMemoryTelemetrySink final : public LivingRealmTelemetrySink
     {
     public:

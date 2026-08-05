@@ -1061,7 +1061,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 }
 
 
-void RandomPlayerbotFactory::CreateRandomGuilds()
+void RandomPlayerbotFactory::CreateRandomGuilds(living::OrganicSourceKind livingSource)
 {
     std::vector<uint32> randomBots;
     std::map<uint32, std::vector<uint32>> charAccGuids;
@@ -1095,7 +1095,7 @@ void RandomPlayerbotFactory::CreateRandomGuilds()
 
     // Recorded past both pure early-outs, immediately before the first mutating
     // branch: with no bot characters at all this pass fabricates nothing.
-    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, living::OrganicSourceKind::RandomManager, uint32(0));
+    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, uint32(0));
 
     if (sPlayerbotAIConfig.deleteRandomBotGuilds && !sRandomPlayerbotMgr.guildsDeleted)
     {
@@ -1224,9 +1224,9 @@ std::string RandomPlayerbotFactory::CreateRandomGuildName()
 }
 
 #ifndef MANGOSBOT_ZERO
-void RandomPlayerbotFactory::CreateRandomArenaTeams()
+void RandomPlayerbotFactory::CreateRandomArenaTeams(living::OrganicSourceKind livingSource)
 {
-    living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, living::OrganicSourceKind::RandomManager, uint32(0));
+    living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, uint32(0));
     std::vector<uint32> randomBots;
 
     auto results = CharacterDatabase.PQuery(
