@@ -25,10 +25,11 @@ namespace
 
             living::OrganicActionMetadata const* row = living::TryGetOrganicActionMetadata(event.action);
 
-            sLog.outDetail("LivingObserve: action=%s decision=%s reason=%s guid=%u",
+            sLog.outDetail("LivingObserve: action=%s decision=%s reason=%s source=%s guid=%u",
                 row ? row->name : "INVALID_ACTION",
                 living::ToString(event.decision),
                 living::ToString(event.reason),
+                living::ToString(event.source),
                 event.identity.characterGuid);
         }
     };
@@ -67,7 +68,7 @@ namespace living_observer
             living::LivingIdentitySnapshot identity;
             identity.characterGuid = characterGuid;
 
-            Sink().Emit(living::MakeMutationDecisionEvent(identity, ObserverClock().UtcNowMs(), kind,
+            Sink().Emit(living::MakeMutationDecisionEvent(identity, ObserverClock().UtcNowMs(), kind, source,
                 living::Evaluate(request)));
         }
         catch (...)

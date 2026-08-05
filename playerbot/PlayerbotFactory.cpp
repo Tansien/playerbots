@@ -5344,9 +5344,10 @@ void PlayerbotFactory::InitArenaTeam()
     if (!sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
         return;
 
-    // Recorded past the random-account guard: a player-owned alt is a no-op here.
-    RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, bot);
-
+    // No record here: this method fabricates nothing of its own. At steady state
+    // (pool already full) it is a permanent no-op, and when the pool is short the
+    // nested batch call records the one honest row for the whole operation --
+    // recording here too would double-count a single fabrication.
     if (sPlayerbotAIConfig.randomBotArenaTeams.size() < sPlayerbotAIConfig.randomBotArenaTeamCount)
         RandomPlayerbotFactory::CreateRandomArenaTeams();
 }

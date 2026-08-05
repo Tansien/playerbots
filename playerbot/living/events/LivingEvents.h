@@ -37,8 +37,8 @@ namespace living
     // keep their inert defaults -- zero for plain values, the Count sentinel
     // for every enum, so an unpopulated field can never read as a real
     // outcome. subjectId carries the kind-specific id (quest id, group id,
-    // travel destination id); the action/decision/reason trio is meaningful
-    // only for MutationDecision.
+    // travel destination id); the action/source/decision/reason group is
+    // meaningful only for MutationDecision.
     struct LivingEvent
     {
         LivingEventKind kind = LivingEventKind::Count;
@@ -46,9 +46,12 @@ namespace living
         uint64_t utcMs = 0;
         uint32_t subjectId = 0;
 
-        // MutationDecision payload. The sentinel defaults render as
-        // INVALID_* rather than resembling a genuine fail-closed denial.
+        // MutationDecision payload: what was asked (action, source) and what
+        // the evaluator answered (decision, reason). OrganicSourceKind arrives
+        // with the OrganicPolicy.h include above. The sentinel defaults render
+        // as INVALID_* rather than resembling a genuine fail-closed denial.
         OrganicActionKind action = OrganicActionKind::Count;
+        OrganicSourceKind source = OrganicSourceKind::Count;
         OrganicDecision decision = OrganicDecision::Count;
         OrganicReasonCode reason = OrganicReasonCode::Count;
 
@@ -61,12 +64,15 @@ namespace living
     // does not stop raw pointers, so the size pin makes any new member -- e.g.
     // a Player* that would dangle inside a sink outliving the emitting frame --
     // a conscious, reviewable edit.
-    static_assert(sizeof(LivingEvent) == 40,
+    // 48, not 41: the trailing enum run (uint16_t action, then three uint8_t
+    // enums) exactly filled the previous 40 bytes, so the source byte rounds
+    // the whole event up to the next multiple of its 8-byte alignment.
+    static_assert(sizeof(LivingEvent) == 48,
         "new LivingEvent member: verify it is pure value state, then update this pin");
 
     // Builds the composite mutation-decision observation from an evaluation.
     LivingEvent MakeMutationDecisionEvent(LivingIdentitySnapshot const& identity, uint64_t utcMs,
-        OrganicActionKind action, OrganicEvaluation evaluation);
+        OrganicActionKind action, OrganicSourceKind source, OrganicEvaluation evaluation);
 
     // Replaceable Phase 0 telemetry surface.
     class LivingRealmTelemetrySink
