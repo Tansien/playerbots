@@ -340,7 +340,10 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 
     if (isRandomBot)
     {
-        RecordDecision(living::OrganicActionKind::MONEY_INIT, livingSource, bot);
+        // The incremental branch is an additive grant re-armed by the periodic
+        // randomize timer, so it belongs to the periodic money family; only the
+        // non-incremental one-shot is the starting-money initialization.
+        RecordDecision(incremental ? living::OrganicActionKind::MONEY_PERIODIC : living::OrganicActionKind::MONEY_INIT, livingSource, bot);
         if (incremental)
         {
             uint32 money = bot->GetMoney();
@@ -2479,9 +2482,10 @@ void PlayerbotFactory::InitReputations()
     }
 #endif
 
-    // Recorded before entering the mutation loop: every faction gate above is
-    // level-based, so a low-level bot leaves the list empty and mutates nothing.
-    RecordDecision(living::OrganicActionKind::REPUTATION_INIT, livingSource, bot);
+    // Same condition as the mutation: every faction gate above is level-based, so
+    // a low-level bot leaves the list empty and the loop below mutates nothing.
+    if (!factions.empty())
+        RecordDecision(living::OrganicActionKind::REPUTATION_INIT, livingSource, bot);
 
     for (auto faction : factions)
     {
@@ -5198,7 +5202,11 @@ void PlayerbotFactory::InitInventoryEquip()
 
 void PlayerbotFactory::InitGuild()
 {
-    RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, bot);
+    // Same condition as the mutation: a bot already in a guild that already owns
+    // the tabard grants nothing and takes the early return below.
+    if (!bot->GetGuildId() || !bot->HasItemCount(5976, 1))
+        RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, bot);
+
     // add guild tabard
     if (bot->GetGuildId() && !bot->HasItemCount(5976, 1))
         StoreItem(5976, 1);
