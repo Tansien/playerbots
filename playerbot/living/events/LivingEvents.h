@@ -64,9 +64,11 @@ namespace living
     // does not stop raw pointers, so the size pin makes any new member -- e.g.
     // a Player* that would dangle inside a sink outliving the emitting frame --
     // a conscious, reviewable edit.
-    // 48, not 41: the trailing enum run (uint16_t action, then three uint8_t
-    // enums) exactly filled the previous 40 bytes, so the source byte rounds
-    // the whole event up to the next multiple of its 8-byte alignment.
+    // 48, not 41: kind@0, identity@4, utcMs@24, subjectId@32, action@36 (uint16),
+    // then the uint8 enum run source@38, decision@39, reason@40. Before source
+    // was added the run ended at reason@39 and the event was exactly 40 bytes;
+    // the one extra byte rounds it up to the next multiple of its 8-byte
+    // alignment, which utcMs sets.
     static_assert(sizeof(LivingEvent) == 48,
         "new LivingEvent member: verify it is pure value state, then update this pin");
 

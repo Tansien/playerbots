@@ -1093,9 +1093,11 @@ void RandomPlayerbotFactory::CreateRandomGuilds(living::OrganicSourceKind living
     if (randomBots.empty())
         return;
 
-    // Recorded past both pure early-outs, immediately before the first mutating
-    // branch: with no bot characters at all this pass fabricates nothing.
-    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, uint32(0));
+    // Fabricating-pass latch, past both pure early-outs above: at steady state
+    // (guilds already deleted once, pool already full) this pass neither disbands
+    // nor creates anything. Record immediately before the first guild it does
+    // touch, once for the whole batch.
+    bool recorded = false;
 
     if (sPlayerbotAIConfig.deleteRandomBotGuilds && !sRandomPlayerbotMgr.guildsDeleted)
     {
@@ -1107,6 +1109,12 @@ void RandomPlayerbotFactory::CreateRandomGuilds(living::OrganicSourceKind living
             Guild* guild = sGuildMgr.GetGuildByLeader(leader);
             if (guild)
             {
+                if (!recorded)
+                {
+                    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, uint32(0));
+                    recorded = true;
+                }
+
                 guild->Disband();
                 counter++;
             }
@@ -1169,6 +1177,15 @@ void RandomPlayerbotFactory::CreateRandomGuilds(living::OrganicSourceKind living
             continue;
 
         Guild* guild = new Guild();
+
+        // Marked before the attempt, matching the CreateRandomBot precedent: a
+        // failed creation still consumed a name and a leader.
+        if (!recorded)
+        {
+            living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, uint32(0));
+            recorded = true;
+        }
+
         if (!guild->Create(player, guildName))
         {
             sLog.outError("Error creating random guild %s", guildName.c_str());
@@ -1226,7 +1243,12 @@ std::string RandomPlayerbotFactory::CreateRandomGuildName()
 #ifndef MANGOSBOT_ZERO
 void RandomPlayerbotFactory::CreateRandomArenaTeams(living::OrganicSourceKind livingSource)
 {
-    living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, uint32(0));
+    // Fabricating-pass latch: at steady state (teams already deleted once, pool
+    // already full, no eligible captains) this pass neither disbands nor creates
+    // anything. Record immediately before the first team it does touch, once for
+    // the whole batch.
+    bool recorded = false;
+
     std::vector<uint32> randomBots;
 
     auto results = CharacterDatabase.PQuery(
@@ -1250,8 +1272,16 @@ void RandomPlayerbotFactory::CreateRandomArenaTeams(living::OrganicSourceKind li
             ObjectGuid captain(HIGHGUID_PLAYER, *i);
             ArenaTeam* arenateam = sObjectMgr.GetArenaTeamByCaptain(captain);
             if (arenateam)
+            {
+                if (!recorded)
+                {
+                    living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, uint32(0));
+                    recorded = true;
+                }
+
                 //sObjectMgr.RemoveArenaTeam(arenateam->GetId());
                 arenateam->Disband(NULL);
+            }
         }
         sLog.outString("Random bot arena teams deleted");
 
@@ -1382,6 +1412,15 @@ void RandomPlayerbotFactory::CreateRandomArenaTeams(living::OrganicSourceKind li
             continue;
 
         ArenaTeam* arenateam = new ArenaTeam();
+
+        // Marked before the attempt, matching the CreateRandomBot precedent: a
+        // failed creation still consumed a name and a captain.
+        if (!recorded)
+        {
+            living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, uint32(0));
+            recorded = true;
+        }
+
         if (!arenateam->Create(player->GetObjectGuid(), type, arenaTeamName))
         {
             sLog.outError("Error creating arena team %s", arenaTeamName.c_str());

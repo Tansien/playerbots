@@ -2,7 +2,7 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "PlayerbotDbStore.h"
 #include "playerbot/PlayerbotFactory.h"
-#include "playerbot/living/policy/OrganicPolicy.h"
+#include "playerbot/LivingRealmObserver.h"
 #include "playerbot/RandomPlayerbotFactory.h"
 #include "playerbot/RandomPlayerbotMgr.h"
 #include "playerbot/ServerFacade.h"
@@ -515,6 +515,16 @@ void PlayerbotHolder::OnBotLogin(Player * const bot)
 #endif
         )
     {
+        // Recorded inside the has-item guard, where the fabrication is certain.
+        // One record for both arms: they are the same missing-starter-item
+        // compound, only the item differs by expansion and class. The source is
+        // the random-bot login driver -- OnBotLogin runs from the core's
+        // PlayerbotHolder::HandlePlayerBotLoginCallback, and for the random-account
+        // characters this observer records at all, the AddPlayerBot that queued
+        // the login came from RandomPlayerbotMgr's timers and refresh paths.
+        living_observer::RecordDecision(living::OrganicActionKind::LOGIN_ITEM_FABRICATION,
+            living::OrganicSourceKind::RandomManager, bot);
+
 #ifdef MANGOSBOT_TWO
         if (bot->getClass() == CLASS_DEATH_KNIGHT && bot->GetMapId() == 609)
             bot->StoreNewItemInBestSlots(40582, 1);
@@ -1870,6 +1880,23 @@ std::string PlayerbotHolder::HandleBotRemoveLogout(Player* bot, Player* master, 
     return "ok";
 }
 
+namespace
+{
+    // Shared attribution for the bot command handlers below, which also serve
+    // the server console: HandlePlayerbotCommand passes master == nullptr there,
+    // and an active `.bot spoof` then substitutes the spoofed Player* for that
+    // null master, so master alone no longer identifies the origin. fromConsole
+    // carries the origin captured at the substitution site. Deliberately no
+    // bot/real-player test on master: selfbot attaches a PlayerbotAI to a real
+    // player, and a spoof target may itself be a real player, so neither
+    // GetPlayerbotAI() nor isRealPlayer() tells us where the command came from.
+    living::OrganicSourceKind CommandSource(Player* master, bool fromConsole)
+    {
+        return (!master || fromConsole) ? living::OrganicSourceKind::ConsoleCommand
+                                       : living::OrganicSourceKind::PlayerChatCommand;
+    }
+}
+
 void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::list<std::string>& messages, ObjectGuid& guid)
 {    
     // Allow null master for RA/console usage
@@ -2015,6 +2042,17 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
         botSession->SetNoAnticheat();
 
         Player* newBot = new Player(botSession);
+
+        // The bootstrap question is only well-formed pre-creation, while the guid
+        // is still 0, so this uses the batch overload like the CORE_CHARACTER_CREATE
+        // precedent in RandomPlayerbotFactory; marking the attempt here counts
+        // failed creations too. One record for the whole compound: the level, taxi,
+        // talent, profession and spell grants below (including the direct PLAYER_XP
+        // write) are the "and then grants" half of COMMAND_CHARACTER_PROVISION, not
+        // separate fabrications.
+        living_observer::RecordDecision(living::OrganicActionKind::COMMAND_CHARACTER_PROVISION,
+            CommandSource(master, m_commandFromConsole), uint32(0));
+
         if (!newBot->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender, skin, face, hairStyle, hairColor, facialHair, 0))
         {
             delete botSession;
@@ -2546,23 +2584,6 @@ std::string PlayerbotHolder::HandleBotDelete(Player* bot, Player* master, const 
     DeleteBot(guid);
 
     return "ok";
-}
-
-namespace
-{
-    // Shared attribution for the bot command handlers below, which also serve
-    // the server console: HandlePlayerbotCommand passes master == nullptr there,
-    // and an active `.bot spoof` then substitutes the spoofed Player* for that
-    // null master, so master alone no longer identifies the origin. fromConsole
-    // carries the origin captured at the substitution site. Deliberately no
-    // bot/real-player test on master: selfbot attaches a PlayerbotAI to a real
-    // player, and a spoof target may itself be a real player, so neither
-    // GetPlayerbotAI() nor isRealPlayer() tells us where the command came from.
-    living::OrganicSourceKind CommandSource(Player* master, bool fromConsole)
-    {
-        return (!master || fromConsole) ? living::OrganicSourceKind::ConsoleCommand
-                                       : living::OrganicSourceKind::PlayerChatCommand;
-    }
 }
 
 std::string PlayerbotHolder::HandleBotGear(Player* bot, Player* master, const std::string param)
