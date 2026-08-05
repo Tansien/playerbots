@@ -5,30 +5,32 @@
 #include "playerbot/living/events/LivingEvents.h"
 #include "playerbot/living/testing/LivingDeterminism.h"
 
-#include <mutex>
-
 namespace
 {
     // Intercepted fabrication runs on the world thread and on map-update worker
-    // threads, so the process sink synchronizes itself rather than assuming a
-    // single writer.
+    // threads, but the sink needs no lock of its own: the cores' Log::outDetail
+    // takes m_worldLogMtx internally (src/shared/Log/Log.cpp:658 in classic, tbc
+    // and wotlk), so an extra mutex here would only double the locking cost.
     class LogTelemetrySink final : public living::LivingRealmTelemetrySink
     {
     public:
         void Emit(living::LivingEvent const& event) override
         {
+            // HasLogLevelOrHigher(LOG_LVL_DETAIL) (src/shared/Log/Log.h:185 in all
+            // three cores) is exactly the condition under which outDetail writes
+            // anything, so this gate makes the sink zero-cost - no formatting, no
+            // lock - whenever detail logging is off.
+            if (!sLog.HasLogLevelOrHigher(LOG_LVL_DETAIL))
+                return;
+
             living::OrganicActionMetadata const* row = living::TryGetOrganicActionMetadata(event.action);
 
-            std::lock_guard<std::mutex> guard(m_mutex);
             sLog.outDetail("LivingObserve: action=%s decision=%s reason=%s guid=%u",
                 row ? row->name : "INVALID_ACTION",
                 living::ToString(event.decision),
                 living::ToString(event.reason),
                 event.identity.characterGuid);
         }
-
-    private:
-        std::mutex m_mutex;
     };
 
     living::LivingRealmTelemetrySink& Sink()

@@ -387,6 +387,13 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         sLog.outError("BOTS: Unable to create session or player for random acc %d - name: \"%s\"; race: %u; class: %u", accountId, name.c_str(), race, cls);
         return false;
     }
+
+    // The bootstrap question is only well-formed pre-creation, while the guid is
+    // still 0; for this legacy path the truthful answer is Deny/BootstrapSourceRequired
+    // (the legacy creator is not the managed bootstrap), and marking the attempt
+    // here means failed creations are counted too.
+    living_observer::RecordDecision(living::OrganicActionKind::CORE_CHARACTER_CREATE, living::OrganicSourceKind::RandomManager, uint32(0));
+
 	if (!player->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender,
 	        face.second, // skinColor,
 	        face.first,
@@ -409,8 +416,6 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
     //player->SetSemaphoreTeleportFar(false);
 
     sObjectAccessor.AddObject(player);
-
-    living_observer::RecordDecision(living::OrganicActionKind::CORE_CHARACTER_CREATE, living::OrganicSourceKind::RandomManager, player->GetGUIDLow());
 
     sLog.outDebug( "Random bot created for account %d - name: \"%s\"; race: %u; class: %u",
             accountId, name.c_str(), race, cls);
@@ -1058,7 +1063,6 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
 void RandomPlayerbotFactory::CreateRandomGuilds()
 {
-    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, living::OrganicSourceKind::RandomManager, uint32(0));
     std::vector<uint32> randomBots;
     std::map<uint32, std::vector<uint32>> charAccGuids;
 
@@ -1088,6 +1092,10 @@ void RandomPlayerbotFactory::CreateRandomGuilds()
 
     if (randomBots.empty())
         return;
+
+    // Recorded past both pure early-outs, immediately before the first mutating
+    // branch: with no bot characters at all this pass fabricates nothing.
+    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, living::OrganicSourceKind::RandomManager, uint32(0));
 
     if (sPlayerbotAIConfig.deleteRandomBotGuilds && !sRandomPlayerbotMgr.guildsDeleted)
     {

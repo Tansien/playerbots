@@ -171,8 +171,10 @@ void PlayerbotFactory::Prepare()
 
 void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 {
-    RecordDecision(incremental ? living::OrganicActionKind::RANDOMIZE_INCREMENTAL : living::OrganicActionKind::RANDOMIZE_FULL, livingSource, bot);
     sLog.outDetail("Preparing to %s randomize...", (incremental ? "incremental" : "full"));
+    // Guards interleave with mutation here: the disableRandomLevels early-out sits
+    // behind Prepare(), which already mutates, so record before the first mutation.
+    RecordDecision(incremental ? living::OrganicActionKind::RANDOMIZE_INCREMENTAL : living::OrganicActionKind::RANDOMIZE_FULL, livingSource, bot);
     Prepare();
 
     if (sPlayerbotAIConfig.disableRandomLevels)
@@ -272,7 +274,9 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
         LoadEnchantContainer();
     }
 
-    InitEquipment(incremental, syncWithMaster);
+    // The incremental randomize pass is the periodic gear-update family (0002A matrix).
+    InitEquipment(incremental, syncWithMaster, sPlayerbotAIConfig.randomGearProgression, false,
+        incremental ? living::OrganicActionKind::GEAR_UPGRADE : living::OrganicActionKind::GEAR_INIT);
     InitGems();
     pmo.reset();
 
@@ -554,10 +558,12 @@ void PlayerbotFactory::AddConsumables()
 
 void PlayerbotFactory::InitPet()
 {
-    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
     // Randomize a new pet (only for hunters)
     if (bot->getClass() != CLASS_HUNTER)
         return;
+
+    // Recorded past the class guard: a warlock entering here is a provable no-op.
+    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
 
     Pet* pet = bot->GetPet();
     if (!pet)
@@ -685,7 +691,6 @@ void PlayerbotFactory::InitPet()
 
 void PlayerbotFactory::InitPetSpells()
 {
-    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
     Map* map = bot->GetMap();
     if (!map)
         return;
@@ -693,6 +698,9 @@ void PlayerbotFactory::InitPetSpells()
     Pet* pet = bot->GetPet();
     if (!pet)
         return;
+
+    // Recorded past both guards; this is where the warlock pet work is observed.
+    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
 
 #ifdef MANGOSBOT_ZERO
      // TODO: Proper Training Point calculation for build variety
@@ -2411,7 +2419,6 @@ void PlayerbotFactory::ResetQuests()
 
 void PlayerbotFactory::InitReputations()
 {
-    RecordDecision(living::OrganicActionKind::REPUTATION_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Reputations");
     // list of factions
     std::list<uint32> factions;
@@ -2472,6 +2479,10 @@ void PlayerbotFactory::InitReputations()
     }
 #endif
 
+    // Recorded before entering the mutation loop: every faction gate above is
+    // level-based, so a low-level bot leaves the list empty and mutates nothing.
+    RecordDecision(living::OrganicActionKind::REPUTATION_INIT, livingSource, bot);
+
     for (auto faction : factions)
     {
 #ifdef MANGOSBOT_ONE
@@ -2489,7 +2500,8 @@ void PlayerbotFactory::InitReputations()
 
 void PlayerbotFactory::InitSpells()
 {
-    RecordDecision(living::OrganicActionKind::SPELLS_INIT, livingSource, bot);
+    // No record here: this only loops over InitAvailableSpells, which records
+    // once per actual fabrication pass.
     for (int i = 0; i < 15; i++)
         InitAvailableSpells();
 }
@@ -2959,9 +2971,8 @@ void PlayerbotFactory::Shuffle(std::vector<uint32>& items)
     }
 }
 
-void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool progressive, bool partialUpgrade)
+void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool progressive, bool partialUpgrade, living::OrganicActionKind observeKind)
 {
-    RecordDecision(living::OrganicActionKind::GEAR_INIT, livingSource, bot);
     uint32 oldGS = ai->GetEquipGearScore(bot, false, false);
     uint32 masterGS = 0;
     if(syncWithMaster && ai->GetMaster())
@@ -2970,6 +2981,11 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
     }
 
     bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot) && bot->GetPlayerbotAI() && !bot->GetPlayerbotAI()->HasRealPlayerMaster() && !bot->GetPlayerbotAI()->IsInRealGuild();
+
+    // Guards interleave with mutation here: the specId early-out sits behind the
+    // full-init item wipe below, so record before that first mutating branch.
+    RecordDecision(observeKind, livingSource, bot);
+
     if (!incremental)
     {
         DestroyItemsVisitor visitor(bot);
@@ -3618,9 +3634,11 @@ bool PlayerbotFactory::IsDesiredReplacement(uint32 itemId)
 
 void PlayerbotFactory::InitSecondEquipmentSet()
 {
-    RecordDecision(living::OrganicActionKind::GEAR_INIT, livingSource, bot);
     if (bot->getClass() == CLASS_MAGE || bot->getClass() == CLASS_WARLOCK || bot->getClass() == CLASS_PRIEST)
         return;
+
+    // Recorded past the class guard: a mage entering here is a provable no-op.
+    RecordDecision(living::OrganicActionKind::GEAR_INIT, livingSource, bot);
 
     std::map<uint32, std::vector<uint32> > items;
 
@@ -3890,7 +3908,7 @@ void PlayerbotFactory::AddGems(Item* item)
 
 void PlayerbotFactory::InitAllSkills()
 {
-    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
+    // No record here: InitSkills and InitTradeSkills each record their own pass.
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Skills1");
     InitSkills();
     InitTradeSkills();
@@ -4470,7 +4488,6 @@ void PlayerbotFactory::InitSpecialSpells()
 
 void PlayerbotFactory::InitTalents(uint32 specNo)
 {
-    RecordDecision(living::OrganicActionKind::TALENT_INIT_SYNTHETIC, livingSource, bot);
     uint32 classMask = bot->getClassMask();
 
     std::map<uint32, std::vector<TalentEntry const*> > spells;
@@ -4489,6 +4506,10 @@ void PlayerbotFactory::InitTalents(uint32 specNo)
 
         spells[talentInfo->Row].push_back(talentInfo);
     }
+
+    // Recorded before entering the mutation loop: the scan above filters by class
+    // mask and spec, and an empty result learns nothing.
+    RecordDecision(living::OrganicActionKind::TALENT_INIT_SYNTHETIC, livingSource, bot);
 
     uint32 freePoints = bot->GetFreeTalentPoints();
     for (std::map<uint32, std::vector<TalentEntry const*> >::iterator i = spells.begin(); i != spells.end(); ++i)
@@ -4602,7 +4623,6 @@ void PlayerbotFactory::ClearAllItems()
 
 void PlayerbotFactory::InitAmmo()
 {
-    RecordDecision(living::OrganicActionKind::AMMO_REPLENISH, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Ammo");
     if (bot->getClass() != CLASS_HUNTER && bot->getClass() != CLASS_ROGUE && bot->getClass() != CLASS_WARRIOR)
         return;
@@ -4648,6 +4668,12 @@ void PlayerbotFactory::InitAmmo()
     if (!entry)
         return;
 
+    // Recorded past every no-mutation early-out. PlayerbotAI::UpdateAI calls this
+    // on map-worker threads every tick for ranged bots with no ammo id, and a bot
+    // with no ranged weapon or no available ammo returns above forever: recording
+    // at entry would emit a permanent per-tick event for a provable no-op.
+    RecordDecision(living::OrganicActionKind::AMMO_REPLENISH, livingSource, bot);
+
     if (count < maxCount)
     {
         for (uint32 i = 0; i < maxCount - count; i++)
@@ -4662,7 +4688,6 @@ void PlayerbotFactory::InitAmmo()
 
 void PlayerbotFactory::InitMounts()
 {
-    RecordDecision(living::OrganicActionKind::MOUNT_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Mounts");
     uint32 firstmount =
 #ifdef MANGOSBOT_ZERO
@@ -4714,6 +4739,9 @@ void PlayerbotFactory::InitMounts()
 
     if (bot->GetLevel() < firstmount)
         return;
+
+    // Recorded past the level guard: a bot below the first mount level is a no-op.
+    RecordDecision(living::OrganicActionKind::MOUNT_INIT, livingSource, bot);
 
     std::map<uint8, std::map<uint32, std::vector<uint32> > > mounts;
     std::vector<uint32> slow, fast, fslow, ffast;
@@ -5313,9 +5341,11 @@ void PlayerbotFactory::InitImmersive()
 #ifndef MANGOSBOT_ZERO
 void PlayerbotFactory::InitArenaTeam()
 {
-    RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, bot);
     if (!sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
         return;
+
+    // Recorded past the random-account guard: a player-owned alt is a no-op here.
+    RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, bot);
 
     if (sPlayerbotAIConfig.randomBotArenaTeams.size() < sPlayerbotAIConfig.randomBotArenaTeamCount)
         RandomPlayerbotFactory::CreateRandomArenaTeams();
@@ -5324,9 +5354,12 @@ void PlayerbotFactory::InitArenaTeam()
 
 void PlayerbotFactory::EnchantEquipment()
 {
-    RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
     if (bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
     {
+        // Recorded inside the level guard: below minEnchantingBotLevel this method
+        // is a provable no-op.
+        RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
+
         if (m_EnchantContainer.empty())
         {
             LoadEnchantContainer();
@@ -5556,8 +5589,11 @@ void PlayerbotFactory::LoadEnchantContainer()
 }*/
 void PlayerbotFactory::InitGems() //WIP
 {
-    RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
 #ifndef MANGOSBOT_ZERO
+    // Recorded inside the expansion guard: classic has no gems and the whole body
+    // compiles away, so recording above it would emit for an empty method.
+    RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
+
     std::vector<uint32> gems = sRandomItemMgr.GetGemsList();
     for (int slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; slot++)
     {

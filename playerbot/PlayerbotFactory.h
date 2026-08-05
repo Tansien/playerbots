@@ -57,10 +57,13 @@ public:
     static std::list<uint32> specialQuestIds;
     void InitSkills();
     void EnchantEquipment();
-    void EquipGear() { InitEquipment(false, false); InitGems(); }
-    void EquipGearBest() { return InitEquipment(false, false, false); }
-    void EquipGearPartialUpgrade() { return InitEquipment(false, false, true, true); }
-    void UpgradeGear(bool syncWithMaster) { return InitEquipment(!syncWithMaster, syncWithMaster); }
+    // The chat/console gear wrappers are the periodic gear-update family (0002A
+    // matrix), so they observe as GEAR_UPGRADE. The skipped defaults are spelled
+    // out here only to reach the trailing kind; their values are unchanged.
+    void EquipGear() { InitEquipment(false, false, sPlayerbotAIConfig.randomGearProgression, false, living::OrganicActionKind::GEAR_UPGRADE); InitGems(); }
+    void EquipGearBest() { return InitEquipment(false, false, false, false, living::OrganicActionKind::GEAR_UPGRADE); }
+    void EquipGearPartialUpgrade() { return InitEquipment(false, false, true, true, living::OrganicActionKind::GEAR_UPGRADE); }
+    void UpgradeGear(bool syncWithMaster) { return InitEquipment(!syncWithMaster, syncWithMaster, sPlayerbotAIConfig.randomGearProgression, false, living::OrganicActionKind::GEAR_UPGRADE); }
     void AddReagents() { return InitReagents(); }
     void AddPotions() { return InitPotions(); }
     void AddConsumes() { return AddConsumables(); }
@@ -73,7 +76,7 @@ private:
     void Prepare();
     void InitSecondEquipmentSet();
     void Shuffle(std::vector<uint32>& items);
-    void InitEquipment(bool incremental, bool syncWithMaster, bool progressive = sPlayerbotAIConfig.randomGearProgression, bool partialUpgrade = false);
+    void InitEquipment(bool incremental, bool syncWithMaster, bool progressive = sPlayerbotAIConfig.randomGearProgression, bool partialUpgrade = false, living::OrganicActionKind observeKind = living::OrganicActionKind::GEAR_INIT);
     void InitEquipmentNew(bool incremental);
     bool CanEquipItem(ItemPrototype const* proto, uint32 desiredQuality);
     void InitAllSkills();
