@@ -37,7 +37,9 @@ namespace
         return sink;
     }
 
-    living::LivingClock& Clock()
+    // Not named Clock(): the cores' Common.h typedefs a global-scope Clock,
+    // and unqualified lookup here would be ambiguous.
+    living::LivingClock& ObserverClock()
     {
         static living::SystemLivingClock clock;
         return clock;
@@ -63,7 +65,7 @@ namespace living_observer
             living::LivingIdentitySnapshot identity;
             identity.characterGuid = characterGuid;
 
-            Sink().Emit(living::MakeMutationDecisionEvent(identity, Clock().UtcNowMs(), kind,
+            Sink().Emit(living::MakeMutationDecisionEvent(identity, ObserverClock().UtcNowMs(), kind,
                 living::Evaluate(request)));
         }
         catch (...)
