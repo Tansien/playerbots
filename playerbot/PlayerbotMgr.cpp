@@ -2,6 +2,7 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "PlayerbotDbStore.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/LivingRealmObserver.h"
 #include "playerbot/RandomPlayerbotFactory.h"
 #include "playerbot/RandomPlayerbotMgr.h"
 #include "playerbot/ServerFacade.h"
@@ -514,6 +515,16 @@ void PlayerbotHolder::OnBotLogin(Player * const bot)
 #endif
         )
     {
+        // Recorded inside the has-item guard, where the fabrication is certain.
+        // One record for both arms: they are the same missing-starter-item
+        // compound, only the item differs by expansion and class. The source is
+        // the random-bot login driver -- OnBotLogin runs from the core's
+        // PlayerbotHolder::HandlePlayerBotLoginCallback, and for the random-account
+        // characters this observer records at all, the AddPlayerBot that queued
+        // the login came from RandomPlayerbotMgr's timers and refresh paths.
+        living_observer::RecordDecision(living::OrganicActionKind::LOGIN_ITEM_FABRICATION,
+            living::OrganicSourceKind::RandomManager, bot);
+
 #ifdef MANGOSBOT_TWO
         if (bot->getClass() == CLASS_DEATH_KNIGHT && bot->GetMapId() == 609)
             bot->StoreNewItemInBestSlots(40582, 1);
@@ -624,6 +635,12 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
 std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string args, Player* master, AccountTypes security)
 {
     AccountTypes useSecurity = master ? master->GetSession()->GetSecurity() : security;
+
+    // Capture the origin before the substitution below hands the handlers a
+    // Player* for what was a console command. Rewritten on every entry, and
+    // command dispatch is world-thread only and never re-entered, so a plain
+    // member needs no guard.
+    m_commandFromConsole = !master;
 
     if (!master && m_spoofGuid)
         master = sObjectMgr.GetPlayer(m_spoofGuid);
@@ -1863,6 +1880,23 @@ std::string PlayerbotHolder::HandleBotRemoveLogout(Player* bot, Player* master, 
     return "ok";
 }
 
+namespace
+{
+    // Shared attribution for the bot command handlers below, which also serve
+    // the server console: HandlePlayerbotCommand passes master == nullptr there,
+    // and an active `.bot spoof` then substitutes the spoofed Player* for that
+    // null master, so master alone no longer identifies the origin. fromConsole
+    // carries the origin captured at the substitution site. Deliberately no
+    // bot/real-player test on master: selfbot attaches a PlayerbotAI to a real
+    // player, and a spoof target may itself be a real player, so neither
+    // GetPlayerbotAI() nor isRealPlayer() tells us where the command came from.
+    living::OrganicSourceKind CommandSource(Player* master, bool fromConsole)
+    {
+        return (!master || fromConsole) ? living::OrganicSourceKind::ConsoleCommand
+                                       : living::OrganicSourceKind::PlayerChatCommand;
+    }
+}
+
 void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::list<std::string>& messages, ObjectGuid& guid)
 {    
     // Allow null master for RA/console usage
@@ -2008,6 +2042,17 @@ void PlayerbotHolder::CreateBot(Player* master, const std::string param, std::li
         botSession->SetNoAnticheat();
 
         Player* newBot = new Player(botSession);
+
+        // The bootstrap question is only well-formed pre-creation, while the guid
+        // is still 0, so this uses the batch overload like the CORE_CHARACTER_CREATE
+        // precedent in RandomPlayerbotFactory; marking the attempt here counts
+        // failed creations too. One record for the whole compound: the level, taxi,
+        // talent, profession and spell grants below (including the direct PLAYER_XP
+        // write) are the "and then grants" half of COMMAND_CHARACTER_PROVISION, not
+        // separate fabrications.
+        living_observer::RecordDecision(living::OrganicActionKind::COMMAND_CHARACTER_PROVISION,
+            CommandSource(master, m_commandFromConsole), uint32(0));
+
         if (!newBot->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender, skin, face, hairStyle, hairColor, facialHair, 0))
         {
             delete botSession;
@@ -2545,49 +2590,49 @@ std::string PlayerbotHolder::HandleBotGear(Player* bot, Player* master, const st
 {
     if (param.empty())
     {
-        PlayerbotFactory factory(bot, bot->GetLevel());
+        PlayerbotFactory factory(bot, bot->GetLevel(), 0, CommandSource(master, m_commandFromConsole));
         factory.EquipGear();
         return "random gear equipped";
     }
     if (param == "green" || param == "uncommon")
     {
-        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_UNCOMMON);
+        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_UNCOMMON, CommandSource(master, m_commandFromConsole));
         factory.EquipGear();
         return "random green gear equipped";
     }
     if (param == "blue" || param == "rare")
     {
-        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_RARE);
+        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_RARE, CommandSource(master, m_commandFromConsole));
         factory.EquipGear();
         return "random blue gear equipped";
     }
     if (param == "purple" || param == "epic")
     {
-        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_EPIC);
+        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_EPIC, CommandSource(master, m_commandFromConsole));
         factory.EquipGear();
         return "random epic gear equipped";
     }
     if (param == "upgrade")
     {
-        PlayerbotFactory factory(bot, master ? master->GetLevel() : bot->GetLevel(), ITEM_QUALITY_NORMAL);
+        PlayerbotFactory factory(bot, master ? master->GetLevel() : bot->GetLevel(), ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
         factory.UpgradeGear(false);
         return "gear upgraded";
     }
     if (param == "sync")
     {
-        PlayerbotFactory factory(bot, master ? master->GetLevel() : bot->GetLevel(), ITEM_QUALITY_NORMAL);
+        PlayerbotFactory factory(bot, master ? master->GetLevel() : bot->GetLevel(), ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
         factory.UpgradeGear(true);
         return "gear upgraded";
     }
     if (param == "best")
     {
-        PlayerbotFactory factory(bot, bot->GetLevel());
+        PlayerbotFactory factory(bot, bot->GetLevel(), 0, CommandSource(master, m_commandFromConsole));
         factory.EquipGearBest();
         return "random best gear equipped";
     }
     if (param == "partial")
     {
-        PlayerbotFactory factory(bot, bot->GetLevel());
+        PlayerbotFactory factory(bot, bot->GetLevel(), 0, CommandSource(master, m_commandFromConsole));
         factory.EquipGearPartialUpgrade();
         return "random gear upgraded to some slots";
     }
@@ -2606,7 +2651,7 @@ std::string PlayerbotHolder::HandleBotTrainLearn(Player* bot, Player* master, co
 std::string PlayerbotHolder::HandleBotFoodDrink(Player* bot, Player* master, const std::string param)
 {
     uint32 level = master ? master->GetLevel() : bot->GetLevel();
-    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
     factory.AddFood();
     return "food added";
 }
@@ -2614,7 +2659,7 @@ std::string PlayerbotHolder::HandleBotFoodDrink(Player* bot, Player* master, con
 std::string PlayerbotHolder::HandleBotPotions(Player* bot, Player* master, const std::string param)
 {
     uint32 level = master ? master->GetLevel() : bot->GetLevel();
-    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
     factory.AddPotions();
     return "potions added";
 }
@@ -2622,7 +2667,7 @@ std::string PlayerbotHolder::HandleBotPotions(Player* bot, Player* master, const
 std::string PlayerbotHolder::HandleBotConsumes(Player* bot, Player* master, const std::string param)
 {
     uint32 level = master ? master->GetLevel() : bot->GetLevel();
-    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
     factory.AddConsumes();
     return "consumables added";
 }
@@ -2630,7 +2675,7 @@ std::string PlayerbotHolder::HandleBotConsumes(Player* bot, Player* master, cons
 std::string PlayerbotHolder::HandleBotReagents(Player* bot, Player* master, const std::string param)
 {
     uint32 level = master ? master->GetLevel() : bot->GetLevel();
-    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
     factory.AddReagents();
     return "reagents added";
 }
@@ -2638,7 +2683,7 @@ std::string PlayerbotHolder::HandleBotReagents(Player* bot, Player* master, cons
 std::string PlayerbotHolder::HandleBotPrepare(Player* bot, Player* master, const std::string param)
 {
     uint32 level = master ? master->GetLevel() : bot->GetLevel();
-    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+    PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
     factory.Refresh();
     return "consumes/regs added";
 }
@@ -2649,37 +2694,37 @@ std::string PlayerbotHolder::HandleBotInit(Player* bot, Player* master, const st
 
     if (param.empty())
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
         factory.Randomize(true, false);
     }
     else if (param == "white" || param == "common")
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_NORMAL, CommandSource(master, m_commandFromConsole));
         factory.Randomize(false, false);
     }
     else if (param == "green" || param == "uncommon")
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_UNCOMMON);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_UNCOMMON, CommandSource(master, m_commandFromConsole));
         factory.Randomize(false, false);
     }
     else if (param == "blue" || param == "rare")
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_RARE);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_RARE, CommandSource(master, m_commandFromConsole));
         factory.Randomize(false, false);
     }
     else if (param == "epic" || param == "purple")
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_EPIC);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_EPIC, CommandSource(master, m_commandFromConsole));
         factory.Randomize(false, false);
     }
     else if (param == "legendary" || param == "yellow")
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_LEGENDARY);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_LEGENDARY, CommandSource(master, m_commandFromConsole));
         factory.Randomize(false, false);
     }
     else if (param == "sync")
     {
-        PlayerbotFactory factory(bot, level, ITEM_QUALITY_LEGENDARY);
+        PlayerbotFactory factory(bot, level, ITEM_QUALITY_LEGENDARY, CommandSource(master, m_commandFromConsole));
         factory.Randomize(false, true);
     }
 
@@ -2688,21 +2733,21 @@ std::string PlayerbotHolder::HandleBotInit(Player* bot, Player* master, const st
 
 std::string PlayerbotHolder::HandleBotEnchants(Player* bot, Player* master, const std::string param)
 {
-    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY);
+    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY, CommandSource(master, m_commandFromConsole));
     factory.EnchantEquipment();
     return "ok";
 }
 
 std::string PlayerbotHolder::HandleBotAmmo(Player* bot, Player* master, const std::string param)
 {
-    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY);
+    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY, CommandSource(master, m_commandFromConsole));
     factory.InitAmmo();
     return "ok";
 }
 
 std::string PlayerbotHolder::HandleBotPet(Player* bot, Player* master, const std::string param)
 {
-    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY);
+    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY, CommandSource(master, m_commandFromConsole));
     factory.InitPet();
     factory.InitPetSpells();
     return "ok";
@@ -2710,14 +2755,14 @@ std::string PlayerbotHolder::HandleBotPet(Player* bot, Player* master, const std
 
 std::string PlayerbotHolder::HandleBotLevelUp(Player* bot, Player* master, const std::string param)
 {
-    PlayerbotFactory factory(bot, bot->GetLevel());
+    PlayerbotFactory factory(bot, bot->GetLevel(), 0, CommandSource(master, m_commandFromConsole));
     factory.Randomize(true, false);
     return "ok";
 }
 
 std::string PlayerbotHolder::HandleBotRefresh(Player* bot, Player* master, const std::string param)
 {
-    PlayerbotFactory factory(bot, bot->GetLevel());
+    PlayerbotFactory factory(bot, bot->GetLevel(), 0, CommandSource(master, m_commandFromConsole));
     factory.Refresh();
     return "ok";
 }

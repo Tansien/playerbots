@@ -18,6 +18,8 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "PlayerbotAI.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/LivingRealmObserver.h"
+#include "playerbot/living/policy/OrganicPolicy.h"
 #include "PlayerbotSecurity.h"
 #include "Groups/Group.h"
 #include "Entities/Pet.h"
@@ -508,6 +510,12 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
                     if (bot->getClass() == CLASS_HUNTER && item->GetProto()->SubClass == ITEM_SUBCLASS_WEAPON_THROWN) //Do not replenish thrown weapons for hunters.
                         break;
 
+                    // Only a real top-up is a fabrication: with a full stack
+                    // SetCount rewrites the count the item already has, and this
+                    // block runs every AI tick, per bot, on map threads.
+                    if (item->GetCount() < item->GetProto()->GetMaxStackSize())
+                        living_observer::RecordDecision(living::OrganicActionKind::AMMO_REPLENISH, living::OrganicSourceKind::AiUpdate, bot);
+
                     item->SetCount(item->GetProto()->GetMaxStackSize());
                     break;
                 }
@@ -517,10 +525,10 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 #ifndef MANGOSBOT_ZERO
                 if (!bot->HasAura(46699)) // Thori'dal
                 {
-                    PlayerbotFactory(bot, bot->GetLevel(), 0).InitAmmo();
+                    PlayerbotFactory(bot, bot->GetLevel(), 0, living::OrganicSourceKind::AiUpdate).InitAmmo();
                 }
 #else
-                PlayerbotFactory(bot, bot->GetLevel(), 0).InitAmmo();
+                PlayerbotFactory(bot, bot->GetLevel(), 0, living::OrganicSourceKind::AiUpdate).InitAmmo();
 #endif
             }
         }

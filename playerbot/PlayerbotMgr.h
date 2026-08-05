@@ -135,6 +135,10 @@ private:
     std::map<std::string, HolderCommandHandler> m_holderHandlers;
     std::map<std::string, BotCommandHandler> m_botCommandHandlers;
     ObjectGuid m_spoofGuid;
+    // True while dispatching a command whose origin was the server console.
+    // Set in HandlePlayerbotCommand before the m_spoofGuid substitution can
+    // replace the null console master with a spoofed Player*.
+    bool m_commandFromConsole = false;
 };
 
 class PlayerbotMgr : public PlayerbotHolder

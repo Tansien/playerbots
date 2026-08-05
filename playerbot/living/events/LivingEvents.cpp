@@ -22,13 +22,14 @@ namespace living
     }
 
     LivingEvent MakeMutationDecisionEvent(LivingIdentitySnapshot const& identity, uint64_t utcMs,
-        OrganicActionKind action, OrganicEvaluation evaluation)
+        OrganicActionKind action, OrganicSourceKind source, OrganicEvaluation evaluation)
     {
         LivingEvent event;
         event.kind = LivingEventKind::MutationDecision;
         event.identity = identity;
         event.utcMs = utcMs;
         event.action = action;
+        event.source = source;
         event.decision = evaluation.decision;
         event.reason = evaluation.reason;
         return event;

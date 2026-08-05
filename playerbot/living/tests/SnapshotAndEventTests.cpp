@@ -20,6 +20,7 @@ using living::OrganicActionKind;
 using living::OrganicDecision;
 using living::OrganicReasonCode;
 using living::OrganicRequest;
+using living::OrganicSourceKind;
 using living::ProposalIsCurrent;
 using living::TryGetOrganicActionMetadata;
 
@@ -106,6 +107,7 @@ LIVING_TEST(UnpopulatedEventPayloadCannotResembleARealDecision)
     LIVING_CHECK(std::strcmp(ToString(event.kind), "INVALID_EVENT") == 0);
     LIVING_CHECK(std::strcmp(living::ToString(event.decision), "INVALID_DECISION") == 0);
     LIVING_CHECK(std::strcmp(living::ToString(event.reason), "INVALID_REASON") == 0);
+    LIVING_CHECK(std::strcmp(living::ToString(event.source), "INVALID_SOURCE") == 0);
     LIVING_CHECK(TryGetOrganicActionMetadata(event.action) == nullptr);
 }
 
@@ -139,22 +141,25 @@ LIVING_TEST(InMemorySinkRecordsEventsInOrder)
 
 LIVING_TEST(MutationDecisionEventCarriesTheEvaluationFaithfully)
 {
-    // The event must carry the action and the exact decision/reason pair the
-    // evaluator returned -- across DISTINCT outcomes, so a builder hardcoding
-    // any one pair cannot pass (0002 section 5: intercepted mutation decisions
-    // are the observation Phase 0 most needs to see).
+    // The event must carry the action, the requesting source, and the exact
+    // decision/reason pair the evaluator returned -- across DISTINCT actions,
+    // sources and outcomes, so a builder hardcoding any one of them cannot pass
+    // (0002 section 5: intercepted mutation decisions are the observation
+    // Phase 0 most needs to see). The source is what attributes an intercepted
+    // row to the call site that asked, so it has to survive the trip to a sink.
     LivingIdentitySnapshot const identity = Identity(88);
 
     struct Expectation
     {
         OrganicActionKind action;
+        OrganicSourceKind source;
         OrganicDecision decision;
         OrganicReasonCode reason;
     };
     static Expectation const CASES[] = {
-        { OrganicActionKind::RANDOM_TELEPORT, OrganicDecision::Deny, OrganicReasonCode::DeniedByClassification },
-        { OrganicActionKind::TALENT_SPEND_EARNED, OrganicDecision::AllowAutomation, OrganicReasonCode::AllowedAutomation },
-        { OrganicActionKind::STUCK_EMERGENCY_TELEPORT, OrganicDecision::RequireAudit, OrganicReasonCode::AuditRequired },
+        { OrganicActionKind::RANDOM_TELEPORT, OrganicSourceKind::AiUpdate, OrganicDecision::Deny, OrganicReasonCode::DeniedByClassification },
+        { OrganicActionKind::TALENT_SPEND_EARNED, OrganicSourceKind::PlayerChatCommand, OrganicDecision::AllowAutomation, OrganicReasonCode::AllowedAutomation },
+        { OrganicActionKind::STUCK_EMERGENCY_TELEPORT, OrganicSourceKind::RandomManager, OrganicDecision::RequireAudit, OrganicReasonCode::AuditRequired },
     };
 
     for (Expectation const& expected : CASES)
@@ -163,19 +168,29 @@ LIVING_TEST(MutationDecisionEventCarriesTheEvaluationFaithfully)
         request.characterGuid = identity.characterGuid;
         request.identityNonce = identity.identityNonce;
         request.kind = expected.action;
-        request.source = living::OrganicSourceKind::AiUpdate;
+        request.source = expected.source;
 
         living::OrganicEvaluation const evaluation = Evaluate(request);
         LIVING_CHECK(evaluation.decision == expected.decision);
         LIVING_CHECK(evaluation.reason == expected.reason);
 
-        LivingEvent const event = MakeMutationDecisionEvent(identity, 777, request.kind, evaluation);
+        LivingEvent const event = MakeMutationDecisionEvent(identity, 777, request.kind, request.source, evaluation);
 
         LIVING_CHECK(event.kind == LivingEventKind::MutationDecision);
         LIVING_CHECK(event.identity == identity);
         LIVING_CHECK(event.utcMs == 777);
         LIVING_CHECK(event.action == expected.action);
+        LIVING_CHECK(event.source == expected.source);
         LIVING_CHECK(event.decision == evaluation.decision);
         LIVING_CHECK(event.reason == evaluation.reason);
+
+        // Equality is memberwise over the whole payload: two rows that differ
+        // only in their source must not compare equal, or a misattributed
+        // observation would be indistinguishable from a correct one.
+        LivingEvent misattributed = event;
+        misattributed.source = (expected.source == OrganicSourceKind::ConsoleCommand)
+            ? OrganicSourceKind::RecoveryService
+            : OrganicSourceKind::ConsoleCommand;
+        LIVING_CHECK(!(misattributed == event));
     }
 }

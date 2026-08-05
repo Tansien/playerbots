@@ -3,6 +3,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/LivingRealmObserver.h"
 #include "Accounts/AccountMgr.h"
 #include "Globals/ObjectMgr.h"
 #include "Database/DatabaseEnv.h"
@@ -386,6 +387,13 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
         sLog.outError("BOTS: Unable to create session or player for random acc %d - name: \"%s\"; race: %u; class: %u", accountId, name.c_str(), race, cls);
         return false;
     }
+
+    // The bootstrap question is only well-formed pre-creation, while the guid is
+    // still 0; for this legacy path the truthful answer is Deny/BootstrapSourceRequired
+    // (the legacy creator is not the managed bootstrap), and marking the attempt
+    // here means failed creations are counted too.
+    living_observer::RecordDecision(living::OrganicActionKind::CORE_CHARACTER_CREATE, living::OrganicSourceKind::RandomManager, uint32(0));
+
 	if (!player->Create(sObjectMgr.GeneratePlayerLowGuid(), name, race, cls, gender,
 	        face.second, // skinColor,
 	        face.first,
@@ -548,6 +556,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     if (sPlayerbotAIConfig.deleteRandomBotAccounts || delAccs)
     {
+        living_observer::RecordDecision(living::OrganicActionKind::POPULATION_RESET_RECREATE, living::OrganicSourceKind::RandomManager, uint32(0));
         std::list<uint32> botAccounts;
         std::list<uint32> botFriends;
 
@@ -1052,7 +1061,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 }
 
 
-void RandomPlayerbotFactory::CreateRandomGuilds()
+void RandomPlayerbotFactory::CreateRandomGuilds(living::OrganicSourceKind livingSource)
 {
     std::vector<uint32> randomBots;
     std::map<uint32, std::vector<uint32>> charAccGuids;
@@ -1084,6 +1093,12 @@ void RandomPlayerbotFactory::CreateRandomGuilds()
     if (randomBots.empty())
         return;
 
+    // Fabricating-pass latch, past both pure early-outs above: at steady state
+    // (guilds already deleted once, pool already full) this pass neither disbands
+    // nor creates anything. Record immediately before the first guild it does
+    // touch, once for the whole batch.
+    bool recorded = false;
+
     if (sPlayerbotAIConfig.deleteRandomBotGuilds && !sRandomPlayerbotMgr.guildsDeleted)
     {
         sLog.outString("Deleting random bot guilds...");
@@ -1094,6 +1109,12 @@ void RandomPlayerbotFactory::CreateRandomGuilds()
             Guild* guild = sGuildMgr.GetGuildByLeader(leader);
             if (guild)
             {
+                if (!recorded)
+                {
+                    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, uint32(0));
+                    recorded = true;
+                }
+
                 guild->Disband();
                 counter++;
             }
@@ -1156,6 +1177,15 @@ void RandomPlayerbotFactory::CreateRandomGuilds()
             continue;
 
         Guild* guild = new Guild();
+
+        // Marked before the attempt, matching the CreateRandomBot precedent: a
+        // failed creation still consumed a name and a leader.
+        if (!recorded)
+        {
+            living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, uint32(0));
+            recorded = true;
+        }
+
         if (!guild->Create(player, guildName))
         {
             sLog.outError("Error creating random guild %s", guildName.c_str());
@@ -1211,8 +1241,14 @@ std::string RandomPlayerbotFactory::CreateRandomGuildName()
 }
 
 #ifndef MANGOSBOT_ZERO
-void RandomPlayerbotFactory::CreateRandomArenaTeams()
+void RandomPlayerbotFactory::CreateRandomArenaTeams(living::OrganicSourceKind livingSource)
 {
+    // Fabricating-pass latch: at steady state (teams already deleted once, pool
+    // already full, no eligible captains) this pass neither disbands nor creates
+    // anything. Record immediately before the first team it does touch, once for
+    // the whole batch.
+    bool recorded = false;
+
     std::vector<uint32> randomBots;
 
     auto results = CharacterDatabase.PQuery(
@@ -1236,8 +1272,16 @@ void RandomPlayerbotFactory::CreateRandomArenaTeams()
             ObjectGuid captain(HIGHGUID_PLAYER, *i);
             ArenaTeam* arenateam = sObjectMgr.GetArenaTeamByCaptain(captain);
             if (arenateam)
+            {
+                if (!recorded)
+                {
+                    living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, uint32(0));
+                    recorded = true;
+                }
+
                 //sObjectMgr.RemoveArenaTeam(arenateam->GetId());
                 arenateam->Disband(NULL);
+            }
         }
         sLog.outString("Random bot arena teams deleted");
 
@@ -1368,6 +1412,15 @@ void RandomPlayerbotFactory::CreateRandomArenaTeams()
             continue;
 
         ArenaTeam* arenateam = new ArenaTeam();
+
+        // Marked before the attempt, matching the CreateRandomBot precedent: a
+        // failed creation still consumed a name and a captain.
+        if (!recorded)
+        {
+            living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, uint32(0));
+            recorded = true;
+        }
+
         if (!arenateam->Create(player->GetObjectGuid(), type, arenaTeamName))
         {
             sLog.outError("Error creating arena team %s", arenaTeamName.c_str());

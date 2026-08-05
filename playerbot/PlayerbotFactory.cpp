@@ -1,6 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/LivingRealmObserver.h"
 
 #include "Server/SQLStorages.h"
 #include "Entities/ItemPrototype.h"
@@ -25,6 +26,7 @@
 #include "strategy/ItemVisitors.h"
 
 using namespace ai;
+using namespace living_observer;
 
 #define PLAYER_SKILL_INDEX(x)       (PLAYER_SKILL_INFO_1_1 + ((x)*3))
 
@@ -149,6 +151,7 @@ void PlayerbotFactory::Prepare()
 
     if (!sPlayerbotAIConfig.disableRandomLevels)
     {
+        RecordDecision(living::OrganicActionKind::LEVEL_ASSIGN, livingSource, bot);
         bot->SetLevel(level);
         //Reset xp and xp for next level.
         bot->SetUInt32Value(PLAYER_XP, 0);
@@ -169,6 +172,9 @@ void PlayerbotFactory::Prepare()
 void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 {
     sLog.outDetail("Preparing to %s randomize...", (incremental ? "incremental" : "full"));
+    // Guards interleave with mutation here: the disableRandomLevels early-out sits
+    // behind Prepare(), which already mutates, so record before the first mutation.
+    RecordDecision(incremental ? living::OrganicActionKind::RANDOMIZE_INCREMENTAL : living::OrganicActionKind::RANDOMIZE_FULL, livingSource, bot);
     Prepare();
 
     if (sPlayerbotAIConfig.disableRandomLevels)
@@ -192,6 +198,13 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
     }
     if (isRealRandomBot)
     {
+        // Not recorded: dead on master. Prepare() above already set the level to
+        // exactly `level` whenever randomization is enabled, Randomize returns at
+        // the disableRandomLevels guard when it is not, and core Unit::SetLevel
+        // writes UNIT_FIELD_LEVEL without clamping (Unit.cpp:9203 in the pinned
+        // classic baseline), so GetLevel() can never exceed level here. The
+        // second site below is live: the quest rewards in between can level the
+        // bot back up.
         if (bot->GetLevel() > level)
         {
             bot->SetLevel(level);
@@ -207,6 +220,7 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
         ClearInventory();
         if (bot->GetLevel() > level)
         {
+            RecordDecision(living::OrganicActionKind::LEVEL_ASSIGN, livingSource, bot);
             bot->SetLevel(level);
             //Reset xp and xp for next level.
             bot->SetUInt32Value(PLAYER_XP, 0);
@@ -266,7 +280,9 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
         LoadEnchantContainer();
     }
 
-    InitEquipment(incremental, syncWithMaster);
+    // The incremental randomize pass is the periodic gear-update family (0002A matrix).
+    InitEquipment(incremental, syncWithMaster, sPlayerbotAIConfig.randomGearProgression, false,
+        incremental ? living::OrganicActionKind::GEAR_UPGRADE : living::OrganicActionKind::GEAR_INIT);
     InitGems();
     pmo.reset();
 
@@ -330,6 +346,10 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 
     if (isRandomBot)
     {
+        // The incremental branch is an additive grant re-armed by the periodic
+        // randomize timer, so it belongs to the periodic money family; only the
+        // non-incremental one-shot is the starting-money initialization.
+        RecordDecision(incremental ? living::OrganicActionKind::MONEY_PERIODIC : living::OrganicActionKind::MONEY_INIT, livingSource, bot);
         if (incremental)
         {
             uint32 money = bot->GetMoney();
@@ -373,6 +393,23 @@ void PlayerbotFactory::Refresh()
 void PlayerbotFactory::AddConsumables()
 {
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Consumables");
+
+    // Fabricating-pass latch. The switch below has no druid, shaman or death
+    // knight arm and every arm it does have is level-banded, so entry recording
+    // would emit for a provable no-op. Record once, immediately before the first
+    // item this pass actually fabricates.
+    bool recorded = false;
+    auto storeConsumable = [&](uint32 itemId, uint32 count)
+    {
+        if (!recorded)
+        {
+            RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
+            recorded = true;
+        }
+
+        StoreItem(itemId, count);
+    };
+
    switch (bot->getClass())
    {
       case CLASS_PRIEST:
@@ -380,33 +417,33 @@ void PlayerbotFactory::AddConsumables()
       case CLASS_WARLOCK:
       {
          if (level >= 5 && level < 20) {
-            StoreItem(CONSUM_ID_MINOR_WIZARD_OIL, 5);
+            storeConsumable(CONSUM_ID_MINOR_WIZARD_OIL, 5);
             }
          if (level >= 20 && level < 40) {
-            StoreItem(CONSUM_ID_MINOR_MANA_OIL, 5);
-            StoreItem(CONSUM_ID_MINOR_WIZARD_OIL, 5);
+            storeConsumable(CONSUM_ID_MINOR_MANA_OIL, 5);
+            storeConsumable(CONSUM_ID_MINOR_WIZARD_OIL, 5);
          }
          if (level >= 40 && level < 45) {
-             StoreItem(CONSUM_ID_MINOR_MANA_OIL, 5);
-             StoreItem(CONSUM_ID_WIZARD_OIL, 5);
+             storeConsumable(CONSUM_ID_MINOR_MANA_OIL, 5);
+             storeConsumable(CONSUM_ID_WIZARD_OIL, 5);
          }
 #ifdef MANGOSBOT_ZERO
          if (level >= 45) {
-             StoreItem(CONSUM_ID_BRILLIANT_MANA_OIL, 5);
-             StoreItem(CONSUM_ID_BRILLIANT_WIZARD_OIL, 5);
+             storeConsumable(CONSUM_ID_BRILLIANT_MANA_OIL, 5);
+             storeConsumable(CONSUM_ID_BRILLIANT_WIZARD_OIL, 5);
          }
 #else
          if (level >= 45 && level < 52) {
-            StoreItem(CONSUM_ID_BRILLIANT_MANA_OIL, 5);
-            StoreItem(CONSUM_ID_BRILLIANT_WIZARD_OIL, 5);
+            storeConsumable(CONSUM_ID_BRILLIANT_MANA_OIL, 5);
+            storeConsumable(CONSUM_ID_BRILLIANT_WIZARD_OIL, 5);
          }
          if (level >= 52 && level < 58) {
-            StoreItem(CONSUM_ID_SUPERIOR_MANA_OIL, 5);
-            StoreItem(CONSUM_ID_BRILLIANT_WIZARD_OIL, 5);
+            storeConsumable(CONSUM_ID_SUPERIOR_MANA_OIL, 5);
+            storeConsumable(CONSUM_ID_BRILLIANT_WIZARD_OIL, 5);
          }
          if (level >= 58 && level < 72) {
-           StoreItem(CONSUM_ID_SUPERIOR_MANA_OIL, 5);
-           StoreItem(CONSUM_ID_SUPERIOR_WIZARD_OIL, 5);
+           storeConsumable(CONSUM_ID_SUPERIOR_MANA_OIL, 5);
+           storeConsumable(CONSUM_ID_SUPERIOR_WIZARD_OIL, 5);
       }
 #endif
    }
@@ -416,38 +453,38 @@ void PlayerbotFactory::AddConsumables()
       case CLASS_HUNTER:
        {
          if (level >= 1 && level < 5) {
-            StoreItem(CONSUM_ID_ROUGH_SHARPENING_STONE, 5);
-            StoreItem(CONSUM_ID_ROUGH_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_ROUGH_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_ROUGH_WEIGHTSTONE, 5);
         }
          if (level >= 5 && level < 15) {
-            StoreItem(CONSUM_ID_COARSE_WEIGHTSTONE, 5);
-            StoreItem(CONSUM_ID_COARSE_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_COARSE_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_COARSE_SHARPENING_STONE, 5);
          }
          if (level >= 15 && level < 25) {
-            StoreItem(CONSUM_ID_HEAVY_WEIGHTSTONE, 5);
-            StoreItem(CONSUM_ID_HEAVY_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_HEAVY_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_HEAVY_SHARPENING_STONE, 5);
          }
          if (level >= 25 && level < 35) {
-            StoreItem(CONSUM_ID_SOL_SHARPENING_STONE, 5);
-            StoreItem(CONSUM_ID_SOLID_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_SOL_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_SOLID_WEIGHTSTONE, 5);
          }
 #ifdef MANGOSBOT_ZERO
          if (level >= 35) {
-             StoreItem(CONSUM_ID_DENSE_WEIGHTSTONE, 5);
-             StoreItem(CONSUM_ID_DENSE_SHARPENING_STONE, 5);
+             storeConsumable(CONSUM_ID_DENSE_WEIGHTSTONE, 5);
+             storeConsumable(CONSUM_ID_DENSE_SHARPENING_STONE, 5);
          }
 #else
          if (level >= 35 && level < 50) {
-            StoreItem(CONSUM_ID_DENSE_WEIGHTSTONE, 5);
-            StoreItem(CONSUM_ID_DENSE_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_DENSE_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_DENSE_SHARPENING_STONE, 5);
          }
          if (level >= 50 && level < 60) {
-            StoreItem(CONSUM_ID_FEL_SHARPENING_STONE, 5);
-            StoreItem(CONSUM_ID_FEL_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_FEL_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_FEL_WEIGHTSTONE, 5);
          }
          if (level >= 60) {
-            StoreItem(CONSUM_ID_ADAMANTITE_WEIGHTSTONE, 5);
-            StoreItem(CONSUM_ID_ADAMANTITE_SHARPENING_STONE, 5);
+            storeConsumable(CONSUM_ID_ADAMANTITE_WEIGHTSTONE, 5);
+            storeConsumable(CONSUM_ID_ADAMANTITE_SHARPENING_STONE, 5);
          }
 #endif
    }
@@ -455,89 +492,89 @@ void PlayerbotFactory::AddConsumables()
        case CLASS_ROGUE:
       {
          if (level >= 20 && level < 28) {
-            StoreItem(CONSUM_ID_INSTANT_POISON, 5);
-            StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON, 5);
+            storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
          }
          if (level >= 28 && level < 30) {
-            StoreItem(CONSUM_ID_INSTANT_POISON_II, 5);
-            StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
-            StoreItem(CONSUM_ID_MIND_POISON, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_II, 5);
+            storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
+            storeConsumable(CONSUM_ID_MIND_POISON, 5);
          }
          if (level >= 30 && level < 36) {
-            StoreItem(CONSUM_ID_DEADLY_POISON, 5);
-            StoreItem(CONSUM_ID_INSTANT_POISON_II, 5);
-            StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
-            StoreItem(CONSUM_ID_MIND_POISON, 5);
+            storeConsumable(CONSUM_ID_DEADLY_POISON, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_II, 5);
+            storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
+            storeConsumable(CONSUM_ID_MIND_POISON, 5);
          }
          if (level >= 36 && level < 38) {
-             StoreItem(CONSUM_ID_DEADLY_POISON, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_III, 5);
-             StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
-             StoreItem(CONSUM_ID_MIND_POISON, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_III, 5);
+             storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
+             storeConsumable(CONSUM_ID_MIND_POISON, 5);
          }
          if (level >= 38 && level < 44) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_II, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_III, 5);
-             StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
-             StoreItem(CONSUM_ID_MIND_POISON_II, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_II, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_III, 5);
+             storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
+             storeConsumable(CONSUM_ID_MIND_POISON_II, 5);
          }
          if (level >= 44 && level < 46) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_II, 5);
-            StoreItem(CONSUM_ID_INSTANT_POISON_IV, 5);
-            StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
-            StoreItem(CONSUM_ID_MIND_POISON_II, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_II, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_IV, 5);
+            storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
+            storeConsumable(CONSUM_ID_MIND_POISON_II, 5);
          }
          if (level >= 46 && level < 52) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_III, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_IV, 5);
-             StoreItem(CONSUM_ID_CRIPPLING_POISON, 5);
-             StoreItem(CONSUM_ID_MIND_POISON_II, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_III, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_IV, 5);
+             storeConsumable(CONSUM_ID_CRIPPLING_POISON, 5);
+             storeConsumable(CONSUM_ID_MIND_POISON_II, 5);
          }
          if (level >= 52 && level < 54) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_III, 5);
-            StoreItem(CONSUM_ID_INSTANT_POISON_V, 5);
-            StoreItem(CONSUM_ID_CRIPPLING_POISON_II, 5);
-            StoreItem(CONSUM_ID_MIND_POISON_III, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_III, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_V, 5);
+            storeConsumable(CONSUM_ID_CRIPPLING_POISON_II, 5);
+            storeConsumable(CONSUM_ID_MIND_POISON_III, 5);
          }
          if (level >= 54 && level < 60) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_IV, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_V, 5);
-             StoreItem(CONSUM_ID_CRIPPLING_POISON_II, 5);
-             StoreItem(CONSUM_ID_MIND_POISON_III, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_IV, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_V, 5);
+             storeConsumable(CONSUM_ID_CRIPPLING_POISON_II, 5);
+             storeConsumable(CONSUM_ID_MIND_POISON_III, 5);
          }
          if (level >= 60 && level < 62) {
-            StoreItem(CONSUM_ID_DEADLY_POISON_V, 5);
-            StoreItem(CONSUM_ID_INSTANT_POISON_VI, 5);
-            StoreItem(CONSUM_ID_CRIPPLING_POISON_II, 5);
-            StoreItem(CONSUM_ID_MIND_POISON_III, 5);
+            storeConsumable(CONSUM_ID_DEADLY_POISON_V, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_VI, 5);
+            storeConsumable(CONSUM_ID_CRIPPLING_POISON_II, 5);
+            storeConsumable(CONSUM_ID_MIND_POISON_III, 5);
          }
          if (level >= 62 && level < 68) {
-            StoreItem(CONSUM_ID_DEADLY_POISON_VI, 5);
-            StoreItem(CONSUM_ID_INSTANT_POISON_VI, 5);
+            storeConsumable(CONSUM_ID_DEADLY_POISON_VI, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_VI, 5);
          }
          if (level >= 68 && level < 70) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_VI, 5);
-            StoreItem(CONSUM_ID_INSTANT_POISON_VII, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_VI, 5);
+            storeConsumable(CONSUM_ID_INSTANT_POISON_VII, 5);
          }
          if (level >= 70 && level < 73) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_VII, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_VII, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_VII, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_VII, 5);
          }
          if (level >= 73 && level < 76) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_VII, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_VIII, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_VII, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_VIII, 5);
          }
          if (level >= 76 && level < 79) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_VIII, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_VIII, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_VIII, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_VIII, 5);
          }
          if (level >= 79 && level < 80) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_VIII, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_IX, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_VIII, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_IX, 5);
          }
          if (level == 80) {
-             StoreItem(CONSUM_ID_DEADLY_POISON_IX, 5);
-             StoreItem(CONSUM_ID_INSTANT_POISON_IX, 5);
+             storeConsumable(CONSUM_ID_DEADLY_POISON_IX, 5);
+             storeConsumable(CONSUM_ID_INSTANT_POISON_IX, 5);
          }
          break;
       }
@@ -549,6 +586,9 @@ void PlayerbotFactory::InitPet()
     // Randomize a new pet (only for hunters)
     if (bot->getClass() != CLASS_HUNTER)
         return;
+
+    // Recorded past the class guard: a warlock entering here is a provable no-op.
+    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
 
     Pet* pet = bot->GetPet();
     if (!pet)
@@ -644,6 +684,12 @@ void PlayerbotFactory::InitPet()
 #ifndef MANGOSBOT_TWO
         pet->SetLoyaltyLevel(BEST_FRIEND);
 #endif
+        // The factory arm of the free-happiness family: this fills happiness
+        // without consuming pet food, and it runs for a pre-existing pet too, so
+        // PET_INIT alone would misattribute it. (The FeedPetAction arm is cluster
+        // C.) A pet created by the loop above lands here as well, so this single
+        // record covers both entries into the block.
+        RecordDecision(living::OrganicActionKind::FREE_PET_HAPPINESS, livingSource, bot);
         pet->SetPower(POWER_HAPPINESS, HAPPINESS_LEVEL_SIZE * 2);
         pet->SetHealth(pet->GetMaxHealth());
         pet->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
@@ -684,10 +730,18 @@ void PlayerbotFactory::InitPetSpells()
     if (!pet)
         return;
 
+    // Not recorded at entry: every arm below is preprocessor-excluded on
+    // MANGOSBOT_TWO and nothing unconditional is left between them, so this whole
+    // method is a provable no-op there. Each surviving arm records inside its own
+    // expansion and class guard instead; the arms are mutually exclusive by class,
+    // so a pass still emits at most once.
+
 #ifdef MANGOSBOT_ZERO
      // TODO: Proper Training Point calculation for build variety
     if (bot->getClass() == CLASS_HUNTER)
     {
+        RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
+
         enum HunterPetType
         {
             PET_WOLF,
@@ -1323,6 +1377,8 @@ void PlayerbotFactory::InitPetSpells()
      // TODO: Proper Training Point calculation for build variety
     if (bot->getClass() == CLASS_HUNTER)
     {
+        RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
+
         // add tbc pet families
         enum HunterPetType
         {
@@ -2150,6 +2206,8 @@ void PlayerbotFactory::InitPetSpells()
 #ifndef MANGOSBOT_TWO
     if (bot->getClass() == CLASS_WARLOCK)
     {
+        RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
+
         constexpr uint32 PET_IMP = 416;
         constexpr uint32 PET_FELHUNTER = 417;
         constexpr uint32 PET_VOIDWALKER = 1860;
@@ -2461,6 +2519,11 @@ void PlayerbotFactory::InitReputations()
     }
 #endif
 
+    // Same condition as the mutation: every faction gate above is level-based, so
+    // a low-level bot leaves the list empty and the loop below mutates nothing.
+    if (!factions.empty())
+        RecordDecision(living::OrganicActionKind::REPUTATION_INIT, livingSource, bot);
+
     for (auto faction : factions)
     {
 #ifdef MANGOSBOT_ONE
@@ -2478,12 +2541,17 @@ void PlayerbotFactory::InitReputations()
 
 void PlayerbotFactory::InitSpells()
 {
+    // No record here: this only loops over InitAvailableSpells, which records
+    // once per actual fabrication pass.
     for (int i = 0; i < 15; i++)
         InitAvailableSpells();
 }
 
 void PlayerbotFactory::InitTalentsTree(bool incremental)
 {
+    // Not recorded: this branch is dead on master (its only call site is the
+    // commented-out line in Randomize). Live talent fabrication runs through
+    // the "auto talents" strategy action and is instrumented at that layer.
     uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
     if (incremental && specNo)
 	{
@@ -2946,7 +3014,7 @@ void PlayerbotFactory::Shuffle(std::vector<uint32>& items)
     }
 }
 
-void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool progressive, bool partialUpgrade)
+void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool progressive, bool partialUpgrade, living::OrganicActionKind observeKind)
 {
     uint32 oldGS = ai->GetEquipGearScore(bot, false, false);
     uint32 masterGS = 0;
@@ -2956,6 +3024,11 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
     }
 
     bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot) && bot->GetPlayerbotAI() && !bot->GetPlayerbotAI()->HasRealPlayerMaster() && !bot->GetPlayerbotAI()->IsInRealGuild();
+
+    // Guards interleave with mutation here: the specId early-out sits behind the
+    // full-init item wipe below, so record before that first mutating branch.
+    RecordDecision(observeKind, livingSource, bot);
+
     if (!incremental)
     {
         DestroyItemsVisitor visitor(bot);
@@ -3607,6 +3680,9 @@ void PlayerbotFactory::InitSecondEquipmentSet()
     if (bot->getClass() == CLASS_MAGE || bot->getClass() == CLASS_WARLOCK || bot->getClass() == CLASS_PRIEST)
         return;
 
+    // Not recorded: dead on master (only call site is inside the commented-out
+    // second-equipment block in Randomize).
+
     std::map<uint32, std::vector<uint32> > items;
 
     uint32 desiredQuality = ITEM_QUALITY_NORMAL;
@@ -3727,11 +3803,22 @@ void PlayerbotFactory::InitSecondEquipmentSet()
 void PlayerbotFactory::InitBags()
 {
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Bags");
+
+    // Fabricating-pass latch: a bot whose four bag slots are already filled
+    // fabricates nothing, so record before the first bag this pass hands out.
+    bool recorded = false;
+
     for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
     {
         Bag* pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (!pBag)
         {
+            if (!recorded)
+            {
+                RecordDecision(living::OrganicActionKind::BAGS_INVENTORY_INIT, livingSource, bot);
+                recorded = true;
+            }
+
 #ifdef MANGOSBOT_ZERO
             bot->StoreNewItemInBestSlots(4500, 1); // add Traveler's Backpack if no bag in slot
 #else
@@ -3874,6 +3961,7 @@ void PlayerbotFactory::AddGems(Item* item)
 
 void PlayerbotFactory::InitAllSkills()
 {
+    // No record here: InitSkills and InitTradeSkills each record their own pass.
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Skills1");
     InitSkills();
     InitTradeSkills();
@@ -3881,6 +3969,7 @@ void PlayerbotFactory::InitAllSkills()
 
 void PlayerbotFactory::InitTradeSkills()
 {
+    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
     uint16 firstSkill = sRandomPlayerbotMgr.GetValue(bot, "firstSkill");
     uint16 secondSkill = sRandomPlayerbotMgr.GetValue(bot, "secondSkill");
     if (!firstSkill || !secondSkill)
@@ -4107,15 +4196,29 @@ void PlayerbotFactory::InitTradeSkills()
 void PlayerbotFactory::UpdateTradeSkills()
 {
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Skills2");
+
+    // Fabricating-pass latch: this only clears trade skills stuck at value 1, so a
+    // bot with none of them leaves every skill untouched.
+    bool recorded = false;
+
     for (int i = 0; i < sizeof(tradeSkills) / sizeof(uint32); ++i)
     {
         if (bot->GetSkillValue(tradeSkills[i]) == 1)
+        {
+            if (!recorded)
+            {
+                RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
+                recorded = true;
+            }
+
             bot->SetSkill(tradeSkills[i], 0, 0, 0);
+        }
     }
 }
 
 void PlayerbotFactory::InitSkills()
 {
+    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
     bot->UpdateSkillsForLevel(true);
 
 // Riding skills requirements are different
@@ -4335,6 +4438,7 @@ void PlayerbotFactory::SetRandomSkill(uint16 id)
 
 void PlayerbotFactory::InitAvailableSpells()
 {
+    RecordDecision(living::OrganicActionKind::SPELLS_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Spells1");
     bot->learnDefaultSpells();
     bot->learnClassLevelSpells(true);
@@ -4435,6 +4539,12 @@ void PlayerbotFactory::InitAvailableSpells()
 
 void PlayerbotFactory::InitSpecialSpells()
 {
+    // Fabricating-pass latch: AiPlayerbot.RandomBotSpellIds may be configured
+    // empty, and every id in it still has to resolve to a spell template (the
+    // default 54197 does not exist before WotLK), so this pass often teaches
+    // nothing at all.
+    bool recorded = false;
+
     for (std::list<uint32>::iterator i = sPlayerbotAIConfig.randomBotSpellIds.begin(); i != sPlayerbotAIConfig.randomBotSpellIds.end(); ++i)
     {
         uint32 spellId = *i;
@@ -4442,7 +4552,15 @@ void PlayerbotFactory::InitSpecialSpells()
         SpellEntry const* spellInfo = sSpellTemplate.LookupEntry<SpellEntry>(spellId);
 
         if(spellInfo)
+        {
+            if (!recorded)
+            {
+                RecordDecision(living::OrganicActionKind::SPELLS_INIT, livingSource, bot);
+                recorded = true;
+            }
+
             bot->learnSpell(spellId, false);
+        }
     }
 }
 
@@ -4542,6 +4660,17 @@ void PlayerbotFactory::AddPrevQuests(uint32 questId, std::list<uint32>& questIds
 
 void PlayerbotFactory::InitQuests(std::list<uint32>& questMap)
 {
+    // CONFIGURED_QUEST_REWARD, not PREQUEST_INIT: the only caller passes
+    // specialQuestIds, which Init() builds exclusively from
+    // AiPlayerbot.RandomBotQuestIds plus their prerequisite chains. The
+    // classQuestIds list that would make this the PreQuests family is built in
+    // Init() and never consumed, so PREQUEST_INIT is dead on master and stays
+    // unrecorded.
+    //
+    // Fabricating-pass latch: every entry can fail the class, level or race gate
+    // below, so a low-level or wrong-class bot is rewarded nothing.
+    bool recorded = false;
+
     int count = 0;
     for (std::list<uint32>::iterator i = questMap.begin(); i != questMap.end(); ++i)
     {
@@ -4552,6 +4681,12 @@ void PlayerbotFactory::InitQuests(std::list<uint32>& questMap)
                 quest->GetMinLevel() > bot->GetLevel() ||
                 !bot->SatisfyQuestRace(quest, false))
             continue;
+
+        if (!recorded)
+        {
+            RecordDecision(living::OrganicActionKind::CONFIGURED_QUEST_REWARD, livingSource, bot);
+            recorded = true;
+        }
 
         bot->SetQuestStatus(questId, QUEST_STATUS_COMPLETE);
         bot->RewardQuest(quest, 0, bot, false);
@@ -4623,8 +4758,18 @@ void PlayerbotFactory::InitAmmo()
     if (!entry)
         return;
 
+    // Fabricating-pass latch, past every no-mutation early-out above.
+    // PlayerbotAI::UpdateAI calls this on map-worker threads every tick for ranged
+    // bots, so a bot that already carries a full ammo stack of the right entry has
+    // to stay silent: record only where this pass actually fabricates or reassigns.
+    bool recorded = false;
+
     if (count < maxCount)
     {
+        // maxCount - count is at least 1 here, so this branch always stores.
+        RecordDecision(living::OrganicActionKind::AMMO_REPLENISH, livingSource, bot);
+        recorded = true;
+
         for (uint32 i = 0; i < maxCount - count; i++)
         {
             Item* newItem = bot->StoreNewItemInInventorySlot(entry, 200);
@@ -4632,7 +4777,12 @@ void PlayerbotFactory::InitAmmo()
     }
 
     if(bot->GetUInt32Value(PLAYER_AMMO_ID) != entry)
+    {
+        if (!recorded)
+            RecordDecision(living::OrganicActionKind::AMMO_REPLENISH, livingSource, bot);
+
         bot->SetAmmo(entry);
+    }
 }
 
 void PlayerbotFactory::InitMounts()
@@ -4688,6 +4838,9 @@ void PlayerbotFactory::InitMounts()
 
     if (bot->GetLevel() < firstmount)
         return;
+
+    // Recorded past the level guard: a bot below the first mount level is a no-op.
+    RecordDecision(living::OrganicActionKind::MOUNT_INIT, livingSource, bot);
 
     std::map<uint8, std::map<uint32, std::vector<uint32> > > mounts;
     std::vector<uint32> slow, fast, fslow, ffast;
@@ -4777,6 +4930,11 @@ void PlayerbotFactory::InitMounts()
 void PlayerbotFactory::InitPotions()
 {
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Potions");
+
+    // Fabricating-pass latch: a bot that already carries both potion types (the
+    // steady state after the first pass) skips every iteration.
+    bool recorded = false;
+
     uint32 effects[] = { SPELL_EFFECT_HEAL, SPELL_EFFECT_ENERGIZE };
     for (int i = 0; i < 2; ++i)
     {
@@ -4800,6 +4958,13 @@ void PlayerbotFactory::InitPotions()
         if (!proto) continue;
 
         uint32 maxCount = proto->GetMaxStackSize();
+
+        if (!recorded)
+        {
+            RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
+            recorded = true;
+        }
+
         Item* newItem = bot->StoreNewItemInInventorySlot(itemId, urand(maxCount / 2, maxCount));
     }
 }
@@ -4807,6 +4972,11 @@ void PlayerbotFactory::InitPotions()
 void PlayerbotFactory::InitFood()
 {
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Food");
+
+    // Fabricating-pass latch: a bot that already carries food and drink (the
+    // steady state after the first pass) skips every iteration.
+    bool recorded = false;
+
     uint32 categories[] = { 11, 59 };
     for (int i = 0; i < 2; ++i)
     {
@@ -4829,6 +4999,13 @@ void PlayerbotFactory::InitFood()
         if (!proto) continue;
 
         uint32 maxCount = proto->GetMaxStackSize();
+
+        if (!recorded)
+        {
+            RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
+            recorded = true;
+        }
+
         Item* newItem = bot->StoreNewItemInInventorySlot(itemId, urand(maxCount / 2, maxCount));
    }
 }
@@ -4836,6 +5013,12 @@ void PlayerbotFactory::InitFood()
 void PlayerbotFactory::InitReagents()
 {
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Reagents");
+
+    // Fabricating-pass latch: the class switch below leaves `items` empty for
+    // every non-caster and for casters under the first reagent level, and the
+    // totem loop only fires for spells with an unmet totem requirement.
+    bool recorded = false;
+
     std::list<uint32> items;
     uint32 regCount = 1;
     switch (bot->getClass())
@@ -4920,6 +5103,12 @@ void PlayerbotFactory::InitReagents()
 
         uint32 randCount = urand(maxCount / 2, maxCount * regCount);
 
+        if (!recorded)
+        {
+            RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
+            recorded = true;
+        }
+
         Item* newItem = bot->StoreNewItemInInventorySlot(*i, randCount);
 
         sLog.outDetail("Bot %d got reagent %s x%d", bot->GetGUIDLow(), proto->Name1, randCount);
@@ -4948,6 +5137,12 @@ void PlayerbotFactory::InitReagents()
                 {
                     sLog.outError("No totem (ItemId %d) found for bot %d (Class:%d)", totem, bot->GetGUIDLow(), bot->getClass());
                     continue;
+                }
+
+                if (!recorded)
+                {
+                    RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
+                    recorded = true;
                 }
 
                 Item* newItem = bot->StoreNewItemInInventorySlot(totem, 1);
@@ -4979,6 +5174,12 @@ void PlayerbotFactory::InitReagents()
                         continue;
                     }
 
+                    if (!recorded)
+                    {
+                        RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
+                        recorded = true;
+                    }
+
                     Item* newItem = bot->StoreNewItemInInventorySlot(itemId, 1);
 
                     sLog.outDetail("Bot %d got totem %s x%d", bot->GetGUIDLow(), proto->Name1, 1);
@@ -4996,6 +5197,9 @@ void PlayerbotFactory::CancelAuras()
 
 void PlayerbotFactory::InitInventory()
 {
+    // Not recorded here: InitInventorySkill is this pass's whole live body (the
+    // other two calls are commented out) and it carries the fabricating-pass
+    // latch for BAGS_INVENTORY_INIT.
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Inventory");
     //InitInventoryTrade();
     //InitInventoryEquip();
@@ -5004,20 +5208,34 @@ void PlayerbotFactory::InitInventory()
 
 void PlayerbotFactory::InitInventorySkill()
 {
+    // Fabricating-pass latch for InitInventory, its only caller: a bot with none
+    // of these professions is handed no tool at all.
+    bool recorded = false;
+    auto storeProfessionTool = [&](uint32 itemId)
+    {
+        if (!recorded)
+        {
+            RecordDecision(living::OrganicActionKind::BAGS_INVENTORY_INIT, livingSource, bot);
+            recorded = true;
+        }
+
+        StoreItem(itemId, 1);
+    };
+
     if (bot->HasSkill(SKILL_MINING)) {
-        StoreItem(2901, 1); // Mining Pick
+        storeProfessionTool(2901); // Mining Pick
     }
     if (bot->HasSkill(SKILL_BLACKSMITHING) || bot->HasSkill(SKILL_ENGINEERING)) {
-        StoreItem(5956, 1); // Blacksmith Hammer
+        storeProfessionTool(5956); // Blacksmith Hammer
     }
     if (bot->HasSkill(SKILL_ENGINEERING)) {
-        StoreItem(6219, 1); // Arclight Spanner
+        storeProfessionTool(6219); // Arclight Spanner
     }
     if (bot->HasSkill(SKILL_ENCHANTING)) {
-        StoreItem(16207, 1); // Runed Arcanite Rod
+        storeProfessionTool(16207); // Runed Arcanite Rod
     }
     if (bot->HasSkill(SKILL_SKINNING)) {
-        StoreItem(7005, 1); // Skinning Knife
+        storeProfessionTool(7005); // Skinning Knife
     }
 }
 
@@ -5140,6 +5358,11 @@ void PlayerbotFactory::InitInventoryEquip()
 
 void PlayerbotFactory::InitGuild()
 {
+    // Same condition as the mutation: a bot already in a guild that already owns
+    // the tabard grants nothing and takes the early return below.
+    if (!bot->GetGuildId() || !bot->HasItemCount(5976, 1))
+        RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, bot);
+
     // add guild tabard
     if (bot->GetGuildId() && !bot->HasItemCount(5976, 1))
         StoreItem(5976, 1);
@@ -5148,7 +5371,7 @@ void PlayerbotFactory::InitGuild()
         return;
 
     if (sPlayerbotAIConfig.randomBotGuilds.size() < sPlayerbotAIConfig.randomBotGuildCount)
-        RandomPlayerbotFactory::CreateRandomGuilds();
+        RandomPlayerbotFactory::CreateRandomGuilds(livingSource);
 
     std::vector<uint32> guilds;
     for (std::list<uint32>::iterator i = sPlayerbotAIConfig.randomBotGuilds.begin(); i != sPlayerbotAIConfig.randomBotGuilds.end(); ++i)
@@ -5285,8 +5508,12 @@ void PlayerbotFactory::InitArenaTeam()
     if (!sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
         return;
 
+    // No record here: this method fabricates nothing of its own. At steady state
+    // (pool already full) it is a permanent no-op, and when the pool is short the
+    // nested batch call records the one honest row for the whole operation --
+    // recording here too would double-count a single fabrication.
     if (sPlayerbotAIConfig.randomBotArenaTeams.size() < sPlayerbotAIConfig.randomBotArenaTeamCount)
-        RandomPlayerbotFactory::CreateRandomArenaTeams();
+        RandomPlayerbotFactory::CreateRandomArenaTeams(livingSource);
 }
 #endif
 
@@ -5294,6 +5521,10 @@ void PlayerbotFactory::EnchantEquipment()
 {
     if (bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
     {
+        // Recorded inside the level guard: below minEnchantingBotLevel this method
+        // is a provable no-op.
+        RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
+
         if (m_EnchantContainer.empty())
         {
             LoadEnchantContainer();
@@ -5312,6 +5543,8 @@ void PlayerbotFactory::EnchantEquipment()
 
 void PlayerbotFactory::ApplyEnchantTemplate()
 {
+   // Not recorded: no caller in the repo. The live per-item overload runs
+   // inside InitEquipment's pass, which records GEAR_INIT.
    int tab = AiFactory::GetPlayerSpecTab(bot);
 
    switch (bot->getClass())
@@ -5523,6 +5756,10 @@ void PlayerbotFactory::LoadEnchantContainer()
 void PlayerbotFactory::InitGems() //WIP
 {
 #ifndef MANGOSBOT_ZERO
+    // Recorded inside the expansion guard: classic has no gems and the whole body
+    // compiles away, so recording above it would emit for an empty method.
+    RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
+
     std::vector<uint32> gems = sRandomItemMgr.GetGemsList();
     for (int slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; slot++)
     {
@@ -5678,6 +5915,7 @@ void PlayerbotFactory::InitGems() //WIP
 
 void PlayerbotFactory::InitTaxiNodes()
 {
+    RecordDecision(living::OrganicActionKind::TAXI_NODES_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_TaxiNodes");
     uint32 startMap = bot->GetMapId();
 
