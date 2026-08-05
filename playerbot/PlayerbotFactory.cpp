@@ -2512,7 +2512,9 @@ void PlayerbotFactory::InitSpells()
 
 void PlayerbotFactory::InitTalentsTree(bool incremental)
 {
-    RecordDecision(living::OrganicActionKind::TALENT_INIT_SYNTHETIC, livingSource, bot);
+    // Not recorded: this branch is dead on master (its only call site is the
+    // commented-out line in Randomize). Live talent fabrication runs through
+    // the "auto talents" strategy action and is instrumented at that layer.
     uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
     if (incremental && specNo)
 	{
@@ -3641,8 +3643,8 @@ void PlayerbotFactory::InitSecondEquipmentSet()
     if (bot->getClass() == CLASS_MAGE || bot->getClass() == CLASS_WARLOCK || bot->getClass() == CLASS_PRIEST)
         return;
 
-    // Recorded past the class guard: a mage entering here is a provable no-op.
-    RecordDecision(living::OrganicActionKind::GEAR_INIT, livingSource, bot);
+    // Not recorded: dead on master (only call site is inside the commented-out
+    // second-equipment block in Randomize).
 
     std::map<uint32, std::vector<uint32> > items;
 
@@ -4511,9 +4513,6 @@ void PlayerbotFactory::InitTalents(uint32 specNo)
         spells[talentInfo->Row].push_back(talentInfo);
     }
 
-    // Recorded before entering the mutation loop: the scan above filters by class
-    // mask and spec, and an empty result learns nothing.
-    RecordDecision(living::OrganicActionKind::TALENT_INIT_SYNTHETIC, livingSource, bot);
 
     uint32 freePoints = bot->GetFreeTalentPoints();
     for (std::map<uint32, std::vector<TalentEntry const*> >::iterator i = spells.begin(); i != spells.end(); ++i)
@@ -5387,7 +5386,8 @@ void PlayerbotFactory::EnchantEquipment()
 
 void PlayerbotFactory::ApplyEnchantTemplate()
 {
-   RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
+   // Not recorded: no caller in the repo. The live per-item overload runs
+   // inside InitEquipment's pass, which records GEAR_INIT.
    int tab = AiFactory::GetPlayerSpecTab(bot);
 
    switch (bot->getClass())
