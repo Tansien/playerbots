@@ -1,6 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/LivingRealmObserver.h"
 
 #include "Server/SQLStorages.h"
 #include "Entities/ItemPrototype.h"
@@ -25,6 +26,7 @@
 #include "strategy/ItemVisitors.h"
 
 using namespace ai;
+using namespace living_observer;
 
 #define PLAYER_SKILL_INDEX(x)       (PLAYER_SKILL_INFO_1_1 + ((x)*3))
 
@@ -149,6 +151,7 @@ void PlayerbotFactory::Prepare()
 
     if (!sPlayerbotAIConfig.disableRandomLevels)
     {
+        RecordDecision(living::OrganicActionKind::LEVEL_ASSIGN, livingSource, bot);
         bot->SetLevel(level);
         //Reset xp and xp for next level.
         bot->SetUInt32Value(PLAYER_XP, 0);
@@ -168,6 +171,7 @@ void PlayerbotFactory::Prepare()
 
 void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 {
+    RecordDecision(incremental ? living::OrganicActionKind::RANDOMIZE_INCREMENTAL : living::OrganicActionKind::RANDOMIZE_FULL, livingSource, bot);
     sLog.outDetail("Preparing to %s randomize...", (incremental ? "incremental" : "full"));
     Prepare();
 
@@ -194,6 +198,7 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
     {
         if (bot->GetLevel() > level)
         {
+            RecordDecision(living::OrganicActionKind::LEVEL_ASSIGN, livingSource, bot);
             bot->SetLevel(level);
             //Reset xp and xp for next level.
             bot->SetUInt32Value(PLAYER_XP, 0);
@@ -207,6 +212,7 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
         ClearInventory();
         if (bot->GetLevel() > level)
         {
+            RecordDecision(living::OrganicActionKind::LEVEL_ASSIGN, livingSource, bot);
             bot->SetLevel(level);
             //Reset xp and xp for next level.
             bot->SetUInt32Value(PLAYER_XP, 0);
@@ -330,6 +336,7 @@ void PlayerbotFactory::Randomize(bool incremental, bool syncWithMaster)
 
     if (isRandomBot)
     {
+        RecordDecision(living::OrganicActionKind::MONEY_INIT, livingSource, bot);
         if (incremental)
         {
             uint32 money = bot->GetMoney();
@@ -372,6 +379,7 @@ void PlayerbotFactory::Refresh()
 
 void PlayerbotFactory::AddConsumables()
 {
+    RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Consumables");
    switch (bot->getClass())
    {
@@ -546,6 +554,7 @@ void PlayerbotFactory::AddConsumables()
 
 void PlayerbotFactory::InitPet()
 {
+    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
     // Randomize a new pet (only for hunters)
     if (bot->getClass() != CLASS_HUNTER)
         return;
@@ -676,6 +685,7 @@ void PlayerbotFactory::InitPet()
 
 void PlayerbotFactory::InitPetSpells()
 {
+    RecordDecision(living::OrganicActionKind::PET_INIT, livingSource, bot);
     Map* map = bot->GetMap();
     if (!map)
         return;
@@ -2401,6 +2411,7 @@ void PlayerbotFactory::ResetQuests()
 
 void PlayerbotFactory::InitReputations()
 {
+    RecordDecision(living::OrganicActionKind::REPUTATION_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Reputations");
     // list of factions
     std::list<uint32> factions;
@@ -2478,12 +2489,14 @@ void PlayerbotFactory::InitReputations()
 
 void PlayerbotFactory::InitSpells()
 {
+    RecordDecision(living::OrganicActionKind::SPELLS_INIT, livingSource, bot);
     for (int i = 0; i < 15; i++)
         InitAvailableSpells();
 }
 
 void PlayerbotFactory::InitTalentsTree(bool incremental)
 {
+    RecordDecision(living::OrganicActionKind::TALENT_INIT_SYNTHETIC, livingSource, bot);
     uint32 specNo = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
     if (incremental && specNo)
 	{
@@ -2948,6 +2961,7 @@ void PlayerbotFactory::Shuffle(std::vector<uint32>& items)
 
 void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool progressive, bool partialUpgrade)
 {
+    RecordDecision(living::OrganicActionKind::GEAR_INIT, livingSource, bot);
     uint32 oldGS = ai->GetEquipGearScore(bot, false, false);
     uint32 masterGS = 0;
     if(syncWithMaster && ai->GetMaster())
@@ -3604,6 +3618,7 @@ bool PlayerbotFactory::IsDesiredReplacement(uint32 itemId)
 
 void PlayerbotFactory::InitSecondEquipmentSet()
 {
+    RecordDecision(living::OrganicActionKind::GEAR_INIT, livingSource, bot);
     if (bot->getClass() == CLASS_MAGE || bot->getClass() == CLASS_WARLOCK || bot->getClass() == CLASS_PRIEST)
         return;
 
@@ -3726,6 +3741,7 @@ void PlayerbotFactory::InitSecondEquipmentSet()
 
 void PlayerbotFactory::InitBags()
 {
+    RecordDecision(living::OrganicActionKind::BAGS_INVENTORY_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Bags");
     for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
     {
@@ -3874,6 +3890,7 @@ void PlayerbotFactory::AddGems(Item* item)
 
 void PlayerbotFactory::InitAllSkills()
 {
+    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Skills1");
     InitSkills();
     InitTradeSkills();
@@ -3881,6 +3898,7 @@ void PlayerbotFactory::InitAllSkills()
 
 void PlayerbotFactory::InitTradeSkills()
 {
+    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
     uint16 firstSkill = sRandomPlayerbotMgr.GetValue(bot, "firstSkill");
     uint16 secondSkill = sRandomPlayerbotMgr.GetValue(bot, "secondSkill");
     if (!firstSkill || !secondSkill)
@@ -4106,6 +4124,7 @@ void PlayerbotFactory::InitTradeSkills()
 
 void PlayerbotFactory::UpdateTradeSkills()
 {
+    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Skills2");
     for (int i = 0; i < sizeof(tradeSkills) / sizeof(uint32); ++i)
     {
@@ -4116,6 +4135,7 @@ void PlayerbotFactory::UpdateTradeSkills()
 
 void PlayerbotFactory::InitSkills()
 {
+    RecordDecision(living::OrganicActionKind::SKILLS_INIT, livingSource, bot);
     bot->UpdateSkillsForLevel(true);
 
 // Riding skills requirements are different
@@ -4335,6 +4355,7 @@ void PlayerbotFactory::SetRandomSkill(uint16 id)
 
 void PlayerbotFactory::InitAvailableSpells()
 {
+    RecordDecision(living::OrganicActionKind::SPELLS_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Spells1");
     bot->learnDefaultSpells();
     bot->learnClassLevelSpells(true);
@@ -4435,6 +4456,7 @@ void PlayerbotFactory::InitAvailableSpells()
 
 void PlayerbotFactory::InitSpecialSpells()
 {
+    RecordDecision(living::OrganicActionKind::SPELLS_INIT, livingSource, bot);
     for (std::list<uint32>::iterator i = sPlayerbotAIConfig.randomBotSpellIds.begin(); i != sPlayerbotAIConfig.randomBotSpellIds.end(); ++i)
     {
         uint32 spellId = *i;
@@ -4448,6 +4470,7 @@ void PlayerbotFactory::InitSpecialSpells()
 
 void PlayerbotFactory::InitTalents(uint32 specNo)
 {
+    RecordDecision(living::OrganicActionKind::TALENT_INIT_SYNTHETIC, livingSource, bot);
     uint32 classMask = bot->getClassMask();
 
     std::map<uint32, std::vector<TalentEntry const*> > spells;
@@ -4542,6 +4565,7 @@ void PlayerbotFactory::AddPrevQuests(uint32 questId, std::list<uint32>& questIds
 
 void PlayerbotFactory::InitQuests(std::list<uint32>& questMap)
 {
+    RecordDecision(living::OrganicActionKind::PREQUEST_INIT, livingSource, bot);
     int count = 0;
     for (std::list<uint32>::iterator i = questMap.begin(); i != questMap.end(); ++i)
     {
@@ -4578,6 +4602,7 @@ void PlayerbotFactory::ClearAllItems()
 
 void PlayerbotFactory::InitAmmo()
 {
+    RecordDecision(living::OrganicActionKind::AMMO_REPLENISH, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Ammo");
     if (bot->getClass() != CLASS_HUNTER && bot->getClass() != CLASS_ROGUE && bot->getClass() != CLASS_WARRIOR)
         return;
@@ -4637,6 +4662,7 @@ void PlayerbotFactory::InitAmmo()
 
 void PlayerbotFactory::InitMounts()
 {
+    RecordDecision(living::OrganicActionKind::MOUNT_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Mounts");
     uint32 firstmount =
 #ifdef MANGOSBOT_ZERO
@@ -4776,6 +4802,7 @@ void PlayerbotFactory::InitMounts()
 
 void PlayerbotFactory::InitPotions()
 {
+    RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Potions");
     uint32 effects[] = { SPELL_EFFECT_HEAL, SPELL_EFFECT_ENERGIZE };
     for (int i = 0; i < 2; ++i)
@@ -4806,6 +4833,7 @@ void PlayerbotFactory::InitPotions()
 
 void PlayerbotFactory::InitFood()
 {
+    RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Food");
     uint32 categories[] = { 11, 59 };
     for (int i = 0; i < 2; ++i)
@@ -4835,6 +4863,7 @@ void PlayerbotFactory::InitFood()
 
 void PlayerbotFactory::InitReagents()
 {
+    RecordDecision(living::OrganicActionKind::CONSUMABLES_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Reagents");
     std::list<uint32> items;
     uint32 regCount = 1;
@@ -4996,6 +5025,7 @@ void PlayerbotFactory::CancelAuras()
 
 void PlayerbotFactory::InitInventory()
 {
+    RecordDecision(living::OrganicActionKind::BAGS_INVENTORY_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Inventory");
     //InitInventoryTrade();
     //InitInventoryEquip();
@@ -5140,6 +5170,7 @@ void PlayerbotFactory::InitInventoryEquip()
 
 void PlayerbotFactory::InitGuild()
 {
+    RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, livingSource, bot);
     // add guild tabard
     if (bot->GetGuildId() && !bot->HasItemCount(5976, 1))
         StoreItem(5976, 1);
@@ -5282,6 +5313,7 @@ void PlayerbotFactory::InitImmersive()
 #ifndef MANGOSBOT_ZERO
 void PlayerbotFactory::InitArenaTeam()
 {
+    RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, livingSource, bot);
     if (!sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
         return;
 
@@ -5292,6 +5324,7 @@ void PlayerbotFactory::InitArenaTeam()
 
 void PlayerbotFactory::EnchantEquipment()
 {
+    RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
     if (bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
     {
         if (m_EnchantContainer.empty())
@@ -5312,6 +5345,7 @@ void PlayerbotFactory::EnchantEquipment()
 
 void PlayerbotFactory::ApplyEnchantTemplate()
 {
+   RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
    int tab = AiFactory::GetPlayerSpecTab(bot);
 
    switch (bot->getClass())
@@ -5522,6 +5556,7 @@ void PlayerbotFactory::LoadEnchantContainer()
 }*/
 void PlayerbotFactory::InitGems() //WIP
 {
+    RecordDecision(living::OrganicActionKind::SYNTHETIC_ENCHANT_INIT, livingSource, bot);
 #ifndef MANGOSBOT_ZERO
     std::vector<uint32> gems = sRandomItemMgr.GetGemsList();
     for (int slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; slot++)
@@ -5678,6 +5713,7 @@ void PlayerbotFactory::InitGems() //WIP
 
 void PlayerbotFactory::InitTaxiNodes()
 {
+    RecordDecision(living::OrganicActionKind::TAXI_NODES_INIT, livingSource, bot);
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_TaxiNodes");
     uint32 startMap = bot->GetMapId();
 

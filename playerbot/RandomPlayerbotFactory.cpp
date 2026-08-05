@@ -3,6 +3,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/LivingRealmObserver.h"
 #include "Accounts/AccountMgr.h"
 #include "Globals/ObjectMgr.h"
 #include "Database/DatabaseEnv.h"
@@ -409,6 +410,8 @@ bool RandomPlayerbotFactory::CreateRandomBot(uint8 cls, uint8 inputRace)
 
     sObjectAccessor.AddObject(player);
 
+    living_observer::RecordDecision(living::OrganicActionKind::CORE_CHARACTER_CREATE, living::OrganicSourceKind::RandomManager, player->GetGUIDLow());
+
     sLog.outDebug( "Random bot created for account %d - name: \"%s\"; race: %u; class: %u",
             accountId, name.c_str(), race, cls);
 
@@ -548,6 +551,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
     if (sPlayerbotAIConfig.deleteRandomBotAccounts || delAccs)
     {
+        living_observer::RecordDecision(living::OrganicActionKind::POPULATION_RESET_RECREATE, living::OrganicSourceKind::RandomManager, uint32(0));
         std::list<uint32> botAccounts;
         std::list<uint32> botFriends;
 
@@ -1054,6 +1058,7 @@ void RandomPlayerbotFactory::CreateRandomBots()
 
 void RandomPlayerbotFactory::CreateRandomGuilds()
 {
+    living_observer::RecordDecision(living::OrganicActionKind::GUILD_BOOTSTRAP, living::OrganicSourceKind::RandomManager, uint32(0));
     std::vector<uint32> randomBots;
     std::map<uint32, std::vector<uint32>> charAccGuids;
 
@@ -1213,6 +1218,7 @@ std::string RandomPlayerbotFactory::CreateRandomGuildName()
 #ifndef MANGOSBOT_ZERO
 void RandomPlayerbotFactory::CreateRandomArenaTeams()
 {
+    living_observer::RecordDecision(living::OrganicActionKind::ARENA_TEAM_BOOTSTRAP, living::OrganicSourceKind::RandomManager, uint32(0));
     std::vector<uint32> randomBots;
 
     auto results = CharacterDatabase.PQuery(

@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "GenericActions.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/living/policy/OrganicPolicy.h"
 
 using namespace ai;
 
@@ -106,7 +107,7 @@ bool UpdateStrategyDependenciesAction::isUseful()
 
 bool InitializePetAction::Execute(Event& event)
 {
-    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY);
+    PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_LEGENDARY, living::OrganicSourceKind::AiUpdate);
     factory.InitPet();
     factory.InitPetSpells();
     return true;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "playerbot/living/policy/OrganicPolicy.h"
+
 class Player;
 class PlayerbotMgr;
 class ChatHandler;
@@ -45,7 +47,7 @@ enum spec : uint8 {
 class PlayerbotFactory
 {
 public:
-    PlayerbotFactory(Player* bot, uint32 level, uint32 itemQuality = 0) : level(level), itemQuality(itemQuality), bot(bot), ai(bot->GetPlayerbotAI()) {}
+    PlayerbotFactory(Player* bot, uint32 level, uint32 itemQuality = 0, living::OrganicSourceKind livingSource = living::OrganicSourceKind::RandomManager) : level(level), itemQuality(itemQuality), bot(bot), ai(bot->GetPlayerbotAI()), livingSource(livingSource) {}
 
     static ObjectGuid GetRandomBot();
     static void Init();
@@ -131,6 +133,7 @@ private:
     static TaxiNodeLevelContainer overworldTaxiNodeLevelsH;
     PlayerbotAI* ai;
     Player* bot;
+    living::OrganicSourceKind livingSource;
 
 protected:
    EnchantContainer m_EnchantContainer;

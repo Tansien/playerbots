@@ -18,6 +18,7 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "PlayerbotAI.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/living/policy/OrganicPolicy.h"
 #include "PlayerbotSecurity.h"
 #include "Groups/Group.h"
 #include "Entities/Pet.h"
@@ -517,10 +518,10 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 #ifndef MANGOSBOT_ZERO
                 if (!bot->HasAura(46699)) // Thori'dal
                 {
-                    PlayerbotFactory(bot, bot->GetLevel(), 0).InitAmmo();
+                    PlayerbotFactory(bot, bot->GetLevel(), 0, living::OrganicSourceKind::AiUpdate).InitAmmo();
                 }
 #else
-                PlayerbotFactory(bot, bot->GetLevel(), 0).InitAmmo();
+                PlayerbotFactory(bot, bot->GetLevel(), 0, living::OrganicSourceKind::AiUpdate).InitAmmo();
 #endif
             }
         }
